@@ -1,0 +1,122 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ----------------------------------------------------
+    // SECURITY HELPERS & VALIDATION BLUEPRINTS
+    // ----------------------------------------------------
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 500;
+    }
+
+    // Validation Blueprint for Projects
+    function isValidProject(data) {
+      return (!('id' in data) || data.id is string)
+        && data.name is string
+        && data.name.size() > 0
+        && data.name.size() <= 256;
+    }
+
+    // Validation Blueprint for Messages
+    function isValidMessage(data) {
+      return (!('id' in data) || data.id is string)
+        && data.role is string
+        && (data.role == "user" || data.role == "nyx" || data.role == "assistant")
+        && data.content is string;
+    }
+
+    // Validation Blueprint for Prompts
+    function isValidPrompt(data) {
+      return (!('id' in data) || data.id is string)
+        && data.title is string
+        && data.title.size() > 0
+        && data.promptText is string;
+    }
+
+    // Validation Blueprint for Characters
+    function isValidCharacter(data) {
+      return (!('id' in data) || data.id is string)
+        && data.name is string
+        && data.name.size() > 0;
+    }
+
+    // Validation Blueprint for KeepNote
+    function isValidNote(data) {
+      return (!('id' in data) || data.id is string)
+        && data.title is string
+        && data.content is string;
+    }
+
+    // Validation Blueprint for KeepTask
+    function isValidTask(data) {
+      return (!('id' in data) || data.id is string)
+        && data.text is string
+        && data.completed is bool;
+    }
+
+    // Validation Blueprint for GeneratedImage
+    function isValidImage(data) {
+      return (!('id' in data) || data.id is string)
+        && data.url is string
+        && data.prompt is string;
+    }
+
+    // ----------------------------------------------------
+    // RESOURCE ROUTES
+    // ----------------------------------------------------
+
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      match /projects/{projectId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidProject(request.resource.data) && isValidId(projectId);
+        allow delete: if isOwner(userId) && isValidId(projectId);
+
+        match /messages/{messageId} {
+          allow read: if isOwner(userId);
+          allow create, update: if isOwner(userId) && isValidMessage(request.resource.data) && isValidId(messageId);
+          allow delete: if isOwner(userId) && isValidId(messageId);
+        }
+
+        match /prompts/{promptId} {
+          allow read: if isOwner(userId);
+          allow create, update: if isOwner(userId) && isValidPrompt(request.resource.data) && isValidId(promptId);
+          allow delete: if isOwner(userId) && isValidId(promptId);
+        }
+
+        match /characters/{characterId} {
+          allow read: if isOwner(userId);
+          allow create, update: if isOwner(userId) && isValidCharacter(request.resource.data) && isValidId(characterId);
+          allow delete: if isOwner(userId) && isValidId(characterId);
+        }
+      }
+
+      match /notes/{noteId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidNote(request.resource.data) && isValidId(noteId);
+        allow delete: if isOwner(userId) && isValidId(noteId);
+      }
+
+      match /tasks/{taskId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidTask(request.resource.data) && isValidId(taskId);
+        allow delete: if isOwner(userId) && isValidId(taskId);
+      }
+
+      match /gallery/{galleryId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidImage(request.resource.data) && isValidId(galleryId);
+        allow delete: if isOwner(userId) && isValidId(galleryId);
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Nyx Roleplay Dashboard",
+  "description": "An advanced stateless roleplay companion and DM dashboard featuring real-time mobile sync, prompt vaults, narrative editors, and image generations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
