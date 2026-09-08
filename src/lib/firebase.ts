@@ -13,7 +13,10 @@ import {
 } from "firebase/auth";
 import { 
   getFirestore, 
-  enableIndexedDbPersistence,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentSingleTabManager,
+  memoryLocalCache,
   setLogLevel,
   collection, 
   doc, 
@@ -49,9 +52,27 @@ const auth = initializeAuth(app, {
   popupRedirectResolver: browserPopupRedirectResolver
 });
 
-const db = (firebaseConfig as any).firestoreDatabaseId
-  ? getFirestore(app, (firebaseConfig as any).firestoreDatabaseId)
-  : getFirestore(app);
+// Initialize Firestore with single-tab persistent local cache (or in-memory cache if sandboxed/restricted).
+// Using persistentSingleTabManager avoids the legacy MultiTab lease manager that attempts to write
+// "zombie client id" entries to localStorage during pagehide/unload, which fails inside sandboxed iframes.
+const firestoreDatabaseId = (firebaseConfig as any).firestoreDatabaseId;
+let db: ReturnType<typeof getFirestore>;
+
+try {
+  db = initializeFirestore(app, {
+    localCache: persistentLocalCache({
+      tabManager: persistentSingleTabManager({})
+    })
+  }, firestoreDatabaseId);
+} catch {
+  try {
+    db = initializeFirestore(app, {
+      localCache: memoryLocalCache()
+    }, firestoreDatabaseId);
+  } catch {
+    db = firestoreDatabaseId ? getFirestore(app, firestoreDatabaseId) : getFirestore(app);
+  }
+}
 
 try {
   setLogLevel("error");
@@ -59,15 +80,33 @@ try {
   // ignore
 }
 
-// Suppress benign sandbox WebSocket rejections (HMR disabled in container) and unprovisioned Firestore database warnings
+// Suppress benign sandbox WebSocket rejections (HMR disabled in container), zombie client ID, and unprovisioned Firestore database warnings
 if (typeof window !== "undefined") {
   const originalWarn = console.warn;
   console.warn = (...args: any[]) => {
     const msg = args.map(a => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
-    if (msg.includes("@firebase/firestore") || msg.includes("Database '(default)' not found")) {
+    if (
+      msg.includes("@firebase/firestore") || 
+      msg.includes("Database '(default)' not found") || 
+      msg.includes("zombie client id") || 
+      msg.includes("Failed to set zombie client id")
+    ) {
       return;
     }
     originalWarn.apply(console, args);
+  };
+
+  const originalError = console.error;
+  console.error = (...args: any[]) => {
+    const msg = args.map(a => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+    if (
+      msg.includes("Failed to set zombie client id") || 
+      msg.includes("zombie client id") || 
+      msg.includes("Database '(default)' not found")
+    ) {
+      return;
+    }
+    originalError.apply(console, args);
   };
 
   window.addEventListener("unhandledrejection", (event) => {
@@ -76,28 +115,12 @@ if (typeof window !== "undefined") {
       reason.includes("WebSocket closed") || 
       reason.includes("vite") || 
       reason.includes("Database '(default)' not found") ||
+      reason.includes("zombie client id") ||
       reason.includes("Firestore")
     ) {
       event.preventDefault();
     }
   });
-}
-
-// Enable Offline Persistence for Firestore so it can save and read stuff while offline.
-if (typeof window !== "undefined") {
-  try {
-    enableIndexedDbPersistence(db).catch((err) => {
-      if (err.code === 'failed-precondition') {
-        console.warn("Firestore offline persistence: Multiple tabs open, persistence enabled in another tab.");
-      } else if (err.code === 'unimplemented') {
-        console.warn("Firestore offline persistence: The current browser does not support offline persistence.");
-      } else {
-        console.error("Firestore offline persistence error:", err);
-      }
-    });
-  } catch (syncErr) {
-    console.warn("Firestore offline persistence synchronous initialization failed:", syncErr);
-  }
 }
 
 export const GOOGLE_WORKSPACE_SCOPES = [
@@ -117,7 +140,7 @@ const googleDriveProvider = new GoogleAuthProvider();
 GOOGLE_WORKSPACE_SCOPES.forEach((scope) => googleDriveProvider.addScope(scope));
 
 // Helper to recursively remove undefined properties or replace them with null
-function sanitizeForFirestore(obj: any): any {
+export function sanitizeForFirestore(obj: any): any {
   if (obj === undefined) {
     return null;
   }
@@ -128,10 +151,10 @@ function sanitizeForFirestore(obj: any): any {
     return obj;
   }
   if (Array.isArray(obj)) {
-    return obj.map(sanitizeForFirestore);
+    return obj.filter((item: any) => item !== undefined).map(sanitizeForFirestore);
   }
   if (typeof obj === "object") {
-    // If it's a custom class/object from Firestore SDK, don't mutate or traverse it
+    // If it's a custom class/object from Firestore SDK (e.g. FieldValue, Timestamp), don't mutate or traverse it
     if (obj.constructor && obj.constructor.name !== "Object" && obj.constructor.name !== "Array") {
       return obj;
     }
@@ -145,6 +168,8 @@ function sanitizeForFirestore(obj: any): any {
   }
   return obj;
 }
+
+export const cleanForFirestore = sanitizeForFirestore;
 
 export function setDoc<T>(reference: DocumentReference<T>, data: WithFieldValue<T>): Promise<void>;
 export function setDoc<T>(reference: DocumentReference<T>, data: PartialWithFieldValue<T>, options: SetOptions): Promise<void>;

@@ -1,10 +1,20 @@
+export interface TokenBreakdown {
+  inputTokens: number;      // System directives, base prompt, and conversation history
+  retrievalTokens: number;  // Dynamic lorebook entities, semantic RAG sources, and persistent memory
+  thinkingTokens: number;   // Model chain-of-thought and internal reasoning budget
+  outputTokens: number;     // Generated narrative scene prose and dialogue
+  totalTokens: number;      // Total tokens consumed for this turn
+}
+
 export interface MessageVersion {
   id: string;
   content: string;
   timestamp: string;
   chainOfThought?: string;
   tokensUsed?: number;
+  tokenBreakdown?: TokenBreakdown;
   speakerIds?: string[];
+  contextEntities?: string[];
 }
 
 export interface Message {
@@ -14,21 +24,16 @@ export interface Message {
   timestamp: string;
   chainOfThought?: string;
   tokensUsed?: number;
+  tokenBreakdown?: TokenBreakdown;
   speakerIds?: string[]; // IDs of CharacterProfiles speaking/mentioned in this dialogue box
+  contextEntities?: string[]; // Snapshot of Lore Database entities injected into context during this turn
   projectId?: string;
   versions?: MessageVersion[];
   activeVersionIndex?: number;
   attachments?: any[];
-}
-
-export interface PromptVaultItem {
-  id: string;
-  characterName: string; // Deprecated or primary tag
-  characterTags?: string[]; // Multiple characters in this asset
-  folder: string; // e.g., "Main Cast", "NPCs", "Setting Prompts", "Factions"
-  title: string;
-  promptText: string;
-  imageUrl?: string; // Optional image URL
+  turnHeader?: string;
+  isTimelineAnomaly?: boolean;
+  retrySeconds?: number;
 }
 
 export interface RelationshipTrack {
@@ -51,6 +56,7 @@ export interface CharacterProfile {
   isPlayerCharacter?: boolean; // PC vs NPC fallback flag
   isInScene?: boolean; // 2.0 Lorebook: Explicitly present in the active scene / party
   activationKeys?: string[]; // 2.0 Lorebook: Trigger keywords for selective context injection
+  keywords?: string[]; // Compatibility alias for activation keys
   relationships?: string; // Relationships, key figures, or item owner
   factionName?: string; // Faction/Affiliation name
   isMook?: boolean; // Mook identifier for NPC grunts
@@ -59,6 +65,21 @@ export interface CharacterProfile {
   signatureItems?: string; // Signature items or equipment (e.g. custom blaster, lucky coin, spellbook)
   romanceTracks?: RelationshipTrack[]; // Romance and relationship tracker
   linkedLoreIds?: string[]; // Links to other lore entries (e.g. ship, companion, faction, etc.)
+
+  // Granular Character Accuracy Breakdown
+  appearanceBuild?: string; // Physical build, height, silhouette, posture
+  distinguishingMarks?: string; // Facial features, scars, eyes, hair, tattoos
+  attireWardrobe?: string; // Everyday attire, armor layers, clothing style, colors
+  voiceCadence?: string; // Pitch, speed, accent, speech habits, dialogue tone
+  mannerisms?: string; // Body language, nervous tics, physical habits, posture
+  temperament?: string; // Temperament, emotional triggers, flaws, moral lines
+  motivationsSecrets?: string; // Core drives, personal goals, vulnerabilities, secrets
+  tacticalStyle?: string; // Combat tactics, fighting style, abilities under fire
+
+  // Canon & Delta Tracking (Online Lore vs. Campaign Reality)
+  canonSource?: string; // e.g. "Online Wiki / Official Canon", "Campaign Original", "Adapted / Prequel"
+  timelineStage?: string; // e.g. "Prequel (Before Official Events)", "Mid-Canon", "Sequel", "Alternate Timeline", "Campaign Original"
+  canonDelta?: string; // The delta: differences between online canon and this campaign's reality
 }
 
 export interface GeneratedImage {
@@ -129,6 +150,7 @@ export interface Project {
   narrativePerspective?: "third_person" | "second_person"; // Third Person (Sena does...) vs Second Person (You do...)
   pacing: string;
   emotionalTone: string;
+  mood?: string;
   canonSource: string;
   styleGuide: string;
   storyModules: string;
@@ -154,8 +176,88 @@ export interface Project {
   oocMinTokens?: number; // Minimum length for OOC (Out-Of-Character) response
   oocMaxTokens?: number; // Maximum length for OOC (Out-Of-Character) response
   narrativeFontSize?: "xs" | "sm" | "base" | "lg" | "xl" | "2xl" | string; // Font size of narrative and assistant text
+  adventureLogTitle?: string; // Custom editable adventure log header title
+  turnHeader?: string; // Custom editable turn header / episode template (e.g. 'The Mortician - S01E11' or '{turn}. The Household')
   slidingContextTurns?: number; // 2.0 Dynamic sliding memory window (4-30 turns)
+  activeFactIndexes?: string[]; // Selected Lore Codex fact index/universe IDs to draw trivia & context from for this campaign
   sparkRawThreadsFolderId?: string;
   sparkCodexFolderId?: string;
   lastSparkSyncTimestamp?: string;
+}
+
+export const DEFAULT_INITIAL_PROJECT: Project = {
+  id: "proj-default-nyx",
+  name: "Nyx Roleplay Campaign",
+  description: "Primary creative storytelling & roleplay campaign",
+  setting: "Custom World",
+  creatorNames: "Custom Authors",
+  customInstructions: "",
+  narrationStyle: "Vivid novel-grade detail",
+  narrativePerspective: "third_person",
+  pacing: "Default to Author(s)",
+  emotionalTone: "Default to Author(s)",
+  canonSource: "Custom Core",
+  styleGuide: "",
+  storyModules: "",
+  userNickname: "Adventurer",
+  activeChatId: "chat-default",
+  ragSummary: "",
+  themeId: "slate",
+  chatBgPreset: "none",
+  chatBubbleStyle: "glass",
+  sources: [],
+  persistentContext: "",
+  plotOverview: "",
+  turnHeader: ""
+};
+
+/**
+ * Checks if the pacing has been explicitly customized/adjusted by the user.
+ * Returns false when unset, empty, or set to author defaults, meaning pacing should naturally default to the author(s) in the style.
+ */
+export function isPacingCustomAdjusted(val?: string): boolean {
+  if (!val || typeof val !== "string") return false;
+  const t = val.trim().toLowerCase();
+  if (!t) return false;
+  const unadjusted = [
+    "default",
+    "default to author",
+    "default to author(s)",
+    "default to authors",
+    "author default",
+    "author style",
+    "author style default",
+    "author signature",
+    "adaptive",
+    "balanced",
+    "none"
+  ];
+  return !unadjusted.some(p => t === p || t.startsWith("default to author"));
+}
+
+/**
+ * Checks if the emotional tone / mood has been explicitly customized/adjusted by the user.
+ * Returns false when unset, empty, or set to author defaults, meaning mood should naturally default to the author(s) in the style.
+ */
+export function isMoodCustomAdjusted(val?: string): boolean {
+  if (!val || typeof val !== "string") return false;
+  const t = val.trim().toLowerCase();
+  if (!t) return false;
+  const unadjusted = [
+    "default",
+    "default to author",
+    "default to author(s)",
+    "default to authors",
+    "author default",
+    "author style",
+    "author style default",
+    "author signature",
+    "adaptive",
+    "dramatic / atmospheric",
+    "dramatic & atmospheric",
+    "dramatic",
+    "atmospheric",
+    "none"
+  ];
+  return !unadjusted.some(p => t === p || t.startsWith("default to author"));
 }

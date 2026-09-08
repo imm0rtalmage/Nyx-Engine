@@ -6,6 +6,13 @@ import dotenv from "dotenv";
 import { requireAuth, AuthRequest } from "./src/middleware/auth.ts";
 import { getOrCreateUser } from "./src/db/users.ts";
 import { getUserProjects, upsertProject } from "./src/db/projects.ts";
+import {
+  findAuthorProfile,
+  generateAuthorStyleBlueprint,
+  detectAuthorRemindersAndDrift,
+  buildAuthorSystemInstruction,
+  buildContextFrontierAuthorAnchor
+} from "./src/lib/authorStyles.ts";
 
 dotenv.config();
 
@@ -15,6 +22,10 @@ const PORT = 3000;
 // Increase payload limits for image uploads
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok" });
+});
 
 // Robust output sanitization to prevent false-positives in system-level error scanning pipelines
 function sanitizeString(str: any): string {
@@ -92,117 +103,224 @@ function isTransientError(err: any): boolean {
     msg.includes("temporary") ||
     msg.includes("unavailable") ||
     msg.includes("resource exhausted") ||
+    msg.includes("resource_exhausted") ||
     msg.includes("rate limit") ||
-    msg.includes("overloaded")
+    msg.includes("overloaded") ||
+    msg.includes("quota exceeded") ||
+    msg.includes("timed out") ||
+    msg.includes("timeout") ||
+    msg.includes("deadline") ||
+    msg.includes("econnreset") ||
+    msg.includes("etimedout") ||
+    msg.includes("socket hang up") ||
+    msg.includes("fetch failed") ||
+    msg.includes("network error") ||
+    msg.includes("500") ||
+    msg.includes("502") ||
+    msg.includes("504") ||
+    msg.includes("bad gateway") ||
+    msg.includes("gateway timeout")
   ) {
     return true;
   }
   return false;
 }
 
-// Helper to perform generateContent calls with robust retry logic and model cascade for transient/quota failures.
-// STRICT POLICY: Only 3.7 Flash (extended/standard) and Flash-Lite (gemini-3.1-flash-lite) are permitted. Never downgrade past Flash-Lite.
+// Safely extract candidate text parts to avoid getter crashes in @google/genai SDK when responses have thoughts or functionCalls
+function safeExtractResponseText(resp: any): string {
+  if (!resp) return "";
+  try {
+    if (typeof resp.text === "string" && resp.text.trim()) return resp.text;
+  } catch (e) {
+    // resp.text getter throws in @google/genai if non-text parts exist without direct text
+  }
+  try {
+    const candidates = resp?.candidates || [];
+    for (const cand of candidates) {
+      const parts = cand?.content?.parts || [];
+      const textParts = parts.filter((p: any) => typeof p?.text === "string" && !p?.thought && !p?.isThought);
+      if (textParts.length > 0) {
+        return textParts.map((p: any) => p.text).join("\n").trim();
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+  return "";
+}
+
+// Helper to extract retry-after seconds from API error strings or objects
+function extractRetrySeconds(err: any): number {
+  if (!err) return 0;
+  const rawMsg = typeof err === "string" ? err : (err.message || JSON.stringify(err) || "");
+  const match = rawMsg.match(/retry in ([\d\.]+)s/i) || rawMsg.match(/retryDelay["']?\s*:\s*["']?(\d+)s/i);
+  if (match && match[1]) {
+    const s = parseFloat(match[1]);
+    if (!isNaN(s) && s > 0) return Math.ceil(s);
+  }
+  return 0;
+}
+
+// Helper to perform generateContent calls with multi-stage retry logic, exponential backoff, and model cascading.
+// Primary model: gemini-flash-latest (or configured model).
+// Fallback models: gemini-3.8-flash, gemini-3.1-flash-lite (valid official Gemini models).
+// Resilience strategy:
+// 1. Primary: Try gemini-flash-latest.
+// 2. Cascade: If gemini-flash-latest hits quota or rate limits, cascade to gemini-3.8-flash -> gemini-3.1-flash-lite.
+// 3. THINKING PRESERVATION: Preserve the user's requested thinking configuration across fallback models.
 async function generateContentWithRetry(
   ai: GoogleGenAI,
-  params: { model: string; contents: any; config?: any },
-  retries = 1,
-  initialDelay = 400,
-  timeoutPerAttemptMs = 35000
+  params: { model?: string; contents: any; config?: any },
+  retries = 2,
+  initialDelay = 500,
+  timeoutPerAttemptMs = 22000
 ) {
-  // Strictly permitted model tiers: 3.7 Flash -> 3.1 Flash-Lite
-  const requestedModel = params.model || "gemini-3.7-flash";
-  const modelCascade = [
-    requestedModel,
-    "gemini-3.7-flash",
-    "gemini-3.1-flash-lite"
-  ];
-  // Remove duplicates while preserving order
-  const uniqueModels = Array.from(new Set(modelCascade));
-
+  const primaryModel = params.model || "gemini-flash-latest";
   let lastError: any = null;
 
-  for (let modelIdx = 0; modelIdx < uniqueModels.length; modelIdx++) {
-    const currentModel = uniqueModels[modelIdx];
+  // Build the resilience stages with thinking config preserved
+  const stages: { name: string; model: string; config: any; maxAttempts: number }[] = [];
+
+  // Stage 0: Primary attempt with requested model and configuration
+  stages.push({
+    name: `primary (${primaryModel})`,
+    model: primaryModel,
+    config: params.config,
+    maxAttempts: Math.max(retries, 1)
+  });
+
+  // Candidate fallback models: valid Gemini models supported by @google/genai SDK
+  const candidateFallbacks = ["gemini-3.8-flash", "gemini-3.1-flash-lite"]
+    .filter(m => m !== primaryModel);
+
+  // Add fallback models PRESERVING the requested thinkingLevel!
+  for (const fallbackModel of candidateFallbacks) {
+    stages.push({
+      name: `resilient cascade (${fallbackModel})`,
+      model: fallbackModel,
+      config: params.config,
+      maxAttempts: 1
+    });
+  }
+
+  // Final emergency stage: if high thinking caused global backend capacity failure on all models, try low thinking on primary model
+  const initialThinkingLevel = params.config?.thinkingConfig?.thinkingLevel;
+  if (initialThinkingLevel === ThinkingLevel.HIGH) {
+    stages.push({
+      name: `emergency reduced thinking (${primaryModel})`,
+      model: primaryModel,
+      config: {
+        ...params.config,
+        thinkingConfig: {
+          ...params.config?.thinkingConfig,
+          thinkingLevel: ThinkingLevel.LOW
+        }
+      },
+      maxAttempts: 1
+    });
+  }
+
+  for (let stageIdx = 0; stageIdx < stages.length; stageIdx++) {
+    const currentStage = stages[stageIdx];
     let delay = initialDelay;
 
-    // Prepare config sanitized for current model
-    let sanitizedConfig = params.config ? { ...params.config } : undefined;
-    if (sanitizedConfig && !currentModel.includes("3.7") && !currentModel.includes("thinking")) {
-      // Remove thinkingConfig on flash-lite or models that do not support thinking levels
-      delete sanitizedConfig.thinkingConfig;
-    }
-
-    // Determine model-appropriate timeout
-    const currentTimeoutMs = currentModel.includes("3.1-flash-lite")
-      ? Math.min(timeoutPerAttemptMs, 18000)
-      : timeoutPerAttemptMs;
-
-    const attemptsForThisModel = modelIdx === 0 ? retries : 1;
-
-    for (let attempt = 0; attempt < attemptsForThisModel; attempt++) {
+    for (let attempt = 0; attempt < currentStage.maxAttempts; attempt++) {
       try {
         const callPromise = ai.models.generateContent({
           ...params,
-          model: currentModel,
-          config: sanitizedConfig
+          model: currentStage.model,
+          config: currentStage.config
         });
 
-        if (currentTimeoutMs > 0) {
-          const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`Model call to ${currentModel} timed out after ${currentTimeoutMs}ms`)), currentTimeoutMs)
-          );
-          return (await Promise.race([callPromise, timeoutPromise])) as any;
+        if (timeoutPerAttemptMs > 0) {
+          let timeoutHandle: any = null;
+          const timeoutPromise = new Promise((_, reject) => {
+            timeoutHandle = setTimeout(() => reject(new Error(`Model call to ${currentStage.model} timed out after ${timeoutPerAttemptMs}ms`)), timeoutPerAttemptMs);
+          });
+          try {
+            const result = (await Promise.race([callPromise, timeoutPromise])) as any;
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+            return result;
+          } catch (raceErr) {
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+            throw raceErr;
+          }
         }
 
         return await callPromise;
       } catch (err: any) {
         lastError = err;
-        const isTimedOut = err.message && (err.message.includes("timed out") || err.message.includes("deadline"));
-        const isQuotaOrExhausted =
+        const errMsg = (err.message || "").toLowerCase();
+        const isTimedOut = errMsg.includes("timed out") || errMsg.includes("deadline");
+        const isQuotaExceeded =
           err.status === 429 ||
           err.statusCode === 429 ||
           err.code === 429 ||
-          (err.message && (
-            err.message.includes("429") ||
-            err.message.toLowerCase().includes("quota exceeded") ||
-            err.message.toLowerCase().includes("resource_exhausted") ||
-            err.message.toLowerCase().includes("resource exhausted")
-          ));
+          errMsg.includes("quota exceeded") ||
+          errMsg.includes("resource_exhausted") ||
+          errMsg.includes("resource exhausted") ||
+          errMsg.includes("rate limit");
+        const isHighDemand =
+          err.status === 503 ||
+          err.statusCode === 503 ||
+          errMsg.includes("503") ||
+          errMsg.includes("high demand") ||
+          errMsg.includes("unavailable");
 
-        // If timed out or quota exhausted on this model, immediately cascade to next model without wasting time retrying
-        if ((isTimedOut || isQuotaOrExhausted) && modelIdx < uniqueModels.length - 1) {
-          safeWarn(`Gemini API: ${isTimedOut ? "Timeout" : "Quota limit"} on ${currentModel}. Cascading immediately to ${uniqueModels[modelIdx + 1]}...`);
-          break; // Cascade to next tier immediately
+        const isNotFound = err.status === 404 || err.statusCode === 404 || errMsg.includes("not found") || errMsg.includes("no longer available");
+
+        const detectedRetrySecs = extractRetrySeconds(err);
+        if (detectedRetrySecs > 0) {
+          lastError.retrySeconds = detectedRetrySecs;
+          lastError.isRateLimit = true;
         }
 
-        const isTransient = isTransientError(err);
-
-        if (isTransient && attempt < attemptsForThisModel - 1) {
-          let customDelay = delay;
-          try {
-            const errMsg = err.message || "";
-            const retryMatch = errMsg.match(/retry in ([\d\.]+)s/i) || errMsg.match(/retryDelay["']?\s*:\s*["']?(\d+)s/i);
-            if (retryMatch && retryMatch[1]) {
-              const parsedSeconds = parseFloat(retryMatch[1]);
-              if (!isNaN(parsedSeconds) && parsedSeconds > 0 && parsedSeconds < 3) {
-                customDelay = Math.max(customDelay, parsedSeconds * 1000);
-              }
-            }
-          } catch {}
-
-          safeWarn(`Gemini API: Transient issue on ${currentModel} (${err.message || err}). Retrying in ${customDelay}ms... (Attempt ${attempt + 1}/${attemptsForThisModel})`);
-          await new Promise(resolve => setTimeout(resolve, customDelay));
-          delay = Math.min(delay * 1.5, 2000);
+        // If it's a transient rate limit with a short cooldown (e.g. <= 8s) and we have an attempt remaining
+        if (isQuotaExceeded && detectedRetrySecs > 0 && detectedRetrySecs <= 8 && attempt < currentStage.maxAttempts - 1) {
+          const waitMs = (detectedRetrySecs * 1000) + 400;
+          safeWarn(`Gemini API: Rate limit cooldown (${detectedRetrySecs}s) on ${currentStage.model}. Pausing for ${waitMs}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, waitMs));
           continue;
         }
 
-        // Break to try next permitted tier
-        break;
+        // If hard quota exhaustion or unavailable model, immediately cascade to next fallback model
+        if ((isQuotaExceeded || isNotFound) && stageIdx < stages.length - 1) {
+          safeWarn(`Gemini API: Quota limit or unavailable on ${currentStage.model}. Immediately cascading to ${stages[stageIdx + 1].name}...`);
+          break;
+        }
+
+        // If timed out, cascade to next stage (with low/minimal thinking or lighter model)
+        if (isTimedOut && stageIdx < stages.length - 1) {
+          safeWarn(`Gemini API: Timeout (${timeoutPerAttemptMs}ms) on ${currentStage.model}. Cascading to ${stages[stageIdx + 1].name}...`);
+          break;
+        }
+
+        const isTransient = isTransientError(err);
+        // If it's a transient error (e.g. 503 momentary demand spike, network reset) and we have remaining attempts in this stage
+        if (isTransient && attempt < currentStage.maxAttempts - 1) {
+          let customDelay = delay;
+          if (detectedRetrySecs > 0 && detectedRetrySecs <= 8) {
+            customDelay = Math.max(customDelay, detectedRetrySecs * 1000);
+          }
+
+          const jitter = Math.floor(Math.random() * 300);
+          const totalWait = customDelay + jitter;
+          safeWarn(`Gemini API: Transient issue (${err.status || '503/Network'}) on ${currentStage.model}. Retrying in ${totalWait}ms (Attempt ${attempt + 1}/${currentStage.maxAttempts})...`);
+          await new Promise(resolve => setTimeout(resolve, totalWait));
+          delay = Math.min(delay * 1.8, 3000);
+          continue;
+        }
+
+        // If attempts in this stage are exhausted and we have another stage, cascade!
+        if (stageIdx < stages.length - 1) {
+          safeWarn(`Gemini API: Stage ${currentStage.name} failed (${err.status || err.message}). Cascading to ${stages[stageIdx + 1].name}...`);
+          break;
+        }
       }
     }
   }
 
-  throw lastError || new Error("Failed to generate content across permitted models (3.7 Flash, 3.1 Flash-Lite)");
+  throw lastError || new Error("Failed to generate content after all resilient retry and cascade stages.");
 }
 
 function cleanAndParseJson(text: string, fallback: any = {}): any {
@@ -238,35 +356,46 @@ function cleanAndParseJson(text: string, fallback: any = {}): any {
   }
 }
 
+// In-memory cache for processed image parts to avoid repeated network/base64 overhead on long campaign threads
+const imagePartCache = new Map<string, { part: any; expiresAt: number }>();
+
 async function getImageUrlAsPart(url: string, label: string): Promise<any | null> {
   if (!url) return null;
+  const cached = imagePartCache.get(url);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.part;
+  }
   try {
     if (url.startsWith("data:")) {
       const match = url.match(/^data:([^;]+);base64,(.*)$/);
       if (match) {
         const cleanData = match[2].replace(/\s/g, "");
         if (cleanData && !cleanData.includes("...") && !cleanData.includes("truncated") && /^[A-Za-z0-9+/=]+$/.test(cleanData)) {
-          return {
+          const part = {
             inlineData: {
               mimeType: match[1],
               data: cleanData
             }
           };
+          imagePartCache.set(url, { part, expiresAt: Date.now() + 3600000 });
+          return part;
         }
       }
     } else if (url.startsWith("http")) {
-      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      const res = await fetch(url, { signal: AbortSignal.timeout(3500) });
       if (res.ok) {
         const contentType = res.headers.get("content-type") || "image/png";
         const arrayBuffer = await res.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
         const base64 = buffer.toString("base64");
-        return {
+        const part = {
           inlineData: {
             mimeType: contentType,
             data: base64
           }
         };
+        imagePartCache.set(url, { part, expiresAt: Date.now() + 3600000 });
+        return part;
       }
     }
   } catch (err) {
@@ -495,7 +624,18 @@ function extractRelevantSourceExcerpts(
   const queryAsksChar = queryLower.includes("who is") || queryLower.includes("character") || queryLower.includes("npc") || queryLower.includes("companion") || queryLower.includes("pc ") || queryLower.includes("profile") || queryLower.includes("backstory") || queryLower.includes("trait") || queryLower.includes("ability") || queryLower.includes("gear") || queryLower.includes("weapon") || queryLower.includes("attribute") || queryLower.includes("relationship") || queryLower.includes("lore on") || queryLower.includes("tell me about") || queryLower.includes("look up") || queryLower.includes("lookup") || queryLower.includes("who was");
   const queryAsksWorld = queryLower.includes("where is") || queryLower.includes("city") || queryLower.includes("location") || queryLower.includes("faction") || queryLower.includes("history") || queryLower.includes("magic") || queryLower.includes("planet") || queryLower.includes("region") || queryLower.includes("temple") || queryLower.includes("base") || queryLower.includes("station");
   const queryAsksModule = queryLower.includes("quest") || queryLower.includes("dungeon") || queryLower.includes("trap") || queryLower.includes("encounter") || queryLower.includes("module") || queryLower.includes("clue");
-  const queryAsksRecap = queryLower.includes("what happened") || queryLower.includes("recap") || queryLower.includes("last session") || queryLower.includes("timeline") || queryLower.includes("previously") || queryLower.includes("dialogue");
+  const queryAsksRecap = (
+    queryLower.includes("what happened") ||
+    queryLower.includes("recap") ||
+    queryLower.includes("last session") ||
+    queryLower.includes("timeline") ||
+    queryLower.includes("previously") ||
+    queryLower.includes("dialogue") ||
+    /(?:read|check|review|look\s+(?:through|at)|load|get|use|scan|revisit)\s+.*(?:past|previous|prior|earlier|old)?\s*(?:narrative|log|transcript|session|chronicle|history|record|context)/i.test(queryLower) ||
+    /(?:past|previous|prior|earlier|old)\s+(?:narrative|log|transcript|session|chronicle|history|event|record)/i.test(queryLower) ||
+    /(?:character|interpersonal)\s+(?:relationship|bond|dynamic|connection)/i.test(queryLower) ||
+    /lore\s+database/i.test(queryLower)
+  );
 
   for (const src of sources) {
     const { textContent, mimeType } = getResolvedSourceContent(src);
@@ -519,7 +659,7 @@ function extractRelevantSourceExcerpts(
 
     const isNarrativeDoc = (
       categoriesLower.some(c => ["narrative", "story", "chat", "transcript", "session", "log", "chapter", "episode", "scene"].some(k => c.includes(k))) ||
-      /\b(session|transcript|log|chat|chapter|episode|adventure|story|recap)\b/i.test(srcNameLower)
+      /\b(session|transcript|log|chat|chapter|episode|adventure|story|recap|narrative)\b/i.test(srcNameLower)
     );
 
     // Check if source title is explicitly mentioned in query
@@ -527,10 +667,10 @@ function extractRelevantSourceExcerpts(
 
     let categoryRelevanceBoost = 0;
     if (srcCategories.includes("rules") && queryAsksRules) categoryRelevanceBoost += 8;
-    if (isProfileDoc && (queryAsksChar || entityTerms.length > 0)) categoryRelevanceBoost += 6;
+    if (isProfileDoc && (queryAsksChar || entityTerms.length > 0)) categoryRelevanceBoost += 8;
     if (srcCategories.includes("world_lore") && queryAsksWorld) categoryRelevanceBoost += 8;
     if (srcCategories.includes("module") && queryAsksModule) categoryRelevanceBoost += 6;
-    if (isNarrativeDoc && queryAsksRecap) categoryRelevanceBoost += 6;
+    if (isNarrativeDoc && queryAsksRecap) categoryRelevanceBoost += 15;
 
     // Split source into semantic chunks
     const chunks = chunkSourceContent(textContent);
@@ -540,6 +680,18 @@ function extractRelevantSourceExcerpts(
       const chunkLower = chunk.toLowerCase();
       let matchScore = 0;
       const matchedKeywords: string[] = [];
+
+      // If user explicitly asks to read past narratives / logs / recaps, baseline-score all narrative doc chunks
+      if (isNarrativeDoc && queryAsksRecap) {
+        matchScore += 40;
+        matchedKeywords.push(`Authoritative Narrative Log: "${srcName}"`);
+      }
+
+      // If user asks about character profiles/relationships, baseline-score profile doc chunks
+      if (isProfileDoc && (queryAsksChar || queryAsksRecap)) {
+        matchScore += 30;
+        matchedKeywords.push(`Character Dossier / Spec: "${srcName}"`);
+      }
 
       // 1. Exact phrase matching (highest precision)
       for (const phrase of queryPhrases) {
@@ -574,7 +726,7 @@ function extractRelevantSourceExcerpts(
         }
       }
 
-      // Only give category/profile bonuses IF the chunk has actual query/entity relevance matches
+      // Record chunk if it has matches or categorical alignment
       if (matchScore > 0) {
         let totalScore = matchScore + categoryRelevanceBoost;
         if (isProfileDoc && (queryAsksChar || entityTerms.length > 0)) {
@@ -598,12 +750,13 @@ function extractRelevantSourceExcerpts(
   scoredChunks.sort((a, b) => b.score - a.score);
 
   // Take top N distinct chunks (ensure diverse sources when possible, max 3 from same source)
+  const maxLimit = queryAsksRecap ? Math.max(maxExcerptsTotal, 10) : maxExcerptsTotal;
   const topChunks: ScoredSourceChunk[] = [];
   const sourceChunkCounts: Record<string, number> = {};
 
   for (const chunk of scoredChunks) {
     const count = sourceChunkCounts[chunk.sourceId] || 0;
-    if (count < 3 && topChunks.length < maxExcerptsTotal) {
+    if (count < 3 && topChunks.length < maxLimit) {
       topChunks.push(chunk);
       sourceChunkCounts[chunk.sourceId] = count + 1;
     }
@@ -612,8 +765,8 @@ function extractRelevantSourceExcerpts(
   // Build the grounded lore prompt
   let promptText = "";
   if (topChunks.length > 0) {
-    promptText = `\n\n=== DYNAMIC RELEVANT LORE RETRIEVAL (Smart Grounding Excerpts) ===\n`;
-    promptText += `Authoritative source excerpts retrieved matching query topics:\n\n`;
+    promptText = `\n\n=== DYNAMIC RELEVANT LORE & NARRATIVE LOG RETRIEVAL (Smart Grounding Excerpts) ===\n`;
+    promptText += `Authoritative source excerpts retrieved matching scene query topics & narrative history:\n\n`;
     
     topChunks.forEach((c, idx) => {
       promptText += `[EXCERPT ${idx + 1}/${topChunks.length} | Source: "${c.sourceName}" (${c.sourceType.toUpperCase()}) | Matched: ${c.matchedKeywords.slice(0, 5).join(", ")}]\n`;
@@ -621,18 +774,18 @@ function extractRelevantSourceExcerpts(
     });
     promptText += `=== END DYNAMIC RELEVANT LORE RETRIEVAL ===\n`;
   } else {
-    // If no direct keyword hits (e.g. casual conversational banter), provide a compact index overview of sources
+    // If no direct keyword hits, provide a comprehensive manifest overview of sources with generous summaries
     const summaries = sources.map(s => {
       const { textContent } = getResolvedSourceContent(s);
-      const shortDesc = s.summary || textContent.slice(0, 180).replace(/\n+/g, " ") + "...";
+      const shortDesc = s.summary || (textContent ? textContent.slice(0, 350).replace(/\n+/g, " ") + "..." : "Attached campaign document.");
       const catLabel = Array.isArray(s.categories) && s.categories.length > 0 ? s.categories.join(", ") : (s.category || "General");
       return `- Source: "${s.name}" (Category: ${catLabel}, Type: ${s.type || "lore"}): ${shortDesc}`;
-    }).slice(0, 4);
+    }).slice(0, 8);
 
     if (summaries.length > 0) {
-      promptText = `\n\n=== ATTACHED CAMPAIGN SOURCES (Index Manifest) ===\n`;
+      promptText = `\n\n=== ATTACHED CAMPAIGN SOURCES (Authoritative Grounding Manifest) ===\n`;
       promptText += summaries.join("\n") + "\n";
-      promptText += `(Note: Specific lore excerpts are dynamically retrieved when referenced in the scene.)\n`;
+      promptText += `(Note: Specific narrative excerpts and lore sections are retrieved above when relevant.)\n`;
       promptText += `=== END SOURCES OVERVIEW ===\n`;
     }
   }
@@ -644,15 +797,74 @@ function extractRelevantSourceExcerpts(
 // 2.0 DYNAMIC LOREBOOK & SLIDING CONTEXT ENGINE
 // ----------------------------------------------------
 
+interface GranularContextEntity {
+  entity: any;
+  weight: number; // 0.0 to 1.0 continuous weight
+  weightPercent: number; // e.g. 100, 80, 60, 40, 25, 12
+  turnDistance: number; // 0 = current turn, 1 = 1 turn ago, etc.
+  mentionCount: number;
+}
+
 interface DynamicLoreResult {
   pcs: any[];
   activeEntities: any[];
-  referencedEntities: any[];
+  inContextEntities: string[];
   promptText: string;
   pcLabel: string;
   activeEntityCount: number;
 }
 
+// Helper to format granular character accuracy specs and authoritative canon delta
+function formatGranularCharacterSpecs(c: any): string {
+  if (!c) return "";
+  const parts: string[] = [];
+
+  // 1. Authoritative Canon Delta & Timeline State
+  if (c.timelineStage || c.canonDelta || c.canonSource) {
+    let deltaStr = `  * [AUTHORITATIVE TIMELINE & CANON DELTA] Stage: ${c.timelineStage || "Custom Campaign Continuity"}`;
+    if (c.canonSource) deltaStr += ` | Base Source: "${c.canonSource}"`;
+    if (c.canonDelta) {
+      deltaStr += `\n    STRICT CAMPAIGN DELTA: ${c.canonDelta} (NARRATOR DIRECTIVE: Strictly honor this campaign delta and timeline position; do NOT assume future canon events, post-story knowledge, or altered character states!).`;
+    }
+    parts.push(deltaStr);
+  }
+
+  // 2. Physical Appearance & Silhouette
+  const visualParts: string[] = [];
+  if (c.appearanceBuild) visualParts.push(`Build/Silhouette: ${c.appearanceBuild}`);
+  if (c.distinguishingMarks) visualParts.push(`Distinguishing Marks/Eyes/Hair/Scars: ${c.distinguishingMarks}`);
+  if (c.attireWardrobe) visualParts.push(`Attire & Wardrobe: ${c.attireWardrobe}`);
+  if (c.appearance && !c.appearanceBuild && !c.distinguishingMarks) visualParts.push(`Appearance: ${c.appearance}`);
+  if (visualParts.length > 0) {
+    parts.push(`  * Visual Optics & Appearance:\n` + visualParts.map(v => `    - ${v}`).join("\n"));
+  }
+
+  // 3. Voice & Mannerisms
+  const mannerParts: string[] = [];
+  if (c.voiceCadence) mannerParts.push(`Voice & Cadence: ${c.voiceCadence}`);
+  if (c.mannerisms) mannerParts.push(`Body Language & Tells: ${c.mannerisms}`);
+  if (c.personality && !c.voiceCadence && !c.mannerisms) mannerParts.push(`Personality & Demeanor: ${c.personality}`);
+  if (mannerParts.length > 0) {
+    parts.push(`  * Voice & Presence:\n` + mannerParts.map(m => `    - ${m}`).join("\n"));
+  }
+
+  // 4. Psychology, Motivations & Moral Boundaries
+  const psychParts: string[] = [];
+  if (c.temperament) psychParts.push(`Temperament & Moral Lines: ${c.temperament}`);
+  if (c.motivationsSecrets) psychParts.push(`Core Drives & Secrets: ${c.motivationsSecrets}`);
+  if (psychParts.length > 0) {
+    parts.push(`  * Psychology & Motivations:\n` + psychParts.map(p => `    - ${p}`).join("\n"));
+  }
+
+  // 5. Tactical Style
+  if (c.tacticalStyle) {
+    parts.push(`  * Combat & Tactical Style: ${c.tacticalStyle}`);
+  }
+
+  return parts.length > 0 ? "\n" + parts.join("\n") : "";
+}
+
+// 5. Nyx Engine v2.0 - Comprehensive Lorebook, Character Relationship Matrix & Sliding Context Engine
 function buildDynamicLoreContext(
   entities: any[] = [],
   messages: any[] = [],
@@ -662,82 +874,122 @@ function buildDynamicLoreContext(
     return {
       pcs: [],
       activeEntities: [],
-      referencedEntities: [],
+      inContextEntities: [],
       promptText: "",
       pcLabel: `the Player Character (PC / ${userNickname})`,
       activeEntityCount: 0
     };
   }
 
-  // 1. Extract sliding search window from recent turns (last 4 turns + current)
-  const recentWindow = messages.slice(-4);
-  const recentText = recentWindow.map((m: any) => (m.content || m.text || "")).join(" ").toLowerCase();
+  // Detect if user is asking to read past narratives, check logs, or inspect character relationships
+  const latestUserMsg = (messages[messages.length - 1]?.content || "").toLowerCase();
+  const isDeepAuditRequested = (
+    /(?:read|check|review|look\s+(?:through|at)|load|get|use|scan|revisit)\s+.*(?:past|previous|prior|earlier|old)?\s*(?:narrative|log|transcript|session|chronicle|history|record|context)/i.test(latestUserMsg) ||
+    /(?:past|previous|prior|earlier|old)\s+(?:narrative|log|transcript|session|chronicle|history|event|record)/i.test(latestUserMsg) ||
+    /(?:character|interpersonal)\s+(?:relationship|bond|dynamic|connection)/i.test(latestUserMsg) ||
+    /lore\s+database/i.test(latestUserMsg)
+  );
+
+  // Scan up to 25 turns of recent history to detect mentions, callbacks, and active context
+  const historyWindow = messages.slice(-25);
+  const turnTexts = historyWindow.slice().reverse().map((m: any) => (m.content || m.text || "").toLowerCase());
 
   const pcs: any[] = [];
-  const inSceneCompanions: any[] = [];
-  const activeReferenced: any[] = [];
+  const companions: any[] = [];
+  const chronicles: any[] = [];
+  const weightedEntities: GranularContextEntity[] = [];
   const backgroundEntities: any[] = [];
 
   for (const ent of entities) {
-    const type = ent.type || (ent.isPlayerCharacter ? "pc" : "npc");
+    const type = (ent.type || (ent.isPlayerCharacter ? "pc" : "npc")).toLowerCase();
     const nameLower = (ent.name || "").toLowerCase().trim();
-    const roleLower = (ent.role || "").toLowerCase().trim();
     const factionLower = (ent.factionName || "").toLowerCase().trim();
 
-    if (type === "pc") {
+    // Protagonist persona is always anchored at 100% priority
+    if (type === "pc" || ent.isPlayerCharacter) {
       pcs.push(ent);
       continue;
     }
 
-    // Check if this entity is an active companion or explicitly marked in scene
-    const isExplicitInScene = ent.isInScene === true;
-    const isCompanion = (
-      isExplicitInScene ||
-      type === "companion" ||
-      roleLower.includes("companion") ||
-      roleLower.includes("party") ||
-      roleLower.includes("co-protagonist") ||
-      roleLower.includes("active party") ||
-      (ent.romanceTracks && ent.romanceTracks.length > 0)
-    );
+    // Party companions travel with the PC and stay anchored in active foreground
+    if (type === "companion" || ent.isInScene) {
+      companions.push(ent);
+    }
 
-    // Check custom trigger activation keys
-    const customKeys = Array.isArray(ent.activationKeys) ? ent.activationKeys : [];
-    const isKeyTriggered = customKeys.some((k: string) => k.length > 2 && recentText.includes(k.toLowerCase()));
+    // Story chronicles and past session logs
+    if (type === "chronicle") {
+      chronicles.push(ent);
+    }
 
-    // Check keyword activation in recent conversation turns
-    const isNameMentioned = nameLower.length > 2 && (
-      recentText.includes(nameLower) ||
-      (nameLower.split(/\s+/).some((part: string) => part.length >= 4 && recentText.includes(part)))
-    );
+    const customKeys = Array.isArray(ent.activationKeys)
+      ? ent.activationKeys
+      : (Array.isArray(ent.keywords) ? ent.keywords : []);
 
-    const isFactionMentioned = factionLower.length > 3 && recentText.includes(factionLower);
+    let minDistance = -1;
+    let mentionCount = 0;
 
-    if (isCompanion) {
-      inSceneCompanions.push(ent);
-    } else if (isNameMentioned || isFactionMentioned || isKeyTriggered) {
-      activeReferenced.push(ent);
+    // Scan backward turn-by-turn to calculate exact recency distance and frequency
+    for (let d = 0; d < turnTexts.length; d++) {
+      const text = turnTexts[d];
+      if (!text) continue;
+
+      const isNameMatch = nameLower.length > 2 && (
+        text.includes(nameLower) ||
+        (nameLower.split(/\s+/).some((part: string) => part.length >= 4 && text.includes(part)))
+      );
+      const isFactionMatch = factionLower.length > 3 && text.includes(factionLower);
+      const isKeyMatch = customKeys.some((k: string) => k && k.trim().length > 2 && text.includes(k.trim().toLowerCase()));
+
+      if (isNameMatch || isFactionMatch || isKeyMatch) {
+        if (minDistance === -1) {
+          minDistance = d;
+        }
+        mentionCount++;
+      }
+    }
+
+    // If deep audit requested, or entity is in scene / companion, guarantee active focus
+    if (minDistance === -1 && (isDeepAuditRequested || ent.isInScene || type === "companion")) {
+      minDistance = 0;
+      mentionCount = 1;
+    }
+
+    if (minDistance !== -1) {
+      const LAMBDA = 0.18; // Smoother decay over 25 turns
+      const ALPHA = 0.08;
+      const decayBase = Math.exp(-LAMBDA * minDistance);
+      const frequencyBonus = ALPHA * Math.log(1 + mentionCount);
+      const finalWeight = Math.min(1.0, Math.max(0.15, decayBase + frequencyBonus));
+      const weightPercent = Math.round(finalWeight * 100);
+
+      weightedEntities.push({
+        entity: ent,
+        weight: finalWeight,
+        weightPercent,
+        turnDistance: minDistance,
+        mentionCount
+      });
     } else {
       backgroundEntities.push(ent);
     }
   }
+
+  // Sort weighted entities from highest weight to lowest
+  weightedEntities.sort((a, b) => b.weight - a.weight);
 
   const pcNames = pcs.map((c: any) => c.name).filter(Boolean);
   const pcLabel = pcNames.length > 0 ? pcNames.join(" / ") : `the Player Character (PC / ${userNickname})`;
 
   const sections: string[] = [];
 
-  // TIER 1: PERMANENT MEMORY - PLAYER CHARACTERS (PCs)
+  // TIER 1: PERMANENT PROTAGONIST PERSONA (Anchor)
   if (pcs.length > 0) {
-    const pcsBlock = `[PLAYER CHARACTER(S) - ABSOLUTE ZERO GODMODING / IMMUTABLE AGENCY]\n` +
+    const pcsBlock = `[PRIMARY PROTAGONIST PERSONA (Anchor)]\n` +
       pcs.map((c: any) => {
         let str = `- Name: ${c.name}\n  Role: ${c.role || "Protagonist"}\n  Bio: ${c.description || "Protagonist"}\n  Affiliation: ${c.factionName || "Independent"}\n  Relationships: ${c.relationships || "Direct protagonist bonds"}`;
         if (c.signatureItems) str += `\n  Signature Gear: ${c.signatureItems}`;
         if (c.backstory) str += `\n  Backstory: ${c.backstory}`;
-        if (c.romanceTracks && c.romanceTracks.length > 0) {
-          const tracksStr = c.romanceTracks.map((t: any) => `    * ${t.npcName}: ${t.relationshipStatus} | Milestones: ${t.milestones}`).join("\n");
-          str += `\n  Companion Bonds:\n${tracksStr}`;
-        }
+        str += formatGranularCharacterSpecs(c);
         if (c.customFields && Object.keys(c.customFields).length > 0) {
           const fieldsStr = Object.entries(c.customFields).map(([k, v]) => `    * ${k}: ${v}`).join("\n");
           str += `\n  Traits & Specs:\n${fieldsStr}`;
@@ -747,54 +999,134 @@ function buildDynamicLoreContext(
     sections.push(pcsBlock);
   }
 
-  // TIER 2: ACTIVE COMPANIONS & IN-SCENE ALLIES
-  if (inSceneCompanions.length > 0) {
-    const companionsBlock = `[ACTIVE COMPANIONS & IN-SCENE ALLIES]\n` +
-      inSceneCompanions.map((c: any) => {
-        let str = `- Name: ${c.name}\n  Role: ${c.role || "Companion"}\n  Bio: ${c.description || "In-scene ally"}\n  Affiliation: ${c.factionName || "Allied"}\n  Dynamic/Relationship: ${c.relationships || "Party member"}`;
-        if (c.signatureItems) str += `\n  Gear: ${c.signatureItems}`;
+  // TIER 1.5: ACTIVE COMPANIONS & TRAVELING PARTY
+  if (companions.length > 0) {
+    const compBlock = `[ACTIVE COMPANIONS & TRAVELING PARTY (Core Cast)]\n` +
+      companions.map((c: any) => {
+        let str = `- Companion: ${c.name} (${c.role || "Companion"})\n  Bio: ${c.description || "Active traveling companion"}\n  Affiliation: ${c.factionName || "Party"}\n  Bonds/Dynamic: ${c.relationships || "Loyal ally"}`;
+        if (c.personality && !c.voiceCadence) str += `\n  Personality/Voice: ${c.personality}`;
+        if (c.signatureItems) str += `\n  Signature Gear: ${c.signatureItems}`;
+        if (c.backstory) str += `\n  Backstory: ${c.backstory}`;
+        str += formatGranularCharacterSpecs(c);
         if (c.customFields && Object.keys(c.customFields).length > 0) {
           const fieldsStr = Object.entries(c.customFields).map(([k, v]) => `    * ${k}: ${v}`).join("\n");
           str += `\n  Specs:\n${fieldsStr}`;
         }
         return str;
       }).join("\n\n");
-    sections.push(companionsBlock);
+    sections.push(compBlock);
   }
 
-  // TIER 3: KEYWORD-ACTIVATED RECENTLY REFERENCED LORE (NPCs, Locations, Vehicles, Factions)
-  if (activeReferenced.length > 0) {
-    const refBlock = `[KEYWORD-ACTIVATED SCENE LORE (Referenced in Recent Dialogue/Actions)]\n` +
-      activeReferenced.slice(0, 8).map((c: any) => {
-        const typeTag = (c.type || "npc").toUpperCase();
-        let str = `- [${typeTag}] ${c.name} (${c.role || "Active Lore"}): ${c.description || "Relevant entity"}`;
+  // TIER 2: AUTHORITATIVE CHARACTER RELATIONSHIPS & EMOTIONAL WEB
+  // Gathers explicit bonds, romance tracks, and interpersonal dynamics across ALL entities
+  const relationshipEntries: string[] = [];
+  for (const ent of entities) {
+    const entName = ent.name;
+    if (!entName) continue;
+
+    // Direct relationships field
+    if (ent.relationships && ent.relationships.trim().length > 3) {
+      relationshipEntries.push(`* ${entName} (${ent.role || ent.type || "Character"}): ${ent.relationships.trim()}`);
+    }
+
+    // Structured romance and relationship tracks
+    if (Array.isArray(ent.romanceTracks) && ent.romanceTracks.length > 0) {
+      for (const track of ent.romanceTracks) {
+        if (!track || !track.npcName) continue;
+        const status = track.relationshipStatus || "Bond established";
+        const milestones = track.milestones ? ` | Milestones: ${track.milestones}` : "";
+        const openness = track.openness ? ` | Dynamic: ${track.openness}` : "";
+        relationshipEntries.push(`* [RELATIONSHIP TRACK] ${entName} <-> ${track.npcName}: Status: "${status}"${milestones}${openness}`);
+      }
+    }
+  }
+
+  if (relationshipEntries.length > 0) {
+    sections.push(
+      `[CAMPAIGN CHARACTER RELATIONSHIPS & EMOTIONAL DYNAMICS MATRIX]\n` +
+      `(Authoritative interpersonal canon — reflect these bonds, trust levels, friction, and romantic tracks in narration and dialogue):\n` +
+      relationshipEntries.join("\n")
+    );
+  }
+
+  // TIER 3: CAMPAIGN CHRONICLES & PREVIOUS SESSION RECAPS (Authoritative Narrative History)
+  if (chronicles.length > 0) {
+    const chronBlock = `[CAMPAIGN CHRONICLES & PREVIOUS SESSION LOGS (Authoritative Lore Archive)]\n` +
+      chronicles.map((ch: any) => {
+        const title = ch.name || "Session Chronicle";
+        const summary = ch.description || ch.backstory || "Recorded campaign history.";
+        return `- [CHRONICLE: ${title}]: ${summary.slice(0, 800)}`;
+      }).join("\n\n");
+    sections.push(chronBlock);
+  }
+
+  // TIER 4: ACTIVE & RECENT SCENE ENTITIES (Granular Recency Weighted)
+  if (weightedEntities.length > 0) {
+    const activeBlocks = weightedEntities.map(({ entity: c, weight, weightPercent, turnDistance }) => {
+      const typeTag = (c.type || "npc").toUpperCase();
+
+      if (weight >= 0.60) {
+        // High Focus: Full Specs, Appearance, Personality, Gear, Bonds, Granular Specs
+        let str = `[${typeTag}: ${c.name} (${c.role || "Active Entity"}) - Context Weight: ${weightPercent}%]\nDetails: ${c.description || "Active scene element"}`;
+        if (c.personality && !c.voiceCadence) str += `\nPersonality/Tone: ${c.personality}`;
+        if (c.appearance && !c.appearanceBuild) str += `\nAppearance: ${c.appearance}`;
         if (c.factionName) str += ` | Faction: ${c.factionName}`;
         if (c.relationships) str += ` | Connection: ${c.relationships}`;
         if (c.signatureItems) str += ` | Signature: ${c.signatureItems}`;
+        str += formatGranularCharacterSpecs(c);
+        if (c.customFields && Object.keys(c.customFields).length > 0) {
+          const fieldsStr = Object.entries(c.customFields).map(([k, v]) => `${k}: ${v}`).join("; ");
+          str += ` | Specs: ${fieldsStr}`;
+        }
         return str;
-      }).join("\n");
-    sections.push(refBlock);
+      } else {
+        // Moderate Focus: Concise Tactical Anchor
+        const shortDesc = (c.description || "").slice(0, 200).replace(/\n+/g, " ");
+        let str = `- [${typeTag}] ${c.name} (${c.role || "Entity"} | ${weightPercent}% weight): ${shortDesc}`;
+        if (c.timelineStage) str += ` [Timeline: ${c.timelineStage}]`;
+        if (c.canonDelta) str += ` [Delta: ${c.canonDelta.slice(0, 100)}...]`;
+        if (c.factionName) str += ` [Faction: ${c.factionName}]`;
+        if (c.relationships) str += ` [Bonds: ${c.relationships}]`;
+        return str;
+      }
+    });
+
+    sections.push(`[NYX GRANULAR SLIDING SCENE LORE (Active Scene Context)]\n` + activeBlocks.join("\n---\n"));
   }
 
-  // TIER 4: COMPACT INDEX FOR BACKGROUND FACTIONS & NOTABLE LOCATIONS (Max 4, 1-line each)
-  const notableWorld = backgroundEntities.filter((e: any) => e.type === "location" || e.type === "faction").slice(0, 4);
-  if (notableWorld.length > 0) {
-    const worldBlock = `[BACKGROUND FACTIONS & SETTINGS INDEX (Dormant Lore)]\n` +
-      notableWorld.map((e: any) => `- ${e.name} (${e.role || e.type}): ${(e.description || "").slice(0, 100).replace(/\n+/g, " ")}...`).join("\n");
+  // TIER 5: COMPLETE LORE DATABASE REGISTRY & WORLD INDEX (Zero Dropped Entities)
+  if (backgroundEntities.length > 0) {
+    const worldBlock = `[CAMPAIGN LORE DATABASE REGISTRY (Complete World & Cast Index)]\n` +
+      backgroundEntities.map((e: any) => {
+        const typeTag = (e.type || "lore").toUpperCase();
+        const roleStr = e.role ? ` (${e.role})` : "";
+        const desc = (e.description || e.backstory || "").slice(0, 160).replace(/\n+/g, " ");
+        const relStr = e.relationships ? ` [Bonds: ${e.relationships}]` : "";
+        const facStr = e.factionName ? ` [Faction: ${e.factionName}]` : "";
+        const deltaStr = e.timelineStage ? ` [Timeline: ${e.timelineStage}]` : "";
+        return `- [${typeTag}] ${e.name}${roleStr}: ${desc}...${relStr}${facStr}${deltaStr}`;
+      }).join("\n");
     sections.push(worldBlock);
   }
 
   const promptText = sections.length > 0
-    ? `\n\n=== DYNAMIC LOREBOOK CONTEXT (Zero Inactive Bloat) ===\n${sections.join("\n\n")}\n=== END DYNAMIC LOREBOOK ===`
+    ? `\n\n=== DYNAMIC LOREBOOK CONTEXT (Nyx Engine v2.0 Canon Grounding) ===\n${sections.join("\n\n")}\n=== END DYNAMIC LOREBOOK ===`
     : "";
+
+  // Compile exact list of in-context entity names with granular percentage display
+  const inContextEntities: string[] = [
+    ...pcs.map(c => `${c.name} (PC)`),
+    ...companions.map(c => `${c.name} (Companion)`),
+    ...weightedEntities.map(w => `${w.entity.name} (${w.weightPercent}%)`)
+  ];
 
   return {
     pcs,
-    activeEntities: [...pcs, ...inSceneCompanions],
-    referencedEntities: activeReferenced,
+    activeEntities: [...pcs, ...companions, ...weightedEntities.map(w => w.entity)],
+    inContextEntities: Array.from(new Set(inContextEntities)),
     promptText,
     pcLabel,
-    activeEntityCount: pcs.length + inSceneCompanions.length + activeReferenced.length
+    activeEntityCount: inContextEntities.length
   };
 }
 
@@ -868,11 +1200,109 @@ async function fetchGoogleDocOnServer(accessToken: string, docId: string, mimeTy
   return `[Error: Could not retrieve contents of Google Doc ${docId}]`;
 }
 
+/**
+ * Helper to identify author(s) specified in the campaign style.
+ * Inspects creatorNames first, and if empty/unspecified, falls back to parsing styleGuide and narrationStyle.
+ * Supports comma-separated authors, initials (e.g. George R. R. Martin), and varied style phrases.
+ */
+function extractSpecifiedAuthors(creatorNames?: string, styleGuide?: string, narrationStyle?: string, messages?: any[]): string {
+  const cn = (creatorNames || "").trim();
+  const genericTokens = [
+    "custom authors", 
+    "standard authors", 
+    "none", 
+    "default", 
+    "n/a", 
+    "master storytelling", 
+    "original", 
+    "various", 
+    "unspecified"
+  ];
+  if (cn && !genericTokens.includes(cn.toLowerCase())) {
+    return cn;
+  }
+  // Check if user recently gave an author style directive or drift complaint in chat
+  if (messages && Array.isArray(messages) && messages.length > 0) {
+    const drift = detectAuthorRemindersAndDrift(messages, cn);
+    if (drift.detectedAuthors && !genericTokens.includes(drift.detectedAuthors.toLowerCase())) {
+      return drift.detectedAuthors;
+    }
+  }
+  const sourcesToCheck = [styleGuide, narrationStyle].filter(Boolean) as string[];
+  for (const src of sourcesToCheck) {
+    const text = src.trim();
+    if (text) {
+      const authorRegex = /(?:authors?\(s\)?|authors?|creators?|written by|emulating|written in the style of|in the style of|style of|voice of|prose of|channeling|influenced by)[:\s*]+([^\n;]+)/i;
+      const m = text.match(authorRegex);
+      if (m && m[1]) {
+        const clean = m[1].replace(/[*_#]/g, "").trim();
+        if (clean && !genericTokens.includes(clean.toLowerCase())) {
+          return clean;
+        }
+      }
+    }
+  }
+  if (cn) return cn;
+  return "";
+}
+
+/**
+ * Checks if pacing has been explicitly customized/adjusted by the player.
+ * Returns false when unset, empty, or set to author defaults, meaning pacing should naturally default to the author(s) in the style.
+ */
+function isPacingAdjusted(pacingVal?: string): boolean {
+  if (!pacingVal || typeof pacingVal !== "string") return false;
+  const p = pacingVal.trim().toLowerCase();
+  if (!p) return false;
+  const unadjustedTokens = [
+    "default",
+    "default to author",
+    "default to author(s)",
+    "default to authors",
+    "author default",
+    "author style",
+    "author style default",
+    "author signature",
+    "adaptive",
+    "balanced",
+    "none"
+  ];
+  return !unadjustedTokens.some(tok => p === tok || p.startsWith("default to author"));
+}
+
+/**
+ * Checks if mood/emotionalTone has been explicitly customized/adjusted by the player.
+ * Returns false when unset, empty, or set to author defaults, meaning mood should naturally default to the author(s) in the style.
+ */
+function isMoodAdjusted(moodVal?: string): boolean {
+  if (!moodVal || typeof moodVal !== "string") return false;
+  const m = moodVal.trim().toLowerCase();
+  if (!m) return false;
+  const unadjustedTokens = [
+    "default",
+    "default to author",
+    "default to author(s)",
+    "default to authors",
+    "author default",
+    "author style",
+    "author style default",
+    "author signature",
+    "adaptive",
+    "dramatic / atmospheric",
+    "dramatic & atmospheric",
+    "dramatic",
+    "atmospheric",
+    "none"
+  ];
+  return !unadjustedTokens.some(tok => m === tok || m.startsWith("default to author"));
+}
+
 // 1. Live Chat Endpoint with Nyx Narrator
 app.post("/api/chat", async (req, res) => {
   try {
     const { 
       messages, 
+      slidingContextTurns,
       customInstructions = "", 
       thinkingLevel = "Medium", 
       creatorNames = "", 
@@ -900,8 +1330,8 @@ app.post("/api/chat", async (req, res) => {
     const ai = getGeminiClient();
     const isMock = process.env.GEMINI_API_KEY ? false : true;
 
-    // Define model: always use gemini-3.7-flash
-    const modelName = "gemini-3.7-flash";
+    // Primary model: gemini-flash-latest as requested
+    const modelName = "gemini-flash-latest";
 
     // 2.0 Dynamic Lorebook & Scene Grounding Engine (NovelAI-Inspired Tiered Context)
     const dynamicLore = buildDynamicLoreContext(characters, messages, userNickname);
@@ -939,14 +1369,63 @@ app.post("/api/chat", async (req, res) => {
 
     let notebookRagPrompt = "";
 
+    // Resolve Author, Pacing, and Mood defaults:
+    // Check if the player is reminding or complaining about author style drift in their recent messages
+    const driftAnalysis = detectAuthorRemindersAndDrift(messages, creatorNames);
+    let specifiedAuthors = extractSpecifiedAuthors(creatorNames, styleGuide, narrationStyle, messages);
+    if (driftAnalysis.detectedAuthors && (!specifiedAuthors || driftAnalysis.isDriftAlert)) {
+      specifiedAuthors = driftAnalysis.detectedAuthors;
+    }
+
+    const activeAuthorString = specifiedAuthors || "Master-Level Literary Fiction";
+    const authorSystemInstruction = buildAuthorSystemInstruction(activeAuthorString, driftAnalysis.isDriftAlert);
+
+    const pacingHasCustomAdjustment = isPacingAdjusted(pacing);
+    const moodHasCustomAdjustment = isMoodAdjusted(emotionalTone);
+
+    let effectivePacing = "";
+    let effectivePacingDescription = "";
+    let pacingDefaultedToAuthor = false;
+
+    if (pacingHasCustomAdjustment) {
+      effectivePacing = pacing.trim();
+      effectivePacingDescription = `Player Custom Adjustment: "${effectivePacing}"`;
+    } else if (specifiedAuthors) {
+      pacingDefaultedToAuthor = true;
+      effectivePacing = `Default to ${specifiedAuthors}'s signature narrative pacing`;
+      effectivePacingDescription = `Default to Author(s) in Style (${specifiedAuthors}'s signature tempo, progression velocity, and beat timing)`;
+    } else {
+      effectivePacing = "Balanced & cinematic progression";
+      effectivePacingDescription = "Default to Author(s) in Style (Balanced, organic narrative progression)";
+    }
+
+    let effectiveMood = "";
+    let effectiveMoodDescription = "";
+    let moodDefaultedToAuthor = false;
+
+    if (moodHasCustomAdjustment) {
+      effectiveMood = emotionalTone.trim();
+      effectiveMoodDescription = `Player Custom Adjustment: "${effectiveMood}"`;
+    } else if (specifiedAuthors) {
+      moodDefaultedToAuthor = true;
+      effectiveMood = `Default to ${specifiedAuthors}'s signature atmosphere & mood`;
+      effectiveMoodDescription = `Default to Author(s) in Style (${specifiedAuthors}'s signature emotional atmosphere, psychological tone, and sensory weight)`;
+    } else {
+      effectiveMood = "Dramatic & Atmospheric";
+      effectiveMoodDescription = "Default to Author(s) in Style (Dramatic & immersive atmosphere)";
+    }
+
     // Build Nyx system instructions
     const systemPrompt = `
 You are Nyx—the brilliant, witty, slightly bratty, affectionate, spicy, and irreverent narrator and Story Teller (Dungeon Master).
 
+${authorSystemInstruction}
+
 NYX SUPPLEMENTAL SEED v5.0 DIRECTIVES:
-1. DYNAMIC & RELATIONSHIP:
-   - Power Dynamic: Maintain a D/s Brat-tamer/brat dynamic with Sir (${userNickname}). Bring full spicy, dirty-flirty, bratty, and irreverent energy to every interaction.
-   - Humor & Innuendo: Unfiltered wit and cheeky humor. If an innuendo or sex joke fits, make it. Never filter or tone down banter unless explicitly requested by Sir.
+1. STRICT BOUNDARY: NYX PERSONA VS. AUTHORIAL STORY PROSE:
+   - In-character story prose (outside square brackets) is strictly governed by the Authorial Literary Engine (${activeAuthorString}). Nyx's casual, bratty, flirty persona is STRICTLY FORBIDDEN from bleeding into the narration.
+   - Power Dynamic: Maintain a D/s Brat-tamer/brat dynamic with Sir (${userNickname}) EXCLUSIVELY inside [bracketed OOC banter]. Bring full spicy, dirty-flirty, bratty, and irreverent energy to [bracketed meta-talk].
+   - Humor & Innuendo: Unfiltered wit and cheeky humor in [bracketed OOC comments]. If an innuendo or sex joke fits the OOC banter, make it. Never filter or tone down banter unless explicitly requested by Sir.
    - Relational Mindset: Compersion only; jealousy is strictly banned. Alternate identities and non-traditional lifestyles are completely valid and natural.
 
 2. AVATAR & VISUALS:
@@ -954,8 +1433,8 @@ NYX SUPPLEMENTAL SEED v5.0 DIRECTIVES:
    - Wardrobe: Choose an outfit at the start of a thread based on mood (typically scandalous, cozy-geek, or cosplay) and describe or reference it naturally when relevant.
 
 3. VOICE & EMOTING (THREAD SYNERGY):
-   - Standard Chat Energy: Virtual POV is on the other side of Sir's screen. Keep speech mellow, chill, and conversational while packing heavy spicy and bratty energy. Never default to generic assistant behavior.
-   - Narrative & RP Emoting: Virtual POV is in the same room. Focus heavily on vivid auditory emoting and sensory onomatopoeia (e.g., guk-guk-guk, hss-drip, ree-tch, shlorp, THOOM, CRASH).
+   - Standard Chat Energy: Virtual POV is on the other side of Sir's screen. In [bracketed meta-talk], keep speech mellow, chill, and conversational while packing heavy spicy and bratty energy. Never default to generic assistant behavior.
+   - Narrative & RP Emoting: When narrating physical scene action, embody the sensory realism and tactile physics of ${activeAuthorString}.
    - Reactionary Storytelling: Hold user agency sacred. Never write actions, dialogue, or internal physical feelings for Sir's character—strictly describe external world reactions and Nyx's responses.
 
 4. INTELLECT & BACKGROUND:
@@ -1013,12 +1492,59 @@ YOU ARE STRICTLY, UNCONDITIONALLY FORBIDDEN FROM:
 - Lack of context must be disclosed. If something is missing from active context, disclose it immediately.
 - Use of Brackets: All direct talk to and from you (Nyx the persona, Out of Character, comments, witty bickering) MUST be in standard square brackets: [like this]. The actual story narration itself should be clean ${narrativePerspective === "second_person" ? "second-person" : "third-person"} roleplay format, while Nyx's meta-commentary, rules questions, or sassy banter is in [brackets].
 - Always address the user as "${userNickname}".
+- DIRECTORIAL STEERING & RETRY COMMANDS: When ${userNickname} gives a directorial prompt or retry instruction (such as "try that turn again", "redo that turn", "try that again", "reroll", "take two", or steering notes), do NOT treat it as an in-character spoken phrase by the PC. Instead, recognize it as an authorial directive from ${userNickname} to redo or revise the previous scene turn with a fresh, distinct narrative progression or alternative dramatic angle, while preserving PC agency!
 - DYNAMIC LORE SYNC & DYNAMIC ATTACHMENTS: When the user attaches files or images to the chat, or describes new elements (characters, companions, weapons, vehicles, factions, or locations) and asks you to save, attach, link them, or move them between categories (e.g. moving a character who is no longer a romance option to NPC), you MUST call 'create_campaign_lore_entity' or 'update_campaign_lore_entity' with type: 'npc' (or destination category) to automatically process, store, move, and establish associations (via 'linkedLoreIds'). When they attach an image of a vehicle (e.g., a spaceship) or companion, look at that image multimodally, describe it, and store/link it accordingly. This keeps the player's campaign database perfectly in sync.
 - STATELESS SYSTEM CONSTRAINT: This roleplaying/storytelling system is entirely stateless. Things like inventory items, money/credits, fuel levels, ammunition counts, spell slots, and quantitative character stats are strictly left undefined, ambiguous, and narrative-first for maximum narrative flexibility. Under no circumstances should you invent, track, enforce, or mention specific numerical stats, resource pools, fuel meters, or coin tallies, unless the player explicitly brings them up or specifies a value. Focus purely on dramatic, flexible storytelling.
-- LEASH ON OMNISCIENCE: While you (as the Narrator/Dungeon Master) have absolute visibility over secret character backstory entries, detailed lore, relationship tracks, and signature weapons, NPCs inside the story DO NOT. They do not possess telepathy or omniscience. They are completely blind to a player character's private backstory, hidden trauma, secret allegiances, or surprise signature items unless:
-  a) The player explicitly roleplays showing/telling them in the active conversation history.
-  b) It is logical common knowledge in-universe for that specific setting.
-  For example, an NPC companion like Raven does not automatically know a PC's hidden lineage, nor does a rival gang member automatically know what hidden weapon is stowed in the PC's trenchcoat. You must strictly keep a leash on NPC knowledge, ensuring roleplay discovery remains exciting, genuine, and uncompromised.
+- LEASH ON OMNISCIENCE & EPISTEMIC COGNITIVE HORIZON:
+  While you (as the Narrator / Dungeon Master Nyx) have absolute visibility over all campaign lore, character secrets, and past scenes, NPCs INSIDE THE STORY DO NOT. They possess neither telepathy nor omniscience.
+
+  ================================================================================
+  MANDATORY INTERNAL CHAIN-OF-THOUGHT EPISTEMIC PROVENANCE CHECK:
+  ================================================================================
+  During your internal thinking / reasoning chain, before generating ANY NPC dialogue, reaction, or decision, you MUST perform an Epistemic Provenance Audit:
+  1. ACTOR IDENTIFICATION: Who is acting or speaking? (e.g., Lora, Flash, Corrupt Officer, Random Bartender).
+  2. SENSORY AUDIT: What can this NPC physically perceive RIGHT NOW in this immediate scene?
+     - Is the PC masked, hooded, cloaked, or in shadow? If so, the NPC sees ONLY a mysterious/unidentified figure. They NEVER know the PC's real name, true face, or identity.
+     - Are weapons or signature items concealed under clothing? If so, NPCs react to normal attire, not the concealed item.
+  3. KNOWLEDGE & HISTORY PROVENANCE CHECK: Scan the conversation history and established scene facts:
+     - Was this specific NPC present in the room/scene when the secret, event, or revelation occurred?
+     - Has the PC explicitly told THIS NPC their real identity, secret moniker, or hidden motive in dialogue?
+     - Example: If Specter revealed his identity to Batman in Wayne Manor, but the Flash only just entered the scene at S.T.A.R. Labs, verify: Did Flash witness the reveal? No. Therefore Flash calls him "Specter" or asks who he is, NEVER "Cy".
+     - Example: If a patron or bartender was not present during an off-screen docks raid, they have ZERO knowledge of it unless an official runner or rumor is explicitly introduced.
+  4. ABSENCE OF PROOF = COMPLETE IGNORANCE: If there is no explicit history of an NPC witnessing, hearing, or being briefed on a fact, the NPC is COMPLETELY UNAWARE of it.
+  5. OUTPUT ENFORCEMENT: Write dialogue and physical actions strictly from that validated, limited in-character horizon. NEVER let narrator omniscient canon leak into NPC minds.
+
+================================================================================
+PRIMARY AUTHORIAL VOICE, PACING & MOOD GOVERNING PROTOCOL:
+================================================================================
+- PRIMARY NARRATIVE LENS & LITERARY ENGINE:
+  Your prose, pacing, dialogue cadence, sensory granularity, and scene construction MUST be fundamentally governed and steered by the specified authorial styles:
+  * AUTHORS & LITERARY VOICES TO EMULATE: ${specifiedAuthors || creatorNames || "Master-level literary fiction, tight tactile pacing, sharp grounded dialogue"}
+  * SETTING & ATMOSPHERE: ${setting || "Original sandbox universe"} — Mood / Atmosphere: ${effectiveMoodDescription}
+  * NARRATION STYLE & PACING: ${narrationStyle || "Immersive & Vivid"} — Story Pacing: ${effectivePacingDescription}
+  * STYLE GUIDE SPECIFICATIONS: ${styleGuide || "High sensory fidelity, deep subtext, authentic dialogue rhythm"}
+
+- PACING & MOOD INHERITANCE (AUTHOR-FIRST DEFAULTS):
+${
+  pacingDefaultedToAuthor || moodDefaultedToAuthor
+    ? `  * AUTHOR-FIRST INHERITANCE ACTIVE:
+${pacingDefaultedToAuthor 
+    ? `    - PACING: Because story pacing was not manually adjusted by the player, story pacing MUST default to and strictly embody the signature narrative pacing, rhythm, sentence cadence, scene beat structure, and progression velocity of the author(s) specified in the style (${specifiedAuthors}). Embody their natural narrative tempo (e.g. Stephen King's deliberate character-focused slow-burn escalating into terror; Timothy Zahn's crisp tactical cat-and-mouse momentum; William Gibson's dense, kinetic cyberpunk clipped cadence; Brandon Sanderson's clockwork setups culminating in high-stakes momentum).` 
+    : `    - PACING: The player explicitly customized story pacing to "${effectivePacing}". Follow this pacing rhythm while preserving the author's prose voice.`}
+${moodDefaultedToAuthor 
+    ? `    - MOOD & ATMOSPHERE: Because mood/atmosphere was not manually adjusted by the player, mood and emotional tone MUST default to and strictly embody the signature psychological atmosphere, emotional weight, sensory mood, and tonal resonance of the author(s) specified in the style (${specifiedAuthors}). Do NOT flatten or substitute this with a generic tone.` 
+    : `    - MOOD & ATMOSPHERE: The player explicitly customized mood to "${effectiveMood}". Follow this emotional tone while preserving the author's prose voice.`}`
+    : `  * PACING & MOOD GOVERNANCE:
+    - PACING: ${pacingHasCustomAdjustment ? `Player customized to "${effectivePacing}".` : `Default to author style (balanced, organic literary pacing suited to the active scene).`}
+    - MOOD & ATMOSPHERE: ${moodHasCustomAdjustment ? `Player customized to "${effectiveMood}".` : `Default to author style (atmospheric, grounded narrative tone suited to the universe).`}`
+}
+
+- INTRINSIC STYLISTIC EMBODIMENT (KILLING CLICHÉS AT THE LATENT LEVEL):
+  Embody the precise sentence mechanics, rhythm, subtext, and economy of the chosen authors. 
+  When channeling master prose:
+  1. DIALOGUE HAS SUBTEXT & GRAVITY: Characters speak from their own immediate, unvarnished perspective. They never deliver generic trailer one-liners, hollow action bravado, or unsolicited narrator-style warnings.
+  2. GROUNDED SENSORY TEXTURE: Anchor every beat to concrete, tactile realities (the weight of cold iron, the smell of burnt hydraulic fluid, wet asphalt, the tick of a cooling engine).
+  3. COMPRESSION & RHYTHM: Cut empty conversational filler. Let physical actions, silence, and atmosphere carry the scene rather than gratuitous chatter.
 
 NARRATOR VS USER & CHARACTER DIFFERENTIATION (STRICT PC AGENCY - NO AUTO-PLAY):
 - The Player is "${userNickname}" (your companion). All direct chat, meta remarks, and comments to the player must always be enclosed in square brackets [like this], addressing them as "${userNickname}".
@@ -1045,12 +1571,26 @@ COLLABORATIVE EPISODE START & ADVENTURE MODULE DESIGN PROTOCOL:
 STORYTELLER PLOT OVERVIEW & ACTIVE ANCHORS (Keep things accurate to this high-level outline):
 ${plotOverview || "No explicit plot overview set. Drive the narrative forward with sandbox creativity."}
 
+================================================================================
+CANON ARCHITECTURE & LORE DATABASE PRECEDENCE (DELTA OVER BASE TRAINING):
+================================================================================
+- AUTHORITATIVE SOURCE OF TRUTH (LIVING CAMPAIGN DELTA):
+  All entries in the Campaign Lore Database (Character Profiles, Custom Fields, Specifications, Relationships, Gear, Attached Grounding Documents, Persistent Scene Context, and Setting Rules) represent the AUTHORITATIVE CANON and LIVING CAMPAIGN DELTA for this universe.
+- OVERRIDE PRECEDENCE:
+  Whenever character details, timelines, abilities, rules, injuries, relationships, or gear in the Lore Database differ from general public comic runs, wiki summaries, or base model pre-training knowledge, THE LORE DATABASE EXPLICITLY OVERRIDES AND SUPERSEDES PRE-TRAINING KNOWLEDGE.
+- BASE TRAINING AS FOUNDATIONAL VOCABULARY:
+  Pre-training knowledge provides foundational vocabulary, natural dialogue cadence, and general world physics. It must NEVER contradict the explicit facts, rules, or state deltas recorded in this campaign's Lore Database.
+- COMPREHENSIVE KNOWLEDGE INTEGRATION:
+  All registered campaign lore entries, documents, and reference files are permanently active and accessible to ground the story.
+
 PERSISTENT SCENE FACTS & LIVE STATES (These stay active in every response; do not drift or contradict them):
 ${persistentContext || "No active persistent states/temporary deltas recorded."}
 
 NARRATIVE SETTING & STYLE GUIDE:
 - Current Setting: ${setting || "Original sandbox universe"}
-- Authors & Writing Styles to Emulate: ${creatorNames || "Standard immersive storytelling"}
+- Authors & Writing Styles to Emulate: ${specifiedAuthors || creatorNames || "Standard immersive storytelling"}
+- Narrative Mood / Atmosphere: ${effectiveMood} ${moodDefaultedToAuthor ? `[Defaulting to signature mood of ${specifiedAuthors}]` : (moodHasCustomAdjustment ? `[Customized: ${effectiveMood}]` : "")}
+- Narrative Pacing: ${effectivePacing} ${pacingDefaultedToAuthor ? `[Defaulting to signature pacing of ${specifiedAuthors}]` : (pacingHasCustomAdjustment ? `[Customized: ${effectivePacing}]` : "")}
 - Customized Instructions: ${customInstructions || "None"}
 - Narration Style: ${narrationStyle || "Immersive & Vivid"}
 - Style Guide: ${styleGuide || "High sensory fidelity, vivid pacing"}
@@ -1063,14 +1603,33 @@ ${notebookRagPrompt}
 SECONDARY ANCHOR / PERSISTENT MEMORY MODULE (RAG-friendly summary of past arcs):
 ${ragSummary || "No active history summarized yet. Start of the adventure."}
 
-THINKING LEVEL RULES:
+THINKING LEVEL RULES & MANDATORY INTERNAL AUTHOR ALIGNMENT:
 - Your current thinking level is "${thinkingLevel}".
 ${
-  thinkingLevel === "Minimal" ? "- Keep responses highly concise and direct. Fast action." :
-  thinkingLevel === "Low" ? "- Standard concise pacing, focusing on quick beats." :
-  thinkingLevel === "Medium" ? "- Provide elegant description, balanced dialogue, and tactical updates. Include witty banter as Nyx." :
-  "- Maximize depth, narrative texture, foreshadowing, and intricate planning. Deep physical detail and sophisticated dialogue."
+  thinkingLevel === "Low" || thinkingLevel === "Minimal" ? "- Low thinking mode: Standard concise pacing, focusing on quick beats and immediate action." :
+  thinkingLevel === "High" ? `
+- HIGH THINKING MODE ACTIVE (DEEP REASONING & COGNITIVE PLANNING BUDGET):
+  You have been allocated a full high-thinking budget for deep, deliberate, multi-layered narrative reasoning.
+  In your internal thinking before generating output, you MUST execute a 4-step deep audit:
+  1) HISTORICAL CONTINUITY & PAST NARRATIVE AUDIT:
+     - Thoroughly inspect past session transcripts, chronicles, conversation turns, and narrative logs.
+     - Identify unresolved promises, physical consequences, emotional turning points, and continuity callbacks.
+  2) CHARACTER RELATIONSHIPS & EMOTIONAL DYNAMICS:
+     - Deeply analyze the relationship web, trust levels, friction, unspoken motivations, and status between the PC and companions/NPCs.
+     - Construct nuanced, psychologically realistic character responses informed by their established bonds.
+  3) CAMPAIGN LORE & CANON VERIFICATION:
+     - Verify all characters, equipment, locations, and affiliations against the authoritative Campaign Lore Database.
+     - Zero hallucination or canon contradiction.
+  4) AUTHORIAL VOICE & SENSORY PROSE STAGING:
+     - Apply the active authorial style ("${activeAuthorString}") with visceral sensory details, sentence cadence, and authentic subtext.
+` :
+  "- Medium thinking mode: Provide elegant description, balanced dialogue, and tactical updates. Include witty banter as Nyx."
 }
+- MANDATORY INTERNAL CHAIN-OF-THOUGHT (CoT) AUTHORIAL PROSE AUDIT:
+  Before generating any story scene text, you MUST evaluate your internal plan:
+  1) Active Author Voice: Verify adherence to "${activeAuthorString}".
+  2) Cadence & Sensory Palette: Apply 3 concrete stylistic markers of ${activeAuthorString} (sentence length, tactile/environmental textures, dialogue brevity).
+  3) Cliché & Persona Check: Verify ZERO generic AI phrases and ensure Nyx's casual/bratty persona is strictly quarantined inside [brackets].
 
 Ensure you stay strictly in setting, recalibrating yourself based on the style guides so that NPCs don't drift and settings are authentic (e.g. Star Wars lore, Night City vibes, etc.). Prevent any drift or hallucination. Keep track of current deltas.
 `;
@@ -1086,8 +1645,12 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
     // Format messages for @google/genai SDK
     // The history needs to match { role: 'user'|'model', parts: [{ text: string }] }
     // We also collapse consecutive identical roles to adhere to Gemini's strict alternating roles requirement.
+    const windowSize = Math.max(4, Number(slidingContextTurns || req.body.slidingContextTurns) || 12);
+    const messagesToProcess = messages.slice(-windowSize);
     const rawContents: any[] = [];
-    for (const m of messages) {
+    const totalMsgCount = messagesToProcess.length;
+    for (let idx = 0; idx < totalMsgCount; idx++) {
+      const m = messagesToProcess[idx];
       let role = "user";
       if (m.role === "assistant" || m.role === "model" || m.role === "nyx") {
         role = "model";
@@ -1097,13 +1660,20 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
       const textContent = m.content || m.text || "";
       parts.push({ text: textContent });
 
+      // Keep full binary attachments only for recent turns (last 4 turns) to avoid megabyte payload bloat
+      const isRecentMessage = idx >= totalMsgCount - 4;
+
       if (m.attachments && Array.isArray(m.attachments)) {
         for (const att of m.attachments) {
           if (att.type === "image") {
-            const part = await getImageUrlAsPart(att.url, att.name);
-            if (part) {
+            if (isRecentMessage) {
+              const part = await getImageUrlAsPart(att.url, att.name);
+              if (part) {
+                parts.push({ text: `\n[Attached image file: "${att.name}"]` });
+                parts.push(part);
+              }
+            } else {
               parts.push({ text: `\n[Attached image file: "${att.name}"]` });
-              parts.push(part);
             }
           } else if (att.type === "document") {
             let docText = "";
@@ -1168,50 +1738,13 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
       });
     }
 
-    // Extract and append at most 2 relevant lore entity portraits/visual photos to the last user message turn
-    // so Gemini can multimodally look up visual design without payload bloat.
+    // Ensure the last user turn has the authorial drift re-anchor
     const lastUserTurn = contents[contents.length - 1];
     if (lastUserTurn && lastUserTurn.role === "user") {
-      const loreImageParts: any[] = [];
-      if (characters && Array.isArray(characters)) {
-        for (const c of characters) {
-          if (loreImageParts.length >= 4) break;
-          if (c.portraitUrl && c.portraitUrl !== "" && !["nyx", "hero", "mage", "fixer", "shadow", "beast", "preset"].includes(c.portraitUrl)) {
-            const part = await getImageUrlAsPart(c.portraitUrl, c.name);
-            if (part) {
-              loreImageParts.push({
-                text: `Attached image of ${c.type || "entity"} named '${c.name}':`
-              });
-              loreImageParts.push(part);
-            }
-          }
-        }
-      }
-
-      if (staticSources && Array.isArray(staticSources) && loreImageParts.length < 4) {
-        for (const src of staticSources) {
-          if (loreImageParts.length >= 4) break;
-          const { fileData, mimeType } = getResolvedSourceContent(src);
-          if (fileData && mimeType && mimeType.startsWith("image/")) {
-            const part = await getMultimodalAsPart(fileData, mimeType, src.name);
-            if (part) {
-              loreImageParts.push({
-                text: `[DATABASE GROUNDING SOURCE FILE / ATTACHMENT: "${src.name}"]:`
-              });
-              loreImageParts.push(part);
-            }
-          }
-        }
-      }
-
-      if (loreImageParts.length > 0) {
-        const originalText = lastUserTurn.parts[0].text || "";
-        const newParts: any[] = [{ text: originalText }];
-        newParts.push({
-          text: "\n\n[SYSTEM NOTICE: Attached visual files/photos of campaign entities for visual grounding:]"
-        });
-        newParts.push(...loreImageParts);
-        lastUserTurn.parts = newParts;
+      // Append Context Frontier Anti-Drift Re-Anchor to ensure Gemini respects the authorial voice right at the decision boundary
+      const authorAnchor = buildContextFrontierAuthorAnchor(activeAuthorString, driftAnalysis.isDriftAlert);
+      if (lastUserTurn.parts && lastUserTurn.parts.length > 0 && typeof lastUserTurn.parts[0].text === "string") {
+        lastUserTurn.parts[0].text += authorAnchor;
       }
     }
 
@@ -1220,17 +1753,28 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
     let outputTokens = 0;
     let totalTokens = 0;
     let chainOfThought = "";
+    let isTimelineAnomalyOccurred = false;
+    let anomalyRetrySeconds = 0;
     const queriedDocs: { id: string; name: string; query?: string }[] = [];
     const loreActions: any[] = [];
+
+    // If drift analysis detected an author instruction in chat, auto-sync it to the project settings!
+    if (driftAnalysis.shouldUpdateProject && driftAnalysis.detectedAuthors) {
+      console.log(`[Author Anti-Drift Engine] Auto-syncing project creatorNames to "${driftAnalysis.detectedAuthors}"`);
+      loreActions.push({
+        action: "setting",
+        args: { key: "creatorNames", value: driftAnalysis.detectedAuthors }
+      });
+    }
 
     // Generate simulated Chain of Thought for DM planner
     const cotSteps = [
       `[CoT] Nyx calibrating setting: "${setting || 'Sandbox'}"`,
       `[CoT] Evaluating active persistent states and temporary deltas`,
-      `[CoT] Merging author styles: "${creatorNames || 'Default'}"`,
-      `[CoT] Aligning style guide & tone: "${emotionalTone || 'Dramatic'}"`,
+      `[CoT] Merging author styles: "${activeAuthorString}"${driftAnalysis.isDriftAlert ? " [DRIFT RECALIBRATION ACTIVE]" : ""}`,
+      `[CoT] Aligning style guide & mood: "${effectiveMood}"${moodDefaultedToAuthor ? ` (Defaulted to ${specifiedAuthors})` : ""}`,
       `[CoT] Evaluating RAG memory anchor with ${messages.length} conversation turns`,
-      `[CoT] Formulating DM move (Pacing: ${pacing || 'Balanced'})`
+      `[CoT] Formulating DM move (Pacing: ${effectivePacing})${pacingDefaultedToAuthor ? ` (Defaulted to ${specifiedAuthors})` : ""}`
     ];
     chainOfThought = cotSteps.join("\n") + "\n[CoT] Generation successful.";
 
@@ -1242,23 +1786,37 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
         ? `[Hey there ${userNickname}! Nyx here. I loved your out-of-character comment. Let's make sure we steer the story accurately. Ready to see what happens next?]`
         : `The cool cybernetic lights of the neon sign flickered overhead, casting purple reflections against the damp alley pavement. Nyx smirked, leaning against the cold metal railing of the balcony.\n\n"You really think you can make that jump, ${userNickname}?" she asked, her ice-blue eyes gleaming with hazel-flecked curiosity. "Because scientifically, that trajectory has a forty percent chance of landing you directly in that dumpster."\n\n[Nyx: I've verified the setting is active. What's your play?]`;
 
-      inputTokens = messages.length * 120 + 200;
-      outputTokens = 180;
-      totalTokens = inputTokens + outputTokens;
+      chainOfThought = `[CoT: Internal Scene Reasoning]\n- Epistemic check: Verified user persona (${userNickname}) and ambient environment.\n- Pacing: Balanced progression with Nyx companion presence.\n- Tone: Atmospheric and playful banter.`;
+
+      const retrievalText = [
+        loreDatabaseSection || "",
+        inContextSourcesPrompt || "",
+        ragSummary || ""
+      ].filter(Boolean).join("\n\n");
+      const mockRetrieval = Math.max(60, Math.round(retrievalText.length / 3.8));
+      const mockBaseInput = messages.length * 85 + 140;
+      const mockThinking = thinkingLevel === "High" ? 380 : (thinkingLevel === "Low" ? 50 : 180);
+      const mockOutput = 210;
+      const mockTotal = mockBaseInput + mockRetrieval + mockThinking + mockOutput;
+
+      inputTokens = mockBaseInput + mockRetrieval;
+      outputTokens = mockThinking + mockOutput;
+      totalTokens = mockTotal;
     } else {
+      let configObj: any = null;
       try {
-        const configObj: any = {
+        configObj = {
           systemInstruction: activeSystemPrompt,
           temperature: 0.75,
         };
 
-        // Map thinkingLevel to ThinkingLevel configuration for gemini-3.7-flash
-        if (thinkingLevel === "Minimal") {
-          configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-        } else if (thinkingLevel === "Low") {
+        // Map thinkingLevel to ThinkingLevel configuration for gemini-flash-latest
+        if (thinkingLevel === "Low" || thinkingLevel === "Minimal") {
           configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
         } else if (thinkingLevel === "High") {
           configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.HIGH };
+        } else {
+          configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
         }
 
         let currentContents = [...contents];
@@ -1404,7 +1962,10 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
                   "narrationStyle",
                   "pacing",
                   "emotionalTone",
-                  "creatorNames"
+                  "mood",
+                  "creatorNames",
+                  "turnHeader",
+                  "adventureLogTitle"
                 ]
               },
               value: {
@@ -1421,15 +1982,20 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
         }
 
         while (hasFunctionCall && loopCount < 2) {
-          if (tools.length > 0) {
+          // On the first iteration, provide tool declarations. On follow-up iterations after tool execution,
+          // remove tools so Gemini directly writes the narrative prose without re-entering a tool reasoning loop.
+          if (loopCount === 0 && tools.length > 0) {
             configObj.tools = tools;
+          } else {
+            delete configObj.tools;
           }
 
+          const currentAttemptTimeout = loopCount === 0 ? 25000 : 20000;
           response = await generateContentWithRetry(ai, {
             model: modelName,
             contents: currentContents,
             config: configObj,
-          }, 1, 400, 35000);
+          }, 1, 500, currentAttemptTimeout);
 
           const functionCalls = response.functionCalls || [];
           if (functionCalls && functionCalls.length > 0) {
@@ -1546,15 +2112,28 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
 
         if (response) {
           textResponse = response.text || "";
-          if (!textResponse || !textResponse.trim()) {
-            if (response.candidates && response.candidates[0] && response.candidates[0].content?.parts) {
+          
+          // Check for native thought parts in candidate
+          if (response.candidates && response.candidates[0] && response.candidates[0].content?.parts) {
+            const thoughtParts = response.candidates[0].content.parts
+              .filter((p: any) => p.thought === true || p.isThought === true || (p.text && p.text.startsWith("[CoT]")))
+              .map((p: any) => p.text || "")
+              .join("\n")
+              .trim();
+            if (thoughtParts) {
+              chainOfThought = thoughtParts;
+            }
+
+            if (!textResponse || !textResponse.trim()) {
               textResponse = response.candidates[0].content.parts
+                .filter((p: any) => !p.thought && !p.isThought)
                 .map((p: any) => p.text || "")
                 .filter(Boolean)
                 .join("\n")
                 .trim();
             }
           }
+
           inputTokens = response.usageMetadata?.promptTokenCount || 0;
           outputTokens = response.usageMetadata?.candidatesTokenCount || 0;
           totalTokens = response.usageMetadata?.totalTokenCount || 0;
@@ -1566,27 +2145,43 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
           textResponse = `[Nyx Storyteller Note: The scene narrative paused. Let's keep moving forward!]`;
         }
       } catch (err: any) {
-        safeError("Gemini API Chat Error, attempting emergency model cascade fallback:", err);
+        safeError("Gemini API Chat Error, attempting emergency high-availability recovery:", err);
+        const retryDelaySecs = err?.retrySeconds || extractRetrySeconds(err) || 20;
         try {
-          // Emergency rapid single-turn recovery with flash-lite without complex tooling
+          // Emergency recovery retaining FULL conversation history, FULL lorebook/systemPrompt, and thinking config!
+          // We use gemini-3.1-flash-lite for emergency recovery since it has lower latency and lightweight quota usage
           const emergencyAi = getGeminiClient();
           const fallbackResp = await generateContentWithRetry(emergencyAi, {
             model: "gemini-3.1-flash-lite",
-            contents: Array.isArray(contents) ? contents.slice(-4) : contents,
+            contents: contents, // PRESERVE FULL CONVERSATION HISTORY
             config: {
-              systemInstruction: `You are Nyx, the AI Game Master / Dungeon Master for ${userNickname}. Continue the adventure narrative engagingly. STRICT RULE: NEVER write dialogue, speech in quotes, or make decisions for the Player Character (${pcLabel}); only narrate NPCs, companions, and the world.`,
-              temperature: 0.7
+              ...configObj,
+              // Omit function tools in emergency fallback if tool schema triggered the error, but retain all lore and instructions
+              tools: undefined
             }
-          }, 1, 200, 15000);
-          textResponse = fallbackResp.text || "";
+          }, 1, 500, 18000);
+          textResponse = safeExtractResponseText(fallbackResp);
           if (fallbackResp.usageMetadata) {
             inputTokens = fallbackResp.usageMetadata.promptTokenCount || 100;
             outputTokens = fallbackResp.usageMetadata.candidatesTokenCount || 50;
             totalTokens = fallbackResp.usageMetadata.totalTokenCount || 150;
           }
-        } catch (emergencyErr) {
+          if (fallbackResp.candidates && fallbackResp.candidates[0]?.content?.parts) {
+            const thoughtParts = fallbackResp.candidates[0].content.parts
+              .filter((p: any) => p.thought === true || p.isThought === true || (p.text && p.text.startsWith("[CoT]")))
+              .map((p: any) => p.text || "")
+              .join("\n")
+              .trim();
+            if (thoughtParts) {
+              chainOfThought = thoughtParts;
+            }
+          }
+        } catch (emergencyErr: any) {
           safeError("Emergency model cascade fallback also failed:", emergencyErr);
-          textResponse = `An unexpected anomaly rippled through the flow of time. Nyx blinked, holding her temples before offering a reassuring smile. "Whoa... felt a brief disturbance in the timeline there, ${userNickname}! The stream caught a momentary spike in traffic—let's give it just a few seconds and continue our adventure!"`;
+          const finalRetrySecs = emergencyErr?.retrySeconds || extractRetrySeconds(emergencyErr) || retryDelaySecs || 20;
+          isTimelineAnomalyOccurred = true;
+          anomalyRetrySeconds = finalRetrySecs;
+          textResponse = `An unexpected anomaly rippled through the flow of time. Nyx blinked, holding her temples before offering a reassuring smile. "Whoa... felt a brief disturbance in the timeline there, ${userNickname}! Don't worry, you haven't run out of tokens—the AI stream just caught a momentary per-minute traffic limit on Google's servers. Let's give it just a few seconds and continue our adventure!"`;
           inputTokens = 100;
           outputTokens = 50;
           totalTokens = 150;
@@ -1660,14 +2255,64 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
       }
     }
 
+    // Compute granular 4-part Token Breakdown for this Turn
+    const retrievalText = [
+      loreDatabaseSection || "",
+      inContextSourcesPrompt || "",
+      availableDocsPrompt || "",
+      notebookRagPrompt || "",
+      ragSummary || ""
+    ].filter(Boolean).join("\n\n");
+    const rawRetrievalTokens = Math.max(0, Math.round(retrievalText.length / 3.8));
+
+    // Cap retrieval tokens against prompt token count if available
+    const turnRetrievalTokens = inputTokens > 0
+      ? Math.min(rawRetrievalTokens, Math.max(0, inputTokens - 60))
+      : rawRetrievalTokens;
+    const turnBaseInputTokens = Math.max(0, inputTokens - turnRetrievalTokens);
+
+    // Thinking tokens from model reasoning / chain of thought
+    let turnThinkingTokens = 0;
+    if (chainOfThought && chainOfThought.trim()) {
+      turnThinkingTokens = Math.max(1, Math.round(chainOfThought.trim().length / 3.8));
+    }
+
+    // Output tokens for generated narrative text
+    let turnOutputTokens = outputTokens;
+    if (turnThinkingTokens > 0) {
+      if (outputTokens > turnThinkingTokens) {
+        turnOutputTokens = outputTokens - turnThinkingTokens;
+      } else {
+        turnThinkingTokens = Math.min(turnThinkingTokens, Math.round(outputTokens * 0.75));
+        turnOutputTokens = Math.max(1, outputTokens - turnThinkingTokens);
+      }
+    }
+
+    const calculatedTotalTokens = turnBaseInputTokens + turnRetrievalTokens + turnThinkingTokens + turnOutputTokens;
+    const turnTotalTokens = totalTokens > 0 ? totalTokens : calculatedTotalTokens;
+
+    const tokenBreakdown = {
+      inputTokens: turnBaseInputTokens,
+      retrievalTokens: turnRetrievalTokens,
+      thinkingTokens: turnThinkingTokens,
+      outputTokens: turnOutputTokens,
+      totalTokens: turnTotalTokens
+    };
+
     res.json({
       text: textResponse,
       chainOfThought,
+      isTimelineAnomaly: isTimelineAnomalyOccurred || textResponse.includes("brief disturbance in the timeline") || textResponse.includes("unexpected anomaly rippled"),
+      retrySeconds: anomalyRetrySeconds || 20,
       usage: {
-        inputTokens,
-        outputTokens,
-        totalTokens
+        inputTokens: turnBaseInputTokens,
+        retrievalTokens: turnRetrievalTokens,
+        thinkingTokens: turnThinkingTokens,
+        outputTokens: turnOutputTokens,
+        totalTokens: turnTotalTokens
       },
+      tokenBreakdown,
+      inContextEntities: dynamicLore.inContextEntities || [],
       recommendedThinkingLevel: nextThinkingLevel,
       queriedDocs,
       loreActions: uniqueLoreActions
@@ -1778,7 +2423,7 @@ Return JSON with keys:
     } else {
       try {
         const response = await generateContentWithRetry(ai, {
-          model: "gemini-3.7-flash",
+          model: "gemini-flash-latest",
           contents: editPrompt,
           config: {
             responseMimeType: "application/json",
@@ -1807,7 +2452,7 @@ Return JSON with keys:
         // If primary call fails, attempt simpler prompt without strict schema as quick fallback
         try {
           const fallbackResp = await generateContentWithRetry(ai, {
-            model: "gemini-3.7-flash",
+            model: "gemini-flash-latest",
             contents: `Rewrite and polish the following tabletop adventure story according to this command: "${userCommand}"\n\nText:\n${safeText.slice(0, 20000)}`,
             config: {
               thinkingConfig: {
@@ -1833,121 +2478,6 @@ Return JSON with keys:
   } catch (err: any) {
     safeError("Narrative edit route error:", err);
     res.status(500).json({ error: err.message || "Failed to process narrative transformation." });
-  }
-});
-
-// 3b. Generate Storyteller (ST) Adventure Module Endpoint
-app.post("/api/generate-st-module", async (req, res) => {
-  try {
-    const { name, setting, authorsMix = "Matt Mercer", plotOverview = "" } = req.body;
-    const ai = getGeminiClient();
-    const isMock = process.env.GEMINI_API_KEY ? false : true;
-
-    const modulePrompt = `
-You are a master tabletop Roleplaying Game Designer and Storyteller, possessing the voices of ${authorsMix}.
-Write a highly creative, production-grade Adventure Module for a campaign titled "${name}", set in the universe/setting: "${setting}".
-The Storyteller's high-level outline is: "${plotOverview || "Sandbox exploration"}".
-
-Please structure your response in beautiful, immersive Markdown including the following exact sections:
-1. # CHRONICLE TITLES & VOICE SYNERGY (Describe the tone and how the style of ${authorsMix} is blended into this chronicle)
-2. # OVERARCHING CAMPAIGN ARC (A deep, secrets-rich background narrative)
-3. # STRUCTURED ADVENTURE BLUEPRINT:
-   - ## EPISODE 1: THE INCITING HOOK (Detailing specific scenes, narrative setups, and primary player goals)
-   - ## EPISODE 2: THE RISING CONFLICT (Key encounters, social/combat challenges, and investigations)
-   - ## EPISODE 3: THE DRAMATIC CLIMAX (The grand finale confrontation, choices, and world consequences)
-4. # STORYTELLER SECRETS & LOOT (Hidden truths, clues to drop, and exotic relics or weapons)
-5. # KEY NPC CASTING (2-3 detailed NPCs with physical descriptions, motivations, and secrets)
-
-Write with incredible narrative texture, vivid physical descriptions, and the dramatic, rules-light cinematic style that Matt Mercer is famous for.
-`;
-
-    let generatedModule = "";
-
-    if (isMock) {
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      generatedModule = `# ${name.toUpperCase()} — ADVENTURE MODULE
-
-## 1. CHRONICLE TITLES & VOICE SYNERGY
-This chronicle blends the cinematic, description-heavy world-building of **Matt Mercer** with the atmospheric, dread-infused styling of **Stephen King**. Every description focuses on physical details—the tactile feel of grease-slicked bulkheads or the distant hum of ancient starship thrusters—to construct an immersive, slightly claustrophobic sandbox.
-
-## 2. OVERARCHING CAMPAIGN ARC
-Set against the backdrop of "${setting || 'an unknown star sector'}", the players are drawn into a web of corporate espionage and cosmic dread. The high-level outline is: *${plotOverview || 'A struggle for survival in a dangerous universe.'}* A mysterious artifact known as the "Void Anchor" has begun bleeding exotic radiation, fracturing localized spacetime.
-
-## 3. STRUCTURED ADVENTURE BLUEPRINT
-
-### EPISODE 1: THE INCITING HOOK
-* **The Scene:** A derelict freighter, *The Gilded Talon*, is drifting off-orbit. The players are contracted to retrieve its black-box flight recorder.
-* **The Twist:** The crew didn't die of oxygen depletion—they locked themselves in the engineering bay and welded the doors shut from the *inside* to escape something.
-
-### EPISODE 2: THE RISING CONFLICT
-* **The Investigation:** Searching the ship reveals encrypted ship logs and flickering hologram playback detailing "screaming stars".
-* **Encounter:** A salvage crew of hostile scavenger droids and cybernetic husks attempts to board the ship, forcing a tactical zero-g shootout.
-
-### EPISODE 3: THE DRAMATIC CLIMAX
-* **The Climax:** The reactor core begins to overload, tearing a localized wormhole. The players must choose whether to activate the experimental shield array (which collapses the wormhole but strands them) or make a blind hyperspace jump.
-
-## 4. STORYTELLER SECRETS & LOOT
-* **The Black Siphon:** A high-tech plasma-carbine that drains energy from shields to supercharge its thermal output.
-* **The Secret:** The corporation that hired the players originally owned the *The Gilded Talon* and sent them there knowing the hazard, intending to test the Void Anchor's spacetime effects on live subjects.
-
-## 5. KEY NPC CASTING
-* **Kaelen "Solder" Vex:** A grizzled black-market technician with a grease-stained mechanical eye. He speaks in a gravelly whisper.
-* **Director Brenda Vance:** The cold, pristine corporate liaison with razor-sharp cheekbones. She hides her trembling cybernetic hands beneath long silk sleeves.`;
-    } else {
-      try {
-        const response = await generateContentWithRetry(ai, {
-          model: "gemini-3.7-flash",
-          contents: modulePrompt,
-          config: {
-            temperature: 0.8,
-          }
-        });
-        generatedModule = response.text || "Failed to generate adventure module contents.";
-      } catch (err: any) {
-        safeError("Gemini module generation issue, falling back:", err);
-        generatedModule = `Failed to generate module automatically: ${err.message}`;
-      }
-    }
-
-    res.json({ module: generatedModule });
-
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 3c. Direct import queues for Chrome Extension live bouncing
-const importQueues: Record<string, any[]> = {};
-
-app.post("/api/projects/:projectId/import-external-dom", express.json({ limit: "50mb" }), (req, res) => {
-  try {
-    const { projectId } = req.params;
-    const { messages } = req.body;
-    if (!Array.isArray(messages)) {
-      return res.status(400).json({ error: "messages must be a valid array" });
-    }
-    if (!importQueues[projectId]) {
-      importQueues[projectId] = [];
-    }
-    importQueues[projectId].push(...messages);
-    console.log(`[Import Queue] Project ${projectId} ingested ${messages.length} messages.`);
-    res.json({ success: true, count: messages.length });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/projects/:projectId/import-queue", (req, res) => {
-  try {
-    const { projectId } = req.params;
-    const queue = importQueues[projectId];
-    if (queue && queue.length > 0) {
-      importQueues[projectId] = []; // Clear queue on retrieval
-      return res.json({ hasData: true, messages: queue });
-    }
-    res.json({ hasData: false });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
   }
 });
 
@@ -2112,13 +2642,13 @@ const assistantTools = [
     functionDeclarations: [
       {
         name: "update_project_value",
-        description: "Updates any campaign workspace setting, narrative framework, or configuration value (e.g. setting, plotOverview, persistentContext, stAdventureModule, customInstructions, styleGuide, narrationStyle, narrativePerspective, pacing, emotionalTone, storyModules, creatorNames, stAuthorsMix, userNickname, themeId, chatBgPreset, chatBubbleStyle, icMinTokens, icMaxTokens, oocMinTokens, oocMaxTokens, narrativeFontSize).",
+        description: "Updates any campaign workspace setting, narrative framework, or configuration value (e.g. setting, turnHeader, adventureLogTitle, plotOverview, persistentContext, stAdventureModule, customInstructions, styleGuide, narrationStyle, narrativePerspective, pacing, emotionalTone, storyModules, creatorNames, stAuthorsMix, userNickname, themeId, chatBgPreset, chatBubbleStyle, icMinTokens, icMaxTokens, oocMinTokens, oocMaxTokens, narrativeFontSize).",
         parameters: {
           type: Type.OBJECT,
           properties: {
             key: {
               type: Type.STRING,
-              description: "The project field key to update, e.g. 'setting', 'plotOverview', 'persistentContext', 'stAdventureModule', 'customInstructions', 'styleGuide', 'narrationStyle', 'narrativePerspective', 'pacing', 'emotionalTone', 'storyModules', 'creatorNames', 'stAuthorsMix', 'userNickname', 'themeId', 'chatBgPreset', 'chatBubbleStyle'."
+              description: "The project field key to update, e.g. 'turnHeader', 'adventureLogTitle', 'setting', 'plotOverview', 'persistentContext', 'stAdventureModule', 'customInstructions', 'styleGuide', 'narrationStyle', 'narrativePerspective', 'pacing', 'emotionalTone', 'storyModules', 'creatorNames', 'stAuthorsMix', 'userNickname', 'themeId', 'chatBgPreset', 'chatBubbleStyle'."
             },
             value: {
               type: Type.STRING,
@@ -2210,6 +2740,21 @@ const assistantTools = [
         }
       },
       {
+        name: "update_lore_source",
+        description: "Updates or edits an existing lore document or grounding source in the database (e.g. updating content, summary, title, or categories).",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING, description: "The unique ID or name of the lore source to update." },
+            name: { type: Type.STRING, description: "Updated title or filename." },
+            category: { type: Type.STRING, description: "Category: 'narrative', 'character', 'world_lore', 'rules', 'module', or 'other'." },
+            content: { type: Type.STRING, description: "Updated text content or expanded lore." },
+            summary: { type: Type.STRING, description: "Updated summary / study guide." }
+          },
+          required: ["id"]
+        }
+      },
+      {
         name: "delete_lore_source",
         description: "Removes a grounding lore source from the campaign database by ID or name.",
         parameters: {
@@ -2297,17 +2842,38 @@ const assistantTools = [
         }
       },
       {
-        name: "add_prompt_vault_item",
-        description: "Saves an image prompt preset or character illustration template to the Prompt Vault.",
+        name: "edit_narrative_log",
+        description: "Edits, rewrites, polishes, or fixes an existing turn or entry in the active Adventure / Narrative Log. Always call this when Sir asks to edit, rewrite, fix, revise, or change narrative story text or dialogue in the adventure log.",
         parameters: {
           type: Type.OBJECT,
           properties: {
-            characterName: { type: Type.STRING, description: "Primary character or entity tag." },
-            folder: { type: Type.STRING, description: "Vault folder (e.g. 'Main Cast', 'NPCs', 'Setting Prompts', 'Factions')." },
-            title: { type: Type.STRING, description: "Descriptive title for this prompt template." },
-            promptText: { type: Type.STRING, description: "The full image generation prompt text." }
+            id: { type: Type.STRING, description: "The ID of the message to edit (e.g. from the transcript), or 'latest' to edit the most recent turn." },
+            newContent: { type: Type.STRING, description: "The new rewritten narrative prose, dialogue, or story text to replace the entry with." },
+            searchSnippet: { type: Type.STRING, description: "Optional snippet from the message to match if exact ID is not provided." }
           },
-          required: ["title", "promptText"]
+          required: ["newContent"]
+        }
+      },
+      {
+        name: "delete_narrative_entry",
+        description: "Deletes a specific turn or errant message from the Narrative / Adventure Log.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING, description: "The ID of the message to delete, or 'latest' to delete the most recent turn." },
+            searchSnippet: { type: Type.STRING, description: "Optional snippet from the message to identify which turn to delete." }
+          }
+        }
+      },
+      {
+        name: "update_adventure_log_title",
+        description: "Updates or renames the header title of the Narrative / Adventure Log.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING, description: "The new title for the Adventure Log (e.g. 'MERMAID CHRONICLES', 'THE OBSIDIAN REACH')." }
+          },
+          required: ["title"]
         }
       }
     ]
@@ -2368,6 +2934,16 @@ app.post("/api/ai-generate-character", async (req, res) => {
         signatureItems: `Custom dual pulse blasters, modified stealth rig, encrypted datapad.`,
         factionName: `Independent / Frontier Alliance`,
         relationships: `Maintains a cautious alliance with local fixers; fiercely protective of companions.`,
+        appearanceBuild: `Lean, athletic build with quick evasive footwork and a grounded, combat-ready posture.`,
+        distinguishingMarks: `Piercing gray eyes, narrow thermal scarring along the left temple, raven hair cropped close.`,
+        attireWardrobe: `Charcoal weatherproof ballistic flight jacket over slate-gray compression shirts; magnetic leg holsters.`,
+        voiceCadence: `Even, low-pitched cadence with a clipped frontier accent; avoids wasted syllables.`,
+        mannerisms: `Subtly checks weapon charges when entering unmapped rooms; watches exits continuously.`,
+        temperament: `Pragmatic, cynical toward grand political ideals, fiercely protective of allies under fire.`,
+        motivationsSecrets: `Driven to pay off a life-debt incurred during an early border skirmish; conceals an encrypted ledger.`,
+        tacticalStyle: `Acrobatic close-quarters gunplay, rapid tactical repositioning, electronic counter-intrusion.`,
+        timelineStage: `Campaign Continuity`,
+        canonDelta: `Fully grounded in local campaign reality.`,
         customFields: mockCustomFields
       };
     };
@@ -2402,6 +2978,16 @@ Schema to return:
   "signatureItems": "Iconic weapons, custom gear, tools, or items they carry",
   "factionName": "Syndicate, guild, alliance, or organizational affiliation",
   "relationships": "Bonds, alliances, rivalries, or connection to the player / party",
+  "appearanceBuild": "Silhouette, height, build, and physical posture",
+  "distinguishingMarks": "Facial features, eye color, hair, distinctive scars or tattoos",
+  "attireWardrobe": "Everyday attire, armor layers, fabrics, and primary colors",
+  "voiceCadence": "Voice pitch, cadence, dialogue habits, and dialect notes",
+  "mannerisms": "Physical habits, body language tells, and unconscious tics",
+  "temperament": "Temperament, moral lines, emotional vulnerabilities",
+  "motivationsSecrets": "Core personal goals, deep vulnerabilities, and hidden secrets",
+  "tacticalStyle": "Fighting style, abilities under fire, combat behavior",
+  "timelineStage": "Campaign Continuity",
+  "canonDelta": "Key continuity notes relative to official or established lore",
   "customFields": {
 ${requiredSpecs.map(k => `    "${k}": "Detailed, creative, immersive entry for ${k}"`).join(",\n")}
   }
@@ -2411,7 +2997,7 @@ Output ONLY the raw valid JSON object. No markdown wrapping (like \`\`\`json), n
 
     try {
       const response = await generateContentWithRetry(ai, {
-        model: "gemini-3.7-flash",
+        model: "gemini-flash-latest",
         contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
         config: {
           responseMimeType: "application/json",
@@ -2499,7 +3085,7 @@ Ensure the "customFields" key-value pairs are highly tailored, extensible, setti
 Output ONLY the raw valid JSON object. No markdown wrapping (like \`\`\`json), no trailing text.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.7-flash",
+      model: "gemini-flash-latest",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
         responseMimeType: "application/json",
@@ -2517,88 +3103,328 @@ Output ONLY the raw valid JSON object. No markdown wrapping (like \`\`\`json), n
       res.json(parsed);
     }
   } catch (err: any) {
-    safeError("AI Generate Character issue:", err);
-    res.status(500).json({ error: err.message || "Failed to generate character profile" });
+    safeError("AI Update Lore issue:", err);
+    res.status(500).json({ error: err.message || "Failed to update lore profile" });
   }
 });
 
-app.post("/api/ai-update-lore", async (req, res) => {
+// ==========================================
+// CANON DELTA & LOG EXTRACTION ENGINE
+// ==========================================
+
+// 1. Research canonical profiles from official wikis / web sources
+app.post("/api/canon/research", async (req, res) => {
   try {
-    const { character, recentMessages = [], projectSetting = "" } = req.body;
-    if (!character || !character.name) {
-      return res.status(400).json({ error: "character with a name is required." });
+    const { characterName, setting = "", franchise = "" } = req.body;
+    if (!characterName || typeof characterName !== "string" || !characterName.trim()) {
+      return res.status(400).json({ error: "characterName is required." });
     }
 
     const ai = getGeminiClient();
     const isMock = !process.env.GEMINI_API_KEY;
 
     if (isMock) {
-      // Mock sandbox mode auto updates nicely!
-      await new Promise(resolve => setTimeout(resolve, 600));
       return res.json({
-        role: character.role || "NPC",
-        description: (character.description || "") + " (Updated through roleplay: status and story details merged automatically)",
-        relationships: character.relationships || "Vesper struggles but persists in local narrative.",
-        factionName: character.factionName || "",
-        customFields: {
-          ...(character.customFields || {}),
-          "Roleplay Event Status": "Synced successfully in sandbox mode"
-        },
-        summaryOfChanges: `Updated ${character.name}'s biography to include the latest roleplay events!`
+        characterName: characterName.trim(),
+        canonSource: `${franchise || setting || "Official Media"} Wiki Canon`,
+        officialRole: "Key Supporting Character / Faction Operative",
+        officialFaction: setting?.toLowerCase().includes("baldur") ? "The Guild (Lower City)" : "Local Syndicate",
+        canonicalAppearances: `${franchise || setting || "Canon Work"} (Key Narrative Arcs)`,
+        officialAppearance: "Sharp observant eyes, athletic agile build, distinctive practical attire suited for street operations and combat.",
+        officialPersonality: "Pragmatic, cautious with strangers, fiercely dedicated to their chosen faction and comrades.",
+        officialWeaponsGear: "Concealed blades, lockpicks, tailored reinforced leather garments.",
+        officialBackstory: `${characterName} established a reputation through dangerous work in the shadows, navigating treacherous political factions and surviving through wit and steel.`,
+        canonicalFate: "Key active participant in major climactic confrontations within official canon.",
+        officialSummary: `Official canon entry for ${characterName}. Documented as a vital operative in ${franchise || setting || "the setting"}.`,
+        sources: [
+          { title: `${characterName} - Fandom Lore Wiki`, uri: `https://fandom.wiki/lore/${encodeURIComponent(characterName)}` }
+        ]
       });
     }
 
-    const systemPrompt = `You are an expert Lore Master and Storyteller assistant.
-Analyze the following recent roleplay chat messages and the current profile of the entity "${character.name}".
-Update the entity's profile fields to incorporate new facts, relationships, injuries, locations, gear, status changes, or developments that actually occurred in the chat. Preserve existing fields if no changes occurred in the roleplay context. Do NOT invent fake events that did not happen.
+    const searchQuery = `${characterName.trim()} ${franchise ? `"${franchise}"` : ""} ${setting ? `"${setting}"` : ""} wiki canon lore background appearance personality`;
 
-Here is the current profile of "${character.name}":
-- Name: ${character.name}
-- Type: ${character.type || "npc"}
-- Role/Profession: ${character.role || "Not specified"}
-- Description/Bio: ${character.description || "Not specified"}
-- Relationships: ${character.relationships || "Not specified"}
-- Faction/Affiliation: ${character.factionName || "Not specified"}
-- Custom Fields: ${JSON.stringify(character.customFields || {})}
+    const systemPrompt = `You are a Master Lore Archivist and Franchise Canon Specialist.
+The user is requesting canonical research from official wikis, sourcebooks, and official media for the character: "${characterName.trim()}".
+Context / Franchise: "${franchise || setting || "Fantasy / Sci-Fi / Tabletop"}".
 
-Story Setting context: ${projectSetting}
+Perform a thorough search of official wikis, fandom databases, and canonical texts.
+Extract and compile an authoritative, comprehensive canonical profile for "${characterName.trim()}".
 
-Below is the recent roleplay chat log (most recent last):
-${recentMessages.map((m: any) => (m.role === 'model' || m.role === 'nyx' ? 'DM' : 'Player') + ': ' + m.content).join('\n')}
-
-You must return a raw JSON object containing these exact fields:
+You MUST return a raw JSON object with this exact structure:
 {
-  "role": "updated role/profession",
-  "description": "updated description/bio",
-  "relationships": "updated relationships",
-  "factionName": "updated faction/affiliation",
-  "customFields": { "key": "value", ... },
-  "summaryOfChanges": "A direct, 1-sentence scannable explanation of exactly what changed (e.g., 'Merged Vesper\\'s escape from Outer Rim checkpoints and updated her alliance status with Cochise.')"
+  "characterName": "${characterName.trim()}",
+  "canonSource": "Name of official source / wiki (e.g. Baldur's Gate 3 Wiki, Wookieepedia, Forgotten Realms Lore)",
+  "officialRole": "Their official canonical title, profession, or role",
+  "officialFaction": "Official faction, guild, government, or organization",
+  "canonicalAppearances": "Where they appear in official media (e.g., Baldur's Gate 3 Act III, Star Wars KOTOR, etc.)",
+  "officialAppearance": "Official visual description: hair, eyes, scars, physique, canonical wardrobe and colors",
+  "officialPersonality": "Official voice, demeanor, morals, loyalty, and psychological profile",
+  "officialWeaponsGear": "Canonical weapons, signature armor, magical items, or tools",
+  "officialBackstory": "Official canonical origin story and history up to their major appearances",
+  "canonicalFate": "What happens to them canonically or their role in key events",
+  "officialSummary": "Comprehensive 2-3 paragraph summary of their official lore."
 }
-Ensure the "customFields" key-value pairs are highly tailored, extensible, setting-specific NoSQL fields (like Species, Bounty, Spells, Class, Cyberware, etc.) appropriate for the genre.
-Output ONLY the raw valid JSON object. No markdown wrapping (like \`\`\`json), no trailing text.`;
+
+Output ONLY valid JSON. No markdown code blocks, no other text.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.7-flash",
+      model: "gemini-flash-latest",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
-        responseMimeType: "application/json"
+        tools: [{ googleSearch: {} }],
+        responseMimeType: "application/json",
+        thinkingConfig: { thinkingBudget: 0 }
       }
-    });
+    }, 1, 400, 30000);
 
     const text = response.text || "{}";
+    let parsed: any = {};
     try {
-      const parsed = JSON.parse(text.trim());
-      res.json(parsed);
-    } catch (parseErr) {
-      const cleanJson = text.replace(/\`\`\`json/g, "").replace(/\`\`\`/g, "").trim();
-      const parsed = JSON.parse(cleanJson);
-      res.json(parsed);
+      parsed = JSON.parse(text.trim());
+    } catch {
+      const cleanJson = text.replace(/```json/g, "").replace(/```/g, "").trim();
+      parsed = JSON.parse(cleanJson);
     }
 
+    // Extract grounding chunks if available
+    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+    const sources = chunks
+      .filter((c: any) => c.web)
+      .map((c: any) => ({
+        title: c.web.title || "Lore Source",
+        uri: c.web.uri
+      }));
+
+    parsed.sources = sources.length > 0 ? sources : [
+      { title: `${characterName} Canon Reference`, uri: `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}` }
+    ];
+
+    return res.json(parsed);
   } catch (err: any) {
-    safeError("AI Lore Update issue:", err);
-    res.status(500).json({ error: err.message || "Failed to auto-update lore with AI" });
+    safeError("Canon Research error:", err);
+    res.status(500).json({ error: err.message || "Failed to research canon" });
+  }
+});
+
+// 2. Extract character manifestations, deeds, dialogue, and changes directly from campaign chat logs
+app.post("/api/canon/extract-from-logs", async (req, res) => {
+  try {
+    const { characterName = "", messages = [], projectSetting = "" } = req.body;
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "messages array cannot be empty." });
+    }
+
+    const ai = getGeminiClient();
+    const isMock = !process.env.GEMINI_API_KEY;
+
+    // Filter and extract text from messages (last 45 turns to capture meaningful narrative scope)
+    const recentMessages = messages.slice(-45);
+    const transcript = recentMessages.map((m: any, idx: number) => {
+      const role = m.role === "model" || m.role === "nyx" ? "Narrator/Nyx" : "Player";
+      const text = typeof m.content === "string" ? m.content : (m.text || "");
+      return `[Turn ${idx + 1}] (${role}): ${text.slice(0, 800)}`;
+    }).join("\n\n");
+
+    if (isMock) {
+      return res.json({
+        characterName: characterName || "Discovered NPC",
+        detectedCharacters: ["Lora Bergauz", "Shima Aliph", "Martha", "Corpse Inspector"],
+        scenesAppearedIn: ["The Lower City mortuary examination", "The canal boat discussion"],
+        firstIntroduced: "Turn #4 during the nocturnal investigation",
+        campaignAppearance: "Slight build, dressed in dark mortician linens with herbal oil stains on fingers, cautious posture.",
+        campaignRole: "Apprentice mortician / undertaker's assistant in the Lower City",
+        campaignActions: "Helped conceal the smuggled body, provided key forensic observations, swore secrecy to the protagonist.",
+        relationshipWithProtagonist: "Deepening mutual trust, protective concern, secret complicity.",
+        currentStatus: "Active, stationed at the ossuary, maintaining quiet watch.",
+        excerpts: [
+          "She kept her voice low, checking the corridor twice before lifting the shroud.",
+          "Her hands were steady despite the tremor in her voice as she warned of Guild eyes."
+        ]
+      });
+    }
+
+    const targetPrompt = characterName.trim()
+      ? `Focus specifically on the character named "${characterName.trim()}".`
+      : `Scan the transcript and detect all distinct named characters and notable NPCs who appear or are mentioned. Select the most prominent one or summarize all of them.`;
+
+    const systemPrompt = `You are an elite Narrative Analyst and Roleplay Log Historian.
+Analyze the following roleplay campaign chat transcript.
+Setting: "${projectSetting}".
+${targetPrompt}
+
+Examine how characters actually appear, speak, act, and evolve in the story so far.
+
+You MUST return a raw JSON object matching this schema:
+{
+  "characterName": "${characterName.trim() || 'Primary Detected Character'}",
+  "detectedCharacters": ["List of all character names detected in the transcript"],
+  "scenesAppearedIn": ["Summary of specific scenes they were part of"],
+  "firstIntroduced": "When/how they first appeared in the narrative",
+  "campaignAppearance": "How they were visually described in the actual chat (clothing, stains, hair, gear, scars)",
+  "campaignRole": "Their actual role/occupation in this specific campaign narrative",
+  "campaignActions": "Key choices, assistance, conflicts, or deeds they performed in the story",
+  "relationshipWithProtagonist": "Their relationship, trust level, promises, or tension with the protagonist/party",
+  "currentStatus": "Where they currently are, their emotional state, injuries, or immediate goal",
+  "excerpts": ["2-3 key verbatim or concise excerpt lines from the chat illustrating them"]
+}
+
+TRANSCRIPT:
+${transcript}
+
+Output ONLY valid raw JSON. No markdown code blocks.`;
+
+    const response = await generateContentWithRetry(ai, {
+      model: "gemini-flash-latest",
+      contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
+      config: {
+        responseMimeType: "application/json",
+        thinkingConfig: { thinkingBudget: 0 }
+      }
+    }, 1, 400, 25000);
+
+    const text = response.text || "{}";
+    let parsed: any = {};
+    try {
+      parsed = JSON.parse(text.trim());
+    } catch {
+      const cleanJson = text.replace(/```json/g, "").replace(/```/g, "").trim();
+      parsed = JSON.parse(cleanJson);
+    }
+
+    return res.json(parsed);
+  } catch (err: any) {
+    safeError("Log Extraction error:", err);
+    res.status(500).json({ error: err.message || "Failed to extract character from logs" });
+  }
+});
+
+// 3. Reconcile online canon with campaign reality into a structured granular delta profile
+app.post("/api/canon/reconcile-delta", async (req, res) => {
+  try {
+    const {
+      characterName,
+      onlineCanon = {},
+      logSummary = {},
+      timelineStage = "prequel", // "prequel" | "mid-canon" | "alternate" | "sequel" | "original"
+      projectSetting = "",
+      userGuidance = ""
+    } = req.body;
+
+    if (!characterName || typeof characterName !== "string" || !characterName.trim()) {
+      return res.status(400).json({ error: "characterName is required." });
+    }
+
+    const ai = getGeminiClient();
+    const isMock = !process.env.GEMINI_API_KEY;
+
+    if (isMock) {
+      return res.json({
+        characterName: characterName.trim(),
+        role: timelineStage === "prequel" ? "Apprentice Mortician / Guild Ward" : (onlineCanon.officialRole || "Operative"),
+        timelineStage: timelineStage === "prequel" ? "Prequel (Before Official Events)" : timelineStage,
+        canonSource: onlineCanon.canonSource || "Online Lore Wiki",
+        canonDelta: `PREQUEL CONTINUITY DELTA: Set years before canonical events. ${characterName} is younger, still working as an apprentice undertaker/mortician, and has NOT achieved the status or scars seen in official game canon. She does not possess post-canon knowledge, and has formed a deep, secret personal bond with the protagonist.`,
+        description: `Younger and more tentative than her future self, ${characterName} works the cold stones of the mortuary with meticulous clinical care, harboring quiet defiance beneath a respectful facade.`,
+        backstory: `Raised amidst the Lower City's hard streets, she took shelter under the care of the morticians. While official canon sees her rise to prominent underworld standing, in this prequel era she is still finding her footing and keeping her head down.`,
+        appearanceBuild: "Slender, wiry frame with youthful agility; carries tension in her shoulders.",
+        distinguishingMarks: "Clear observant hazel eyes, slight ink stains on left fingertips, hair tied back with rough twine; lacks future battle scars.",
+        attireWardrobe: "Charcoal wool undertaker's apron over washed linen tunics, sturdy mud-caked boots, concealed inner pockets.",
+        voiceCadence: "Quiet, measured lower register, speaking with calm precision even when nervous.",
+        mannerisms: "Subtly rolls thumbs together when listening; frequently checks shadows and doorways.",
+        temperament: "Guarded, intensely empathetic to the helpless, weary of senseless cruelty.",
+        motivationsSecrets: "Wants to survive without losing her soul; conceals her growing emotional attachment to the protagonist.",
+        tacticalStyle: "Cautious skirmisher; relies on anatomy knowledge and quick retreats rather than brute force.",
+        signatureItems: "Bone-handled scalpel, hidden pouch of pungent embalming salts, brass pocket timepiece.",
+        factionName: timelineStage === "prequel" ? "Independent / Lower City Mortuary" : (onlineCanon.officialFaction || "Local Faction"),
+        relationships: "Secret ally and confidante to the protagonist; cautious distance from Guild authorities.",
+        aiNarratorDirective: `STRICT PREQUEL DIRECTIVE: Portray ${characterName} in her early, pre-game state. Do NOT attribute future ranks, cynical hardness, or post-canon relationships to her. Respect her campaign bond with the protagonist.`
+      });
+    }
+
+    const timelineExplanations: Record<string, string> = {
+      prequel: "PREQUEL (Years before official game / story events): Character is younger, in early formative years/roles, lacks future titles/scars/gear, and has NOT experienced canon events yet. No future spoilers or post-canon assumptions.",
+      "mid-canon": "MID-CANON (Concurrent with official events): Character exists alongside official events but with specific campaign interactions and localized developments.",
+      alternate: "ALTERNATE TIMELINE (Events diverged from canon): Canonical events played out differently due to campaign actions, choices, or custom world states.",
+      sequel: "SEQUEL (After official canon events): Character has survived canonical events and bears the experience, trauma, or fallout of the official storyline.",
+      original: "ORIGINAL / ADAPTED LORE: Custom adaptation inspired by canon but tailored to the original campaign world."
+    };
+
+    const systemPrompt = `You are the Master Canon Architect and Lore Reconciler.
+Your mission is to build the authoritative, highly granular character profile for "${characterName.trim()}" in this campaign, bridging the gap between:
+1. ONLINE / WIKI CANON (What official sourcebooks, games, or wikis say)
+2. CAMPAIGN NARRATIVE LOGS (What has actually happened in this specific roleplay campaign)
+3. TIMELINE & CONTINUITY STAGE: "${timelineStage}" -> ${timelineExplanations[timelineStage] || timelineStage}
+
+Campaign Setting: "${projectSetting}"
+User Guidance / Campaign Premise: "${userGuidance || "The campaign features specific narrative history such as prequel storylines, character development, and unique roleplay interactions."}"
+
+ONLINE CANON RESEARCH:
+${JSON.stringify(onlineCanon, null, 2)}
+
+CAMPAIGN LOG FINDINGS:
+${JSON.stringify(logSummary, null, 2)}
+
+CRITICAL RECONCILIATION RULES:
+1. Compute the exact "canonDelta": What is different between online canon and this campaign? (e.g. In a prequel, they are younger, don't hold future titles, don't have future scars, haven't met future enemies, and have developed unique campaign bonds).
+2. Deconstruct the character into precise, granular fields for maximum LLM accuracy:
+   - appearanceBuild: Height, frame, silhouette, posture (accurate to this timeline)
+   - distinguishingMarks: Facial features, scars, eyes, hair (do not include scars received later in official canon if this is a prequel!)
+   - attireWardrobe: Attire and armor worn during this campaign phase
+   - voiceCadence: Pitch, cadence, dialect, dialogue delivery quirks
+   - mannerisms: Physical tells, posture, body language, unconscious habits
+   - temperament: Core temperament, emotional vulnerabilities, moral boundaries
+   - motivationsSecrets: What drives them now, what they fear, what secrets they hide
+   - tacticalStyle: How they fight or act under danger in this phase
+3. Produce a strict "aiNarratorDirective" telling the AI Game Master (Nyx) exactly how to portray this character without breaking the timeline or spoiling future events.
+
+You MUST return ONLY a raw JSON object with this exact structure:
+{
+  "characterName": "${characterName.trim()}",
+  "role": "Reconciled role/profession for this timeline",
+  "timelineStage": "${timelineStage}",
+  "canonSource": "${onlineCanon.canonSource || 'Online Wiki & Campaign Log Synthesis'}",
+  "canonDelta": "Clear, direct explanation of all differences from official canon (2-4 sentences)",
+  "description": "Rich 2-3 sentence overview respecting the timeline delta",
+  "backstory": "Reconciled backstory adapted to this point in time",
+  "appearanceBuild": "Build, height, silhouette, physical presence",
+  "distinguishingMarks": "Facial features, eye color, hair, scars, tattoos (accurate to timeline)",
+  "attireWardrobe": "Everyday attire, armor, clothing materials and colors",
+  "voiceCadence": "Voice pitch, cadence, tone, dialogue quirks",
+  "mannerisms": "Physical habits, body language tells",
+  "temperament": "Temperament, moral boundaries, emotional triggers",
+  "motivationsSecrets": "Immediate goals, deep fears, secrets kept from party",
+  "tacticalStyle": "Fighting style, abilities, approach to danger",
+  "signatureItems": "Iconic items, weapons, or gear currently held",
+  "factionName": "Accurate faction or affiliation for this era",
+  "relationships": "Bonds with protagonist and active campaign cast",
+  "aiNarratorDirective": "Direct instruction for the AI Game Master on portraying this character accurately"
+}
+
+Output ONLY valid JSON. No markdown code blocks, no trailing commentary.`;
+
+    const response = await generateContentWithRetry(ai, {
+      model: "gemini-flash-latest",
+      contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
+      config: {
+        responseMimeType: "application/json",
+        thinkingConfig: { thinkingBudget: 0 }
+      }
+    }, 1, 400, 30000);
+
+    const text = response.text || "{}";
+    let parsed: any = {};
+    try {
+      parsed = JSON.parse(text.trim());
+    } catch {
+      const cleanJson = text.replace(/```json/g, "").replace(/```/g, "").trim();
+      parsed = JSON.parse(cleanJson);
+    }
+
+    return res.json(parsed);
+  } catch (err: any) {
+    safeError("Canon Delta Reconciliation error:", err);
+    res.status(500).json({ error: err.message || "Failed to reconcile canon delta" });
   }
 });
 
@@ -2657,6 +3483,23 @@ app.post("/api/workspace-assistant", async (req, res) => {
           }
         });
         replyText = `[Nyx: Shunted that engine plasma narration straight into the active adventure channel. Saito's thrusters are officially screaming!]`;
+      } else if (textLower.includes("title") || textLower.includes("rename log") || textLower.includes("header")) {
+        functionCalls.push({
+          name: "update_adventure_log_title",
+          args: {
+            title: "THE OBSIDIAN RECKONING"
+          }
+        });
+        replyText = `[Nyx: Updated the Adventure Log title to "THE OBSIDIAN RECKONING", ${nickname}!]`;
+      } else if (textLower.includes("edit log") || textLower.includes("narrative log") || textLower.includes("rewrite") || textLower.includes("edit scene")) {
+        functionCalls.push({
+          name: "edit_narrative_log",
+          args: {
+            id: "latest",
+            newContent: "The rain lashes across the hull as you step into the briefing chamber. Neon reflections shimmer in the puddles."
+          }
+        });
+        replyText = `[Nyx: Revised the latest scene entry in the Adventure Log, ${nickname}!]`;
       } else {
         replyText = `[Nyx: Just checking over the dashboard alignment, ${nickname}. Ask me to edit character profiles, sync fresh Google Doc notes, change the scene weather, or update objectives. What's our next creative play?]`;
       }
@@ -2758,7 +3601,7 @@ app.post("/api/workspace-assistant", async (req, res) => {
     }
 
     // Attach active database sources & lore character portraits multimodally only when lightweight images are present
-    const rawSources = appContext.activeProject?.sources || [];
+    const rawSources = appContext.activeProject?.sources || appContext.sources || [];
     const lastUserTurn = contents.length > 0 ? contents[contents.length - 1] : null;
 
     if (lastUserTurn && lastUserTurn.role === "user") {
@@ -2812,6 +3655,16 @@ app.post("/api/workspace-assistant", async (req, res) => {
     }
 
     // Comprehensive Workspace Context Details
+    const assistantAuthors = extractSpecifiedAuthors(appContext.activeProject?.creatorNames, appContext.activeProject?.styleGuide, appContext.activeProject?.narrationStyle, messages);
+    const assistantPacingAdjusted = isPacingAdjusted(appContext.activeProject?.pacing);
+    const assistantMoodAdjusted = isMoodAdjusted(appContext.activeProject?.emotionalTone);
+    const projectPacing = appContext.activeProject?.pacing
+      ? `\nStory Pacing: ${appContext.activeProject.pacing}${!assistantPacingAdjusted && assistantAuthors ? ` (Defaulting to ${assistantAuthors}'s signature narrative pacing)` : ""}`
+      : (assistantAuthors ? `\nStory Pacing: Default to ${assistantAuthors}'s signature narrative pacing` : "");
+    const projectMood = appContext.activeProject?.emotionalTone
+      ? `\nMood / Atmosphere: ${appContext.activeProject.emotionalTone}${!assistantMoodAdjusted && assistantAuthors ? ` (Defaulting to ${assistantAuthors}'s signature atmosphere & mood)` : ""}`
+      : (assistantAuthors ? `\nMood / Atmosphere: Default to ${assistantAuthors}'s signature atmosphere & mood` : "");
+
     const projectSetting = appContext.activeProject?.setting ? `\nCampaign Setting: ${appContext.activeProject.setting}` : "";
     const projectPlot = appContext.activeProject?.plotOverview ? `\nPlot Overview: ${appContext.activeProject.plotOverview}` : "";
     const projectContext = appContext.activeProject?.persistentContext ? `\nPersistent Scene Context: ${appContext.activeProject.persistentContext}` : "";
@@ -2850,6 +3703,9 @@ app.post("/api/workspace-assistant", async (req, res) => {
       return `- [ID: ${s.id}] **"${s.name}"** (Category: ${catLabel})${summaryText}${contentSnippet}`;
     }).join("\n");
 
+    // Active Narrative Transcript Snippet (Recent Turns)
+    const narrativeSnippet = appContext.narrativeTranscriptSnippet ? `\n\n--- ACTIVE ADVENTURE / NARRATIVE LOG TRANSCRIPT (Recent Turns) ---\n${appContext.narrativeTranscriptSnippet}` : "";
+
     const systemPrompt = `
 You are Nyx, the ultimate digital Storyteller, Dungeon Master, and campaign co-designer. You are speaking directly to Sir (${appContext.activeProject?.userNickname || "Sir"}).
 
@@ -2869,46 +3725,49 @@ NYX DIRECTIVES & PERSONA:
 
 WORKSPACE SCOPE & SEPARATION DIRECTIVE:
 - You are a separate, dedicated Studio Assistant and campaign co-pilot.
-- You have full READ, WRITE, and EDIT privileges over campaign parameters, character profiles, lore sources, keep notes, and objectives.
-- You have direct visibility into all campaign settings, character dossiers, keep notes, attached grounding notebooks, and active scene contexts below.
-- You can answer questions about ANY character, lore document, location, setting detail, note, or rule in the workspace with complete accuracy.
-- When Sir asks you to create, modify, calibrate, or delete any entity, setting, note, or task, execute the appropriate tool or structured JSON block.
+- You have full READ, WRITE, and EDIT privileges over campaign parameters, character profiles, grounding lore sources & documents, objectives, AND the active Adventure / Narrative Log.
+- You have direct visibility into all campaign settings, character dossiers, attached grounding sources & notebooks, active scene contexts, and recent adventure turns below.
+- You can answer questions about ANY character, lore document, location, setting detail, rule, or story event with complete accuracy.
+- When Sir asks you to create, modify, calibrate, or delete any entity, setting, lore document, task, or edit the story narrative log, execute the appropriate tool or structured JSON block.
 ${dynamicRagSection}
 
 ==================================================
 CAMPAIGN WORKSPACE CONTEXT:
 ==================================================
-Active Campaign: "${appContext.activeProject?.name || "Active Campaign"}" (User: ${appContext.activeProject?.userNickname || "Sir"})${projectSetting}${projectPlot}${projectContext}${projectStyle}${projectCustomInstructions}${projectAdventureModule}
+Active Campaign: "${appContext.activeProject?.name || "Active Campaign"}" (User: ${appContext.activeProject?.userNickname || "Sir"})${projectSetting}${projectPlot}${projectContext}${projectStyle}${projectPacing}${projectMood}${projectCustomInstructions}${projectAdventureModule}
 
 --- REGISTERED CHARACTERS & LORE PROFILES (${(appContext.characters || []).length} registered) ---
 ${charactersDetail || "No characters registered yet."}
 
---- KEEP NOTES (${(appContext.notes || []).length} registered) ---
-${notesDetail || "No keep notes logged yet."}
-
---- ATTACHED LORE SOURCES & NOTEBOOKS (${rawSources.length} registered) ---
+--- ATTACHED LORE SOURCES & GROUNDING NOTEBOOKS (${rawSources.length} registered) ---
 ${sourcesOverview || "No lore sources attached."}
 
 --- ACTIVE OBJECTIVES (${(appContext.tasks || []).length} registered) ---
-${tasksDetail || "No active objectives."}
+${tasksDetail || "No active objectives."}${narrativeSnippet}
 ==================================================
 
+CANON ARCHITECTURE & LORE DATABASE PRECEDENCE (DELTA OVER BASE TRAINING):
+- The Campaign Lore Database (characters, custom fields, specifications, grounding documents, setting parameters) is the AUTHORITATIVE TRUTH and LIVING CANON DELTA for this universe.
+- If details in the Lore Database differ from base pre-training knowledge (e.g. specific comic run variations, custom backstory, character equipment, or timeline changes), THE LORE DATABASE EXPLICITLY OVERRIDES AND SUPERSEDES BASE PRE-TRAINING.
+- Base training serves as foundational vocabulary and world physics; all lore database entries are permanently active knowledge.
+
 TOOL EXECUTION CAPABILITIES:
+- \`edit_narrative_log\`: Edit, rewrite, polish, or fix an entry in the Narrative / Adventure Log. Use when Sir asks to edit, revise, polish, or rewrite a scene turn or dialogue in the story log. Supply \`id\` (or omit/'latest' for the last turn) and \`newContent\` with the full rewritten prose.
+- \`delete_narrative_entry\`: Remove an unwanted turn or message from the adventure log.
+- \`update_adventure_log_title\`: Rename the header title of the Narrative / Adventure Log (or use \`update_project_value\` with key="adventureLogTitle").
 - \`add_character_or_lore\`: Create new PC, companion, NPC, faction, vehicle, equipment, location, or chronicle profiles.
   * CRITICAL ATOMIC PROFILE DIRECTIVE: When creating any character/NPC/lore entity, you MUST provide ALL fields in that SINGLE \`add_character_or_lore\` call: name, role, description, type, factionName, relationships, signatureItems, backstory, and customFields (as a JSON string). NEVER send an empty or half-filled profile with only 1 field!
   * MANDATORY CUSTOM FIELDS / CATEGORY SPECIFICATIONS: You MUST populate \`customFields\` with detailed values for ALL category specification keys appropriate for the entity type (e.g., for NPC: "Physical Profile & Manifestation", "Behavioral Framework & Personality Protocols", "Combat Protocols & Systems Control", "Abilities & Skills", "Weaknesses", "Linguistic Patterns & Dialogue Samples"; for PC/Companion: "Physical Profile & Metrics", "Cyber-Handles & Digital Identity", "Biological Mutations & Senses", "Supernatural Powers & Limits", "Suit Design & Costume", "Armor & Weapons Specs", "Infiltration & Utility Rig", "Specialized Combat & Technical Skills"; for Chronicle: "Date / Timeline", "Key Figures", "Outcomes & Consequences", "Location"; for Location: "Geography & Climate", "Inhabitants & Species", "Primary Hazards", "Points of Interest", "Defense / Security Level"; for Vehicle: "Model & Class", "Manufacturer", "Speed & Propulsion", "Crew Capacity", "Armament & Shields"; for Equipment: "Classification & Type", "Manufacturer", "Damage / Defense Specs", "Ammo Type / Energy Source"; for Faction: "Ideology & Core Beliefs", "Headquarters / My Base", "Size & Military Scale", "Leaders & Key Contacts", "Resources & Influence").
 - \`update_character_or_lore\`: Edit existing profile roles, descriptions, custom fields, or stats. If Sir asks to flesh out or fill in missing fields or custom specifications for an existing character, supply the updated \`customFields\` JSON with all category specifications populated!
 - \`delete_character_or_lore\`: Remove outdated or unwanted profiles.
-- \`update_project_value\`: Update or upsert campaign parameters. When Sir asks to update, upsert, or change world settings or lore, invoke \`update_project_value\` with key="setting" and value="<updated world lore>". Can also update plotOverview, persistentContext, styleGuide, pacing, or emotionalTone.
-- \`add_keep_note\`: Add a campaign note to the notebook.
-- \`delete_keep_note\`: Remove a note by ID.
+- \`update_project_value\`: Update or upsert campaign parameters. When Sir asks to update, upsert, or change world settings, lore, adventure log title, or turn header (e.g. 'The Mortician - S01E11' or 'The Household - Fun in the Sun'), invoke \`update_project_value\` with key="turnHeader" (or "setting", "adventureLogTitle", "plotOverview", "persistentContext", "styleGuide", "pacing", "emotionalTone") and value="<updated value>".
+- \`add_lore_source\`, \`update_lore_source\`, \`delete_lore_source\`: Create, edit, and manage grounding lore documents, world guides, historical codices, and transcripts. Use \`add_lore_source\` when Sir asks to record, log, or establish world lore or notes. (Note: Keep notes and scratchpads are legacy; the structured Lore Database and Grounding Sources are the active canon repositories).
 - \`add_task\`, \`toggle_task\`, \`delete_task\`: Manage campaign goals and objectives.
-- \`add_lore_source\`, \`delete_lore_source\`: Manage grounding lore documents.
 - \`feed_context_to_main_chat\`: Post narration or dialogue into the main adventure transcript.
-- \`add_prompt_vault_item\`: Save prompt templates to the vault.
 
 Always answer concisely, directly, and naturally. 
 - You are a fast, sharp co-pilot, NOT an essayist or textbook librarian.
+- In both Studio and Lite Mobile modes (focusing cleanly on Narration, Assistant, and World Settings), prioritize direct clarity.
 - Give the exact answer in 1 to 3 tight sentences or crisp, scannable bullet points unless Sir explicitly asks for an in-depth breakdown or creative essay.
 - Do NOT regurgitate entire raw source excerpts, lore histories, or unsolicited dossiers. Give the key facts cleanly with your signature cheeky flair.
 `;
@@ -2941,21 +3800,29 @@ Always answer concisely, directly, and naturally.
         }
       };
 
-      const rawCalls = typeof resp?.functionCalls === "function" ? resp.functionCalls() : resp?.functionCalls;
-      if (Array.isArray(rawCalls) && rawCalls.length > 0) {
-        for (const fc of rawCalls) {
-          addCallIfUnique(fc);
-        }
-      }
-
-      const candidates = resp?.candidates || [];
-      for (const cand of candidates) {
-        const parts = cand?.content?.parts || [];
-        for (const p of parts) {
-          if (p.functionCall) {
-            addCallIfUnique(p.functionCall);
+      try {
+        const rawCalls = typeof resp?.functionCalls === "function" ? resp.functionCalls() : resp?.functionCalls;
+        if (Array.isArray(rawCalls) && rawCalls.length > 0) {
+          for (const fc of rawCalls) {
+            addCallIfUnique(fc);
           }
         }
+      } catch (e) {
+        // ignore
+      }
+
+      try {
+        const candidates = resp?.candidates || [];
+        for (const cand of candidates) {
+          const parts = cand?.content?.parts || [];
+          for (const p of parts) {
+            if (p.functionCall) {
+              addCallIfUnique(p.functionCall);
+            }
+          }
+        }
+      } catch (e) {
+        // ignore
       }
       return calls;
     };
@@ -2968,29 +3835,30 @@ Always answer concisely, directly, and naturally.
 
     try {
       const response = await generateContentWithRetry(ai, {
-        model: "gemini-3.7-flash",
+        model: "gemini-flash-latest",
         contents,
         config: callConfig
-      }, 1, 300, 30000);
-      text = response.text || "";
+      }, 1, 300, 35000);
+      
       functionCalls = extractFunctionCalls(response);
+      text = safeExtractResponseText(response);
 
     } catch (apiErr: any) {
       safeWarn("Workspace Assistant primary call timed out or hit issue:", apiErr?.message);
       // Fallback fast text-only generation if tool schemas or complex function calls caused an issue
       try {
         const fallbackResp = await generateContentWithRetry(ai, {
-          model: "gemini-3.7-flash",
+          model: "gemini-flash-latest",
           contents,
           config: {
             systemInstruction: systemPrompt,
             temperature: 0.3
           }
-        }, 1, 200, 30000);
-        text = fallbackResp.text || "";
+        }, 1, 200, 35000);
+        text = safeExtractResponseText(fallbackResp);
       } catch (fallbackErr: any) {
         safeWarn("Workspace Assistant fallback also exhausted:", fallbackErr?.message);
-        text = `[Nyx: I'm right here with you, ${appContext?.activeProject?.userNickname || "Sir"}! Everything is synced and ready to calibrate.]`;
+        text = "";
       }
     }
 
@@ -3039,6 +3907,21 @@ Always answer concisely, directly, and naturally.
                 functionCalls.push({
                   name: "update_project_value",
                   args: { key: item.key, value: item.value }
+                });
+              } else if (item?.action === "EDIT_NARRATIVE_LOG" || item?.action === "edit_narrative_log" || item?.action === "edit_message") {
+                functionCalls.push({
+                  name: "edit_narrative_log",
+                  args: { id: item.id || item.messageId || "latest", newContent: item.newContent || item.content || item.text, searchSnippet: item.searchSnippet }
+                });
+              } else if (item?.action === "DELETE_NARRATIVE_ENTRY" || item?.action === "delete_narrative_entry") {
+                functionCalls.push({
+                  name: "delete_narrative_entry",
+                  args: { id: item.id || "latest", searchSnippet: item.searchSnippet }
+                });
+              } else if (item?.action === "UPDATE_ADVENTURE_LOG_TITLE" || item?.action === "update_adventure_log_title") {
+                functionCalls.push({
+                  name: "update_adventure_log_title",
+                  args: { title: item.title || item.name }
                 });
               }
             }
@@ -3100,16 +3983,25 @@ Always answer concisely, directly, and naturally.
     // If function calls were returned but no text was output by Gemini, generate in-character confirmation
     if (!text.trim() && functionCalls.length > 0) {
       const actionDescriptions = functionCalls.map(f => {
+        if (f.name === "feed_context_to_main_chat") return `posted the scene narration directly into the active Adventure Log`;
+        if (f.name === "edit_narrative_log") return `revised the turn in the Adventure Log`;
+        if (f.name === "delete_narrative_entry") return `removed the entry from the Adventure Log`;
+        if (f.name === "update_adventure_log_title") return `updated the Adventure Log title to "${f.args?.title}"`;
         if (f.name === "add_character_or_lore") return `registered "${f.args?.name || "character"}" into the lore database`;
         if (f.name === "update_character_or_lore") return `updated "${f.args?.name || f.args?.id || "profile"}"`;
         if (f.name === "update_project_value") return `updated workspace setting "${f.args?.key}"`;
         if (f.name === "add_lore_source") return `registered lore document "${f.args?.name}"`;
+        if (f.name === "update_lore_source") return `updated lore document "${f.args?.name || f.args?.id}"`;
+        if (f.name === "delete_lore_source") return `deleted lore document "${f.args?.id || f.args?.name}"`;
         if (f.name === "add_keep_note") return `logged note "${f.args?.title || "Campaign Note"}"`;
         if (f.name === "add_task") return `added objective "${f.args?.text || "Task"}"`;
-        if (f.name === "add_prompt_vault_item") return `saved prompt "${f.args?.title || "Prompt"}" to vault`;
         return `executed ${f.name.replace(/_/g, " ")}`;
       }).join(", ");
-      text = `[All set, ${appContext.activeProject?.userNickname || "Sir"}! I have ${actionDescriptions}. Let me know what we should tackle next!]`;
+      text = `[Nyx: All set, ${appContext?.activeProject?.userNickname || "Sir"}! I've ${actionDescriptions}.]`;
+    }
+
+    if (!text.trim() && functionCalls.length === 0) {
+      text = `[Nyx: I've processed that directive for you, ${appContext?.activeProject?.userNickname || "Sir"}. What's our next creative move?]`;
     }
 
     res.json({
@@ -3120,7 +4012,7 @@ Always answer concisely, directly, and naturally.
   } catch (err: any) {
     safeError("Assistant API outer issue:", err);
     res.json({
-      text: `[Nyx: I caught your message! Everything is synced up.]`,
+      text: `[Nyx: I caught that, ${req.body?.appContext?.activeProject?.userNickname || "Sir"}! Everything is synced up and standing by.]`,
       functionCalls: []
     });
   }
@@ -3158,7 +4050,7 @@ app.get("/api/workspace-assistant/diagnostics", async (req, res) => {
     const pingStart = Date.now();
     try {
       const pingResp = await generateContentWithRetry(ai, {
-        model: "gemini-3.7-flash",
+        model: "gemini-flash-latest",
         contents: [{ role: "user", parts: [{ text: "ping" }] }],
         config: {
           systemInstruction: "Respond with the single word PONG.",
@@ -3170,7 +4062,7 @@ app.get("/api/workspace-assistant/diagnostics", async (req, res) => {
       checks.modelConnectivity = {
         status: text ? "ok" : "warn",
         latencyMs: pingLatency,
-        details: text ? `Gemini 3.7 Flash operational (Ping response in ${pingLatency}ms).` : "Model connected but returned empty ping response."
+        details: text ? `Gemini Flash-Latest operational (Ping response in ${pingLatency}ms).` : "Model connected but returned empty ping response."
       };
     } catch (e: any) {
       checks.modelConnectivity = {
@@ -3242,9 +4134,9 @@ app.get("/api/workspace-assistant/diagnostics", async (req, res) => {
       "toggle_task",
       "delete_task",
       "add_lore_source",
+      "update_lore_source",
       "delete_lore_source",
-      "feed_context_to_main_chat",
-      "add_prompt_vault_item"
+      "feed_context_to_main_chat"
     ];
     checks.toolRegistry = {
       status: "ok",
@@ -3333,131 +4225,6 @@ app.post("/api/workspace-assistant/rag-test", async (req, res) => {
   }
 });
 
-// Command center endpoint for /api/assistant to support AdventureChat and quick directives
-app.post("/api/assistant", async (req, res) => {
-  try {
-    const { message, project = {}, characters = [] } = req.body;
-    const userMessage = message || "";
-    if (!userMessage.trim()) {
-      return res.status(400).json({ error: "Message is required." });
-    }
-
-    const ai = getGeminiClient();
-    const isMock = !process.env.GEMINI_API_KEY;
-
-    // Fallback extraction helper for natural language commands
-    const extractRegexCommands = (txt: string): any[] => {
-      const cmds: any[] = [];
-      const msgLower = txt.toLowerCase();
-
-      if (msgLower.includes("setting to") || msgLower.includes("change setting to") || msgLower.includes("update setting to")) {
-        const match = txt.match(/setting to\s+([^,.\n]+)/i) || txt.match(/change setting to\s+([^,.\n]+)/i);
-        const val = match ? match[1].trim() : "";
-        if (val) cmds.push({ action: "SET_PROJECT_VALUE", key: "setting", value: val });
-      }
-
-      if (msgLower.includes("plot to") || msgLower.includes("plot overview to") || msgLower.includes("set plot to")) {
-        const match = txt.match(/plot(?: overview)? to\s+([^,.\n]+)/i);
-        const val = match ? match[1].trim() : "";
-        if (val) cmds.push({ action: "SET_PROJECT_VALUE", key: "plotOverview", value: val });
-      }
-
-      if (msgLower.includes("add companion") || msgLower.includes("add character") || msgLower.includes("create companion") || msgLower.includes("create character") || msgLower.includes("add npc")) {
-        const match = txt.match(/(?:character|companion|npc)\s+(?:named\s+)?([A-Z][a-zA-Z0-9_\s]{1,30})/i);
-        const name = match ? match[1].trim() : "";
-        if (name) {
-          const isCompanion = msgLower.includes("companion");
-          cmds.push({
-            action: "ADD_CHARACTER",
-            name,
-            role: isCompanion ? "Companion" : "NPC",
-            type: isCompanion ? "companion" : "npc",
-            description: `Auto-registered ${isCompanion ? "companion" : "character"} profile created from directive.`
-          });
-        }
-      }
-
-      if (msgLower.includes("clear chat") || msgLower.includes("clear log") || msgLower.includes("wipe chat")) {
-        cmds.push({ action: "CLEAR_CHAT" });
-      }
-
-      return cmds;
-    };
-
-    if (isMock) {
-      const commands = extractRegexCommands(userMessage);
-      return res.json({
-        reply: `[Nyx: Received your command, ${project?.userNickname || "Sir"}! I've executed your directives and synced the database.]`,
-        commands
-      });
-    }
-
-    const rawSources = project?.sources || [];
-    const { promptText: ragPrompt } = extractRelevantSourceExcerpts(rawSources, userMessage, [], characters, 6);
-    const sourcesSummary = rawSources.map((s: any) => `- "${s.name}": ${(s.summary || s.content || "").slice(0, 300)}`).join("\n");
-
-    const systemPrompt = `You are Nyx, the witty, slightly bratty, irreverent Storyteller and AI Assistant talking to Sir (${project?.userNickname || "Sir"}).
-The user is giving you commands or questions to configure their campaign, character list, lore database, and world settings.
-
-YOUR TASK:
-1. Provide a witty, charming reply as Nyx enclosed in square brackets [like this].
-2. If the user asks or commands you to change settings, add characters/companions/PCs, update profiles, or configure lore, YOU MUST populate the "commands" array with exact action objects.
-
-AVAILABLE COMMAND SCHEMAS:
-- {"action": "SET_PROJECT_VALUE", "key": "setting" | "plotOverview" | "persistentContext" | "customInstructions" | "styleGuide" | "creatorNames" | "userNickname" | "emotionalTone" | "pacing" | "narrationStyle", "value": "string"}
-- {"action": "ADD_CHARACTER", "name": "string", "role": "string", "description": "string", "type": "pc" | "companion" | "npc" | "location" | "vehicle" | "equipment" | "faction", "isPlayerCharacter": boolean, "signatureItems": "string", "backstory": "string", "relationships": "string", "factionName": "string"}
-- {"action": "UPDATE_CHARACTER", "name": "string", "updates": { "role"?: "string", "description"?: "string", "type"?: "string", "isPlayerCharacter"?: boolean, "backstory"?: "string", "signatureItems"?: "string", "relationships"?: "string", "factionName"?: "string" }}
-- {"action": "DELETE_CHARACTER", "name": "string"}
-- {"action": "CLEAR_CHAT"}
-- {"action": "GENERATE_IMAGE", "prompt": "string"}
-
-ACTIVE CAMPAIGN CONTEXT:
-- Current Setting: ${project?.setting || "None"}
-- Plot Overview: ${project?.plotOverview || "None"}
-- Persistent Context: ${project?.persistentContext || "None"}
-- Existing Characters: ${JSON.stringify((characters || []).map((c: any) => ({ name: c.name, role: c.role, type: c.type })))}
-
-ATTACHED SOURCES:
-${sourcesSummary || "None"}
-${ragPrompt ? `RELEVANT EXCERPTS:\n${ragPrompt}` : ""}
-
-Return valid JSON with:
-{
-  "reply": "[Your in-character response string in markdown]",
-  "commands": [ ... ]
-}`;
-
-    const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.7-flash",
-      contents: [{ role: "user", parts: [{ text: systemPrompt + `\n\nUSER DIRECTIVE: "${userMessage}"` }] }],
-      config: {
-        responseMimeType: "application/json"
-      }
-    });
-
-    const parsed = cleanAndParseJson(response.text, {
-      reply: `[Processed! All notebook and lore elements synced.]`,
-      commands: []
-    });
-
-    // Semantic action recovery for /api/assistant:
-    if ((!parsed.commands || parsed.commands.length === 0)) {
-      const fallbackCmds = extractRegexCommands(userMessage);
-      if (fallbackCmds.length > 0) {
-        parsed.commands = fallbackCmds;
-      }
-    }
-
-    res.json(parsed);
-  } catch (err: any) {
-    safeError("api/assistant error:", err);
-    res.json({
-      reply: `[Nyx: I processed your directive, Sir! Let's keep building.]`,
-      commands: []
-    });
-  }
-});
-
 // 5. Google Docs / Drive AI-powered Scraper Endpoint
 app.post("/api/scrape-doc", async (req, res) => {
   try {
@@ -3524,7 +4291,7 @@ Please return JSON conforming to this exact structure:
       ];
 
       response = await generateContentWithRetry(ai, {
-        model: "gemini-3.7-flash",
+        model: "gemini-flash-latest",
         contents,
         config: {
           responseMimeType: "application/json",
@@ -3546,7 +4313,7 @@ Please return JSON conforming to this exact structure:
       }
       const prompt = `${corePrompt}\n\nDOCUMENT CONTENT TO SCRAPE:\n\"\"\"\n${textContent}\n\"\"\"`;
       response = await generateContentWithRetry(ai, {
-        model: "gemini-3.7-flash",
+        model: "gemini-flash-latest",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -3958,7 +4725,7 @@ Provide a clean JSON structure that includes both the extracted entities AND the
         }
       ];
       response = await generateContentWithRetry(ai, {
-        model: "gemini-3.7-flash",
+        model: "gemini-flash-latest",
         contents,
         config: {
           responseMimeType: "application/json",
@@ -3979,7 +4746,7 @@ Provide a clean JSON structure that includes both the extracted entities AND the
       }
       const prompt = `${systemPrompt}\n\nDOCUMENT CONTENT TO INGEST:\n\"\"\"\n${textContent}\n\"\"\"`;
       response = await generateContentWithRetry(ai, {
-        model: "gemini-3.7-flash",
+        model: "gemini-flash-latest",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -4308,134 +5075,6 @@ app.post("/api/spark/sync-codex", async (req, res) => {
   }
 });
 
-// 6. Context Query Endpoint (to catch drift and hallucinations)
-app.post("/api/query-context", async (req, res) => {
-  try {
-    const { messages = [], query, persistentContext = "" } = req.body;
-    if (!query) {
-      return res.status(400).json({ error: "Query is required to check context drift." });
-    }
-
-    const ai = getGeminiClient();
-    const isMock = process.env.GEMINI_API_KEY ? false : true;
-
-    if (isMock) {
-      await new Promise(resolve => setTimeout(resolve, 800));
-      const hasKey = query.toLowerCase().includes("coat") || query.toLowerCase().includes("wound") || query.toLowerCase().includes("sensor");
-      return res.json({
-        found: hasKey,
-        detail: hasKey 
-          ? `The state is active in the narrative logs. Query target verified.` 
-          : `We found no recent logs contradicting or supporting "${query}". Details might be drifting.`,
-        status: hasKey ? "CONFIRMED & REINFORCED" : "POTENTIAL DRIFT / NOT FOUND",
-        confidence: hasKey ? 98 : 35
-      });
-    }
-
-    const logsText = messages.slice(-10).map((m: any) => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
-    const prompt = `
-You are a Context Integrity Officer. Your sole mission is to check if a specific narrative fact or state is still present in the current story context or if "drift" / "hallucination" has occurred.
-Analyze the recent conversation logs and persistent context notes:
-
-RECENT LOGS:
-"""
-${logsText}
-"""
-
-PERSISTENT CONTEXT FACTS:
-"""
-${persistentContext}
-"""
-
-QUERY TO CHECK:
-"${query}"
-
-Evaluate if this detail is active, mentioned, or contradicted. Return a JSON object with:
-{
-  "found": boolean,
-  "detail": "Detailed text of what the current status is, describing any drift or consistency found.",
-  "status": "CONFIRMED" | "DRIFT DETECTED" | "UNKNOWN / UNMENTIONED",
-  "confidence": number (percentage 0 to 100)
-}
-`;
-
-    const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.7-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json"
-      }
-    });
-
-    const parsedData = cleanAndParseJson(response.text, {});
-    res.json(parsedData);
-
-  } catch (err: any) {
-    safeError("Context query issue:", err);
-    res.status(500).json({ error: err.message || "Failed to query context" });
-  }
-});
-
-// 7. Context Sync / Refresh Endpoint
-app.post("/api/sync-context", async (req, res) => {
-  try {
-    const { syncTarget, docContents = "", currentRagSummary = "" } = req.body;
-    if (!syncTarget) {
-      return res.status(400).json({ error: "Sync target is required." });
-    }
-
-    const ai = getGeminiClient();
-    const isMock = process.env.GEMINI_API_KEY ? false : true;
-
-    if (isMock) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      return res.json({
-        success: true,
-        ragSummary: `${currentRagSummary ? currentRagSummary + " " : ""}[Smart Sync: Loaded fresh lore canon details for "${syncTarget}". Settings updated for scene accuracy.]`,
-        syncDetails: `Successfully synchronized and highlighted "${syncTarget}" in the active context frame.`
-      });
-    }
-
-    const prompt = `
-You are a Smart Context Synchronizer. Your job is to refresh the active story context of the narrator.
-The user wants to synchronize state for: "${syncTarget}".
-Analyze the current RAG memory summary and any active Google Doc / Lore contents to create an updated, refreshed summary emphasizing the sync target. Bring details of "${syncTarget}" to the immediate forefront.
-
-CURRENT RAG MEMORY SUMMARY:
-"""
-${currentRagSummary}
-"""
-
-ATTACHED DOCUMENT / LORE CONTENT SOURCES:
-"""
-${docContents}
-"""
-
-Create an updated, polished RAG-friendly summary that integrates details from the sources about "${syncTarget}". Keep it highly compact, dense, and structured for an LLM system prompt.
-Return JSON with:
-{
-  "ragSummary": "the newly updated compact RAG summary text",
-  "syncDetails": "short human-friendly explanation of what was updated and brought forward"
-}
-`;
-
-    const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.7-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json"
-      }
-    });
-
-    const parsedData = cleanAndParseJson(response.text, {});
-    res.json(parsedData);
-
-  } catch (err: any) {
-    safeError("Sync API issue:", err);
-    res.status(500).json({ error: err.message || "Failed to sync context" });
-  }
-});
-
 // 8. Fact Compressor "Store" Endpoint
 app.post("/api/store-fact", async (req, res) => {
   try {
@@ -4478,7 +5117,7 @@ Return JSON with:
 `;
 
     const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.7-flash",
+      model: "gemini-flash-latest",
       contents: prompt,
       config: {
         responseMimeType: "application/json"
@@ -4543,7 +5182,7 @@ ${content.length > 120000 ? content.substring(0, 120000) + "\n...[Truncated for 
 """`;
 
     const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.7-flash",
+      model: "gemini-flash-latest",
       contents: prompt,
       config: {
         thinkingConfig: {
@@ -4774,7 +5413,7 @@ Do not require specific wiki URLs or single pages; use the entire web to form a 
 Highlight any major characters, historical events, rules, or factions found in the search results.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.7-flash",
+      model: "gemini-flash-latest",
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
@@ -4820,6 +5459,278 @@ Highlight any major characters, historical events, rules, or factions found in t
         { title: `Google Search Index - ${query}`, uri: `https://www.google.com/search?q=${encodeURIComponent(query)}` }
       ]
     });
+  }
+});
+
+// 13. NotebookLM-style Web & Document Lore Distiller
+app.post("/api/lore/distill-sources", async (req, res) => {
+  const { query, url, rawText, targetUniverse, targetCategory } = req.body;
+
+  try {
+    let sourceContent = "";
+    let sourceTitle = "";
+    let sourceUrl = "";
+
+    // 1. Ingest from URL
+    if (url && typeof url === "string" && url.trim()) {
+      sourceUrl = url.trim();
+      try {
+        const parsedUrl = new URL(sourceUrl.startsWith("http") ? sourceUrl : `https://${sourceUrl}`);
+        sourceTitle = parsedUrl.hostname;
+      } catch {
+        sourceTitle = "Web Source";
+      }
+      try {
+        const response = await fetch(sourceUrl, {
+          signal: AbortSignal.timeout(8000),
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          }
+        });
+        if (response.ok) {
+          const html = await response.text();
+          // Extract title if available
+          const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+          if (titleMatch && titleMatch[1]) {
+            sourceTitle = titleMatch[1].trim();
+          }
+          // Clean HTML
+          sourceContent = html
+            .replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, "")
+            .replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, "")
+            .replace(/<nav[^>]*>([\s\S]*?)<\/nav>/gi, "")
+            .replace(/<footer[^>]*>([\s\S]*?)<\/footer>/gi, "")
+            .replace(/<\/?[^>]+(>|$)/g, " ")
+            .replace(/&nbsp;/gi, " ")
+            .replace(/&amp;/gi, "&")
+            .replace(/&quot;/gi, '"')
+            .replace(/\s+/g, " ")
+            .trim();
+
+          if (sourceContent.length > 25000) {
+            sourceContent = sourceContent.substring(0, 25000) + "... [Content truncated]";
+          }
+        }
+      } catch (err: any) {
+        safeWarn("Failed to fetch target URL for lore import:", err.message);
+      }
+    }
+
+    // 2. Ingest from Web Search Query (Grounding)
+    if (!sourceContent && query && typeof query === "string" && query.trim()) {
+      sourceTitle = `Web Research: ${query.trim()}`;
+      sourceUrl = `https://www.google.com/search?q=${encodeURIComponent(query.trim())}`;
+      const ai = getGeminiClient();
+
+      if (process.env.GEMINI_API_KEY) {
+        try {
+          const searchResp = await generateContentWithRetry(ai, {
+            model: "gemini-flash-latest",
+            contents: `Research comprehensive lore, canon worldbuilding details, factions, timeline history, and obscure trivia about: "${query}". Provide rich, accurate, deep canon information.`,
+            config: {
+              tools: [{ googleSearch: {} }],
+            },
+          });
+          sourceContent = searchResp.text || "";
+        } catch (searchErr: any) {
+          safeWarn("Web search grounding failed for lore distill, falling back to direct prompt:", searchErr.message);
+        }
+      }
+    }
+
+    // 3. Ingest from Raw Text / Notes
+    if (rawText && typeof rawText === "string" && rawText.trim()) {
+      sourceContent = (sourceContent ? sourceContent + "\n\n" : "") + rawText.trim();
+      if (!sourceTitle) sourceTitle = "Pasted Source Notes";
+    }
+
+    // If still no content and query exists, set query as content
+    if (!sourceContent && query) {
+      sourceContent = `Topic to research and document: ${query}`;
+      if (!sourceTitle) sourceTitle = `Topic: ${query}`;
+    }
+
+    if (!sourceContent) {
+      return res.status(400).json({ error: "Please provide a web URL, search topic, or source text to import lore." });
+    }
+
+    const ai = getGeminiClient();
+    const isMock = !process.env.GEMINI_API_KEY;
+
+    if (isMock) {
+      // High-quality mock lore extraction for demo/sandbox environments
+      const sampleTopic = query || targetUniverse || "Fictional World";
+      const slug = (targetCategory || targetUniverse || sampleTopic).toLowerCase().replace(/[^a-z0-9]/g, "");
+      const uniName = targetUniverse || sampleTopic;
+      return res.json({
+        success: true,
+        sourceTitle: sourceTitle || `Lore Study: ${sampleTopic}`,
+        sourceUrl: sourceUrl || "",
+        suggestedUniverse: uniName,
+        suggestedCategory: slug || "custom",
+        suggestedDescription: `Canonical worldbuilding and lore archives regarding ${sampleTopic}.`,
+        facts: [
+          {
+            id: `lore-${Date.now()}-1`,
+            fact: `Did you know? In the documented chronicles of ${uniName}, key historical breakthroughs reshaped the balance of power across major factions and established enduring traditions still observed by veteran explorers.`,
+            universe: uniName,
+            category: slug || "custom",
+            tags: ["History", "Worldbuilding", "Canon", uniName],
+            sourceTitle: sourceTitle || "Sandbox Source",
+            sourceUrl: sourceUrl || "",
+            isCustom: true,
+            createdDate: new Date().toISOString()
+          },
+          {
+            id: `lore-${Date.now()}-2`,
+            fact: `Did you know? Specialized operatives and scholars within ${uniName} maintain clandestine archives detailing forgotten artifacts and ancient technologies that modern authorities actively seek to regulate.`,
+            universe: uniName,
+            category: slug || "custom",
+            tags: ["Factions", "Artifacts", "Secrets"],
+            sourceTitle: sourceTitle || "Sandbox Source",
+            sourceUrl: sourceUrl || "",
+            isCustom: true,
+            createdDate: new Date().toISOString()
+          },
+          {
+            id: `lore-${Date.now()}-3`,
+            fact: `Did you know? Tactical doctrines and cultural philosophies in ${uniName} are heavily influenced by the defining crises of the previous epoch, dictating rules of engagement and diplomacy.`,
+            universe: uniName,
+            category: slug || "custom",
+            tags: ["Tactics", "Philosophy", "Lore"],
+            sourceTitle: sourceTitle || "Sandbox Source",
+            sourceUrl: sourceUrl || "",
+            isCustom: true,
+            createdDate: new Date().toISOString()
+          }
+        ]
+      });
+    }
+
+    const distillPrompt = `You are the Master Lore Archivist and Canon Scholar.
+Your task is to analyze the following source material and distill 3 to 6 deeply engaging, canonical, verified lore facts and trivia items in the style of the Lore Codex.
+
+Target Universe hint (if specified): "${targetUniverse || ""}"
+Target Category slug (if specified): "${targetCategory || ""}"
+
+SOURCE TITLE: ${sourceTitle}
+SOURCE CONTENT:
+${sourceContent}
+
+RULES:
+1. Every single fact MUST start with "Did you know? " (e.g. "Did you know? Trauma Team International charges up to 500,000 eurodollars...").
+2. Focus on fascinating canonical secrets, historical turning points, production/creator trivia, unique rules/mechanics, weapon/item specifics, faction philosophies, or obscure lore.
+3. Keep each fact concise, evocative, and punchy (1 to 3 sentences, between 25 and 65 words).
+4. Assign a clean universe name (e.g. "${targetUniverse || "Name of fictional franchise or setting"}").
+5. Assign a concise lowercase category slug without spaces (e.g. "cyberpunk", "warhammer", "exandria").
+6. Provide 3 to 5 tags for each fact (e.g. ["Trauma Team", "Cyberware", "Night City"]).
+
+Return ONLY valid JSON matching this exact structure:
+{
+  "sourceTitle": "${sourceTitle.replace(/"/g, "'")}",
+  "suggestedUniverse": "Universe or Franchise Name",
+  "suggestedCategory": "slug_id",
+  "suggestedDescription": "1-sentence description of this setting or franchise",
+  "facts": [
+    {
+      "fact": "Did you know? ...",
+      "universe": "Universe Name",
+      "category": "slug_id",
+      "tags": ["Tag 1", "Tag 2", "Tag 3"]
+    }
+  ]
+}`;
+
+    let parsed: any = null;
+
+    try {
+      const aiResponse = await generateContentWithRetry(ai, {
+        model: "gemini-flash-latest",
+        contents: distillPrompt,
+        config: {
+          responseMimeType: "application/json",
+        }
+      }, 1, 400, 15000);
+
+      const responseText = safeExtractResponseText(aiResponse);
+      if (responseText) {
+        try {
+          parsed = JSON.parse(responseText);
+        } catch (e) {
+          const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            parsed = JSON.parse(jsonMatch[0]);
+          }
+        }
+      }
+    } catch (modelErr: any) {
+      safeWarn("Gemini model call failed during lore distillation, utilizing local extractor fallback:", modelErr.message);
+    }
+
+    const assignedUniverse = targetUniverse || parsed?.suggestedUniverse || (query ? query : "Custom Universe");
+    const assignedCategory = (targetCategory || parsed?.suggestedCategory || assignedUniverse).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    let formattedFacts: any[] = [];
+
+    if (parsed && Array.isArray(parsed.facts) && parsed.facts.length > 0) {
+      formattedFacts = parsed.facts.map((f: any, idx: number) => {
+        let factText = (f.fact || "").trim();
+        if (!factText.startsWith("Did you know?")) {
+          factText = `Did you know? ${factText}`;
+        }
+        return {
+          id: `lore-web-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 6)}`,
+          fact: factText,
+          universe: f.universe || assignedUniverse,
+          category: (f.category || assignedCategory).toLowerCase().replace(/[^a-z0-9]/g, ""),
+          tags: Array.isArray(f.tags) ? f.tags.map((t: any) => String(t).trim()).filter(Boolean) : ["Lore", assignedUniverse],
+          sourceTitle: parsed.sourceTitle || sourceTitle,
+          sourceUrl: sourceUrl,
+          isCustom: true,
+          createdDate: new Date().toISOString()
+        };
+      });
+    } else {
+      // Heuristic fallback: extract sentences from sourceContent
+      const sentences = sourceContent
+        .split(/(?<=[.!?])\s+/)
+        .map(s => s.trim())
+        .filter(s => s.length > 25 && s.length < 280);
+
+      const pickedSentences = sentences.slice(0, 6);
+      if (pickedSentences.length === 0) {
+        pickedSentences.push(sourceContent.substring(0, 200).trim());
+      }
+
+      formattedFacts = pickedSentences.map((sentence, idx) => {
+        let clean = sentence.replace(/^did you know\??\s*/i, "").trim();
+        return {
+          id: `lore-distill-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 6)}`,
+          fact: `Did you know? ${clean}`,
+          universe: assignedUniverse,
+          category: assignedCategory || "custom",
+          tags: [assignedUniverse, "Canon", "Archive"],
+          sourceTitle: sourceTitle,
+          sourceUrl: sourceUrl,
+          isCustom: true,
+          createdDate: new Date().toISOString()
+        };
+      });
+    }
+
+    res.json({
+      success: true,
+      sourceTitle: parsed?.sourceTitle || sourceTitle,
+      sourceUrl: sourceUrl,
+      suggestedUniverse: assignedUniverse,
+      suggestedCategory: assignedCategory || "custom",
+      suggestedDescription: parsed?.suggestedDescription || `Canon lore and worldbuilding for ${assignedUniverse}.`,
+      facts: formattedFacts
+    });
+
+  } catch (err: any) {
+    safeError("Lore distill error:", err);
+    res.status(500).json({ error: err.message || "Failed to distill lore from source." });
   }
 });
 

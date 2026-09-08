@@ -5,7 +5,7 @@ import {
   FileText, CheckSquare, Plus, Trash, Check, Square, 
   RefreshCw, FileCheck, ExternalLink, HelpCircle, Brain, 
   Globe, Clipboard, Upload, Sparkles, BookOpen, Layers, 
-  ChevronRight, ArrowRight, Eye, Play, CheckCircle2, AlertCircle, X, Trash2, XCircle, Info, History,
+  ChevronRight, ArrowRight, ArrowUp, Eye, Play, CheckCircle2, AlertCircle, X, Trash2, XCircle, Info, History,
   Search, Image, Grid, List, Star, SlidersHorizontal, FolderOpen, Zap, ChevronDown, Edit3, Pencil, Tag
 } from "lucide-react";
 import { listGoogleDocs, fetchGoogleFile, extractDocId } from "../utils/googleWorkspace";
@@ -357,7 +357,6 @@ export default function WorkspaceSync({
   const [editFormCategory, setEditFormCategory] = useState<LoreSource["category"]>("narrative");
   const [editFormCategories, setEditFormCategories] = useState<string[]>(["narrative"]);
   const [editFormSummary, setEditFormSummary] = useState("");
-  const [editFormIsActive, setEditFormIsActive] = useState(true);
 
   useEffect(() => {
     if (selectedSource) {
@@ -375,7 +374,6 @@ export default function WorkspaceSync({
         : [editingSource.category || "narrative"];
       setEditFormCategories(cats);
       setEditFormSummary(editingSource.summary || "");
-      setEditFormIsActive(editingSource.isActive !== false);
     }
   }, [editingSource]);
 
@@ -409,7 +407,7 @@ export default function WorkspaceSync({
           category: finalPrimaryCategory,
           categories: finalCategories,
           summary: editFormSummary,
-          isActive: editFormIsActive
+          isActive: true
         };
       }
       return s;
@@ -872,7 +870,7 @@ export default function WorkspaceSync({
       picker.setVisible(true);
     } catch (err) {
       console.error("Failed to open Google Picker:", err);
-      alert("Failed to load Google Drive Picker. Please try again.");
+      onAddLog("Google Drive", "warning", "Failed to load Google Drive Picker. Please check connection and try again.");
     } finally {
       setIsPickerLoading(false);
     }
@@ -1238,7 +1236,7 @@ export default function WorkspaceSync({
       }
     } catch (err: any) {
       console.error(err);
-      alert(`Failed to search internet: ${err.message || "Network error"}`);
+      onAddLog("Web Search", "warning", `Failed to search internet: ${err.message || "Network error"}`);
     } finally {
       setIsProcessing(false);
       setProcessingStatus("");
@@ -1301,51 +1299,72 @@ export default function WorkspaceSync({
     setKeepTaskText("");
   };
 
+  const [showBackToTop, setShowBackToTop] = useState(false);
+
+  useEffect(() => {
+    const root = document.getElementById("workspace-sync-root");
+    if (!root) return;
+    const handleScroll = () => {
+      setShowBackToTop(root.scrollTop > 220);
+    };
+    root.addEventListener("scroll", handleScroll, { passive: true });
+    return () => root.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  const scrollToWorkspaceSection = (elementId: string) => {
+    const root = document.getElementById("workspace-sync-root");
+    const el = document.getElementById(elementId);
+    if (root && el) {
+      const rootRect = root.getBoundingClientRect();
+      const elRect = el.getBoundingClientRect();
+      const targetScrollTop = root.scrollTop + (elRect.top - rootRect.top) - 76;
+      root.scrollTo({ top: Math.max(0, targetScrollTop), behavior: "smooth" });
+    } else if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  };
+
   return (
-    <div id="workspace-sync-root" className="flex flex-col h-full bg-slate-900 text-slate-100 rounded-2xl border border-slate-800 overflow-hidden relative">
+    <div 
+      id="workspace-sync-root" 
+      className="flex flex-col flex-1 h-full min-h-0 max-h-full bg-slate-900 text-slate-100 rounded-2xl border border-slate-800 overflow-y-auto overflow-x-hidden relative overscroll-contain pb-16"
+      style={{ WebkitOverflowScrolling: "touch" }}
+    >
       
-      {/* 1. Header Navigation */}
-      <div className="p-5 border-b border-slate-800 bg-slate-950 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="p-1.5 bg-purple-950/80 text-purple-400 rounded-lg border border-purple-500/30">
-              <Brain size={16} className="animate-pulse" />
-            </span>
-            <h2 id="workspace-sync-title" className="text-lg font-sans font-semibold text-slate-100 tracking-tight">
-              Campaign Workspace & Studio
-            </h2>
-          </div>
-          <p className="text-[11px] text-slate-400 mt-1 max-w-xl">
-            Integrate Google Docs, PDFs, custom web crawls, or snippets. 
-            Nyx automatically extracts rich characters, timeline chronicles, locations, and settings—safely merging updates without overwriting your manual edits.
-          </p>
+      {/* 1. Ultra-Compact Minimal Workspace Header */}
+      <div className="px-3 sm:px-4 py-2 border-b border-slate-800 bg-slate-950/95 sticky top-0 z-30 backdrop-blur flex items-center justify-between gap-3 shrink-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="p-1 bg-purple-950/80 text-purple-400 rounded-md border border-purple-500/30 shrink-0">
+            <Brain size={13} />
+          </span>
+          <span id="workspace-sync-title" className="text-xs font-semibold text-slate-200 tracking-tight truncate">
+            Workspace
+          </span>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="bg-slate-900 border border-slate-800 p-0.5 rounded-lg flex flex-wrap">
-            <button
-              id="tab-btn-all"
-              onClick={() => setActiveWorkspaceTab("all")}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all ${
-                activeWorkspaceTab === "all"
-                  ? "bg-purple-900/60 text-purple-200 border border-purple-500/30"
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              <Brain size={13} className="text-purple-400" /> Unified Lore Base ({loreSources.length})
-            </button>
-            <button
-              id="tab-btn-sources"
-              onClick={() => setActiveWorkspaceTab("sources")}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all ${
-                activeWorkspaceTab === "sources"
-                  ? "bg-purple-950 text-purple-300 border border-purple-500/20"
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              <Layers size={13} /> Transcripts & Docs ({loreSources.length})
-            </button>
-          </div>
+        <div className="bg-slate-900 border border-slate-800 p-0.5 rounded-lg flex items-center shrink-0">
+          <button
+            id="tab-btn-all"
+            onClick={() => setActiveWorkspaceTab("all")}
+            className={`px-3 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
+              activeWorkspaceTab !== "keep"
+                ? "bg-purple-900/60 text-purple-200 border border-purple-500/30 font-semibold"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <Layers size={12} /> Lore Base ({loreSources.length})
+          </button>
+          <button
+            id="tab-btn-keep"
+            onClick={() => setActiveWorkspaceTab("keep")}
+            className={`px-3 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
+              activeWorkspaceTab === "keep"
+                ? "bg-purple-900/60 text-purple-200 border border-purple-500/30 font-semibold"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <CheckSquare size={12} className="text-emerald-400" /> Notes & Tasks ({tasks.filter(t => !t.completed).length + notes.length})
+          </button>
         </div>
       </div>
 
@@ -1364,10 +1383,10 @@ export default function WorkspaceSync({
 
       {/* 2. UNIFIED WORKSPACE VIEW */}
       {(activeWorkspaceTab === "all" || activeWorkspaceTab === "sources") && (
-        <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden bg-slate-900/40">
-          
+        <div className="grid grid-cols-1 lg:grid-cols-12 bg-slate-900/40 divide-y lg:divide-y-0 lg:divide-x divide-slate-800/80 min-h-0">
+
           {/* Left Panel: Unified Explorer & Action Hub (col-span-5) */}
-          <div className="lg:col-span-5 flex flex-col overflow-hidden p-5 border-r border-slate-800/80">
+          <div id="workspace-left-panel" className="lg:col-span-5 flex flex-col p-4 sm:p-5 min-w-0">
             <div className="flex justify-between items-center mb-2">
               <h3 className="text-xs font-bold uppercase text-slate-400 tracking-wider font-mono flex items-center gap-1.5">
                 📁 Lore Grounds & Sources ({loreSources.length})
@@ -1544,8 +1563,8 @@ export default function WorkspaceSync({
               </div>
             </div>
 
-            {/* Workspace Scrollable Feed */}
-            <div className="flex-1 overflow-y-auto pr-1 space-y-3 scrollbar-thin">
+            {/* Workspace Lore Sources Feed */}
+            <div className="space-y-3 min-h-0">
               {/* Google Sign-in widget if token is missing */}
               {!googleToken && (activeWorkspaceTab === "all" || activeWorkspaceTab === "sources") && (
                 <div className="p-3 bg-gradient-to-br from-slate-950 to-slate-900 border border-slate-800 rounded-xl relative overflow-hidden group flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
@@ -1601,6 +1620,11 @@ export default function WorkspaceSync({
                     onClick={() => {
                       setSelectedItemId(source.id);
                       setSelectedSourceId(source.id);
+                      if (typeof window !== "undefined" && window.innerWidth < 1024) {
+                        setTimeout(() => {
+                          scrollToWorkspaceSection("workspace-reader-panel");
+                        }, 50);
+                      }
                     }}
                     className={`p-3 rounded-xl border transition-all flex flex-col justify-between relative cursor-pointer ${
                       isSelected 
@@ -1744,7 +1768,6 @@ export default function WorkspaceSync({
                       <LoreSourceStatusBadge 
                         source={source} 
                         size="sm" 
-                        onToggleActive={() => handleToggleSourceActive(source.id)} 
                       />
                       <span className="text-[9px] font-bold text-purple-400 flex items-center gap-1">
                         View Item →
@@ -1788,12 +1811,92 @@ export default function WorkspaceSync({
                 </div>
               )}
             </div>
+
+            {/* Campaign Tasks / Objectives Quick Section */}
+            <div id="checklist-tasks-section" className="mt-4 pt-3 border-t border-slate-800/80 shrink-0">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-1.5">
+                  <CheckSquare size={13} className="text-emerald-400" />
+                  <h4 className="text-[11px] font-bold text-slate-200 uppercase tracking-wider font-mono">
+                    Campaign Tasks ({tasks.filter(t => !t.completed).length})
+                  </h4>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveWorkspaceTab("keep")}
+                  className="text-[10px] text-purple-400 hover:text-purple-300 font-mono font-semibold flex items-center gap-0.5 transition-colors cursor-pointer"
+                >
+                  All Notes & Tasks →
+                </button>
+              </div>
+
+              {/* Quick task adder */}
+              <form onSubmit={handleCreateTaskLocal} className="flex items-center gap-1.5 mb-2.5">
+                <input
+                  id="workspace-quick-task-input"
+                  type="text"
+                  placeholder="Add campaign task or DM objective..."
+                  value={keepTaskText}
+                  onChange={(e) => setKeepTaskText(e.target.value)}
+                  className="flex-1 bg-slate-950 border border-slate-800 focus:border-purple-500 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 placeholder-slate-500 outline-none transition-colors"
+                />
+                <button
+                  type="submit"
+                  disabled={!keepTaskText.trim()}
+                  className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded-lg text-xs font-mono font-bold shrink-0 transition-all flex items-center gap-1 cursor-pointer"
+                >
+                  <Plus size={12} /> Add
+                </button>
+              </form>
+
+              {/* Task list preview with natural flow */}
+              <div className="space-y-1.5">
+                {tasks.slice(0, 6).map((task) => (
+                  <div
+                    key={task.id}
+                    id={`task-item-${task.id}`}
+                    className={`flex items-center justify-between gap-2 p-2 rounded-lg border text-xs transition-all ${
+                      task.completed
+                        ? "bg-slate-950/30 border-slate-850/60 text-slate-500 line-through"
+                        : "bg-slate-950/70 border-slate-800/80 text-slate-200 hover:border-slate-700"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onToggleTask(task.id)}
+                      className="flex items-center gap-2 text-left min-w-0 flex-1 cursor-pointer"
+                    >
+                      {task.completed ? (
+                        <CheckSquare size={13} className="text-emerald-400 shrink-0" />
+                      ) : (
+                        <Square size={13} className="text-slate-500 hover:text-slate-300 shrink-0" />
+                      )}
+                      <span className="truncate font-sans text-[11px]">{task.text}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onDeleteTask(task.id)}
+                      className="text-slate-500 hover:text-rose-400 p-1 rounded transition-colors shrink-0 cursor-pointer"
+                      title="Delete task"
+                    >
+                      <Trash size={11} />
+                    </button>
+                  </div>
+                ))}
+
+                {tasks.length === 0 && (
+                  <p className="text-[10px] text-slate-500 font-mono py-1 text-center">
+                    No active tasks. Add campaign objectives or plot goals above!
+                  </p>
+                )}
+              </div>
+            </div>
           </div>
 
           {/* Right Panel: Selected Item Reader & Document Inspector (col-span-7) */}
-          <div className="lg:col-span-7 flex flex-col overflow-hidden bg-slate-950/20 p-5">
+          <div id="workspace-reader-panel" className="lg:col-span-7 flex flex-col p-4 sm:p-5 min-w-0 bg-slate-950/20">
             {selectedSource ? (
-              <div className="h-full flex flex-col overflow-hidden">
+              <div className="flex flex-col min-w-0">
                 
                 {/* Source Description & Header */}
                 <div className="pb-3 border-b border-slate-800/80 flex flex-col gap-2.5">
@@ -1886,6 +1989,15 @@ export default function WorkspaceSync({
                     </div>
 
                     <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => scrollToWorkspaceSection("workspace-left-panel")}
+                        className="lg:hidden px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-lg text-[10px] font-bold font-mono transition-colors flex items-center gap-1 cursor-pointer"
+                        title="Scroll back up to Sources list"
+                      >
+                        <ArrowUp size={11} /> Sources
+                      </button>
+
                       <button
                         id={`open-edit-modal-btn-${selectedSource.id}`}
                         onClick={() => setEditingSource(selectedSource)}
@@ -1991,7 +2103,7 @@ export default function WorkspaceSync({
                 </div>
 
                 {/* Reader Content Box */}
-                <div className="flex-1 overflow-y-auto mt-4 pr-1 scrollbar-thin">
+                <div className="mt-4 flex flex-col min-w-0">
                   
                   {activeReaderTab === "guide" && (
                     selectedSource.type === "gdoc" ? (
@@ -2120,9 +2232,177 @@ export default function WorkspaceSync({
         </div>
       )}
 
+      {/* 3. DEDICATED NOTES & TASKS WORKSPACE VIEW */}
+      {activeWorkspaceTab === "keep" && (
+        <div id="notes-tasks-workspace" className="grid grid-cols-1 lg:grid-cols-12 bg-slate-900/40 divide-y lg:divide-y-0 lg:divide-x divide-slate-800/80 min-h-0">
+          
+          {/* Left Column: Campaign Objectives & Checklist (col-span-5) */}
+          <div className="lg:col-span-5 flex flex-col p-4 sm:p-5 min-w-0">
+            <div className="flex justify-between items-center mb-3">
+              <div>
+                <h3 className="text-xs font-bold uppercase text-slate-300 tracking-wider font-mono flex items-center gap-1.5">
+                  <CheckSquare size={14} className="text-emerald-400" /> Campaign Checklist & Objectives
+                </h3>
+                <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+                  {tasks.filter(t => !t.completed).length} pending · {tasks.filter(t => t.completed).length} completed
+                </p>
+              </div>
+            </div>
 
+            {/* Add Task Input */}
+            <form onSubmit={handleCreateTaskLocal} className="flex items-center gap-2 mb-4">
+              <input
+                id="keep-task-input"
+                type="text"
+                placeholder="New objective, encounter goal, or quest task..."
+                value={keepTaskText}
+                onChange={(e) => setKeepTaskText(e.target.value)}
+                className="flex-1 bg-slate-950 border border-slate-800 focus:border-emerald-500 rounded-xl px-3 py-2 text-xs text-slate-100 placeholder-slate-500 outline-none transition-colors font-sans"
+              />
+              <button
+                type="submit"
+                disabled={!keepTaskText.trim()}
+                className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded-xl text-xs font-mono font-bold shrink-0 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
+              >
+                <Plus size={13} /> Add
+              </button>
+            </form>
 
-      {/* 4. MODAL: ADD LORE SOURCE */}
+            {/* Task list with natural flow */}
+            <div className="space-y-2">
+              {tasks.map((task) => (
+                <div
+                  key={task.id}
+                  id={`checklist-task-${task.id}`}
+                  className={`flex items-center justify-between gap-3 p-3 rounded-xl border transition-all ${
+                    task.completed
+                      ? "bg-slate-950/30 border-slate-850/50 text-slate-500"
+                      : "bg-slate-950/70 border-slate-800 text-slate-200 hover:border-slate-700"
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => onToggleTask(task.id)}
+                    className="flex items-center gap-3 text-left min-w-0 flex-1 cursor-pointer"
+                  >
+                    {task.completed ? (
+                      <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+                    ) : (
+                      <Square size={16} className="text-slate-500 hover:text-slate-300 shrink-0" />
+                    )}
+                    <span className={`text-xs font-sans break-words ${task.completed ? "line-through text-slate-500" : "text-slate-200"}`}>
+                      {task.text}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onDeleteTask(task.id)}
+                    className="text-slate-500 hover:text-rose-400 p-1.5 rounded-lg hover:bg-slate-900 transition-colors shrink-0 cursor-pointer"
+                    title="Delete task"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              ))}
+
+              {tasks.length === 0 && (
+                <div className="h-44 flex flex-col items-center justify-center text-center text-slate-500 border border-dashed border-slate-800 rounded-xl p-6">
+                  <CheckSquare size={24} className="text-slate-600 mb-2" />
+                  <p className="text-xs font-bold text-slate-300 font-mono">No campaign objectives yet</p>
+                  <p className="text-[10px] text-slate-500 mt-1 max-w-xs">
+                    Create quest trackers, DM reminders, or session goals above!
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Right Column: Campaign Notes & Scratchpad (col-span-7) */}
+          <div className="lg:col-span-7 flex flex-col p-4 sm:p-5 min-w-0 bg-slate-950/20">
+            <div className="flex justify-between items-center mb-3">
+              <div>
+                <h3 className="text-xs font-bold uppercase text-slate-300 tracking-wider font-mono flex items-center gap-1.5">
+                  <BookOpen size={14} className="text-purple-400" /> Campaign Notes & Scratchpad ({notes.length})
+                </h3>
+                <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+                  Quick session notes, secrets, and player insights
+                </p>
+              </div>
+            </div>
+
+            {/* Add Note Form */}
+            <form onSubmit={handleCreateNoteLocal} className="bg-slate-950/80 border border-slate-800 rounded-xl p-3 mb-4 space-y-2">
+              <input
+                id="keep-note-title-input"
+                type="text"
+                placeholder="Note title (e.g., Tavern Rumors, Secret Code, Session 4 Beat)..."
+                value={keepNoteTitle}
+                onChange={(e) => setKeepNoteTitle(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-800 focus:border-purple-500 rounded-lg px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 outline-none transition-colors font-mono"
+              />
+              <textarea
+                id="keep-note-content-input"
+                placeholder="Write your campaign notes, secret details, or player notes..."
+                value={keepNoteContent}
+                onChange={(e) => setKeepNoteContent(e.target.value)}
+                rows={2}
+                className="w-full bg-slate-900 border border-slate-800 focus:border-purple-500 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-500 outline-none transition-colors font-sans resize-none"
+              />
+              <div className="flex justify-end">
+                <button
+                  type="submit"
+                  disabled={!keepNoteTitle.trim() || !keepNoteContent.trim()}
+                  className="px-3.5 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white rounded-lg text-xs font-mono font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
+                >
+                  <Plus size={12} /> Save Note
+                </button>
+              </div>
+            </form>
+
+            {/* Notes List with natural flow */}
+            <div className="space-y-2.5">
+              {notes.map((note) => (
+                <div
+                  key={note.id}
+                  id={`note-card-${note.id}`}
+                  className="p-3.5 rounded-xl border border-slate-800 bg-slate-950/70 hover:border-slate-700 transition-all space-y-1.5"
+                >
+                  <div className="flex justify-between items-start gap-2">
+                    <h4 className="text-xs font-bold text-purple-300 font-mono">{note.title}</h4>
+                    <button
+                      type="button"
+                      onClick={() => onDeleteNote(note.id)}
+                      className="text-slate-500 hover:text-rose-400 p-1 rounded hover:bg-slate-900 transition-colors shrink-0 cursor-pointer"
+                      title="Delete note"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                  <p className="text-xs text-slate-300 font-sans whitespace-pre-wrap leading-relaxed">
+                    {note.content}
+                  </p>
+                  {note.updatedAt && (
+                    <span className="text-[9px] text-slate-600 font-mono block pt-1">
+                      {new Date(note.updatedAt).toLocaleDateString()}
+                    </span>
+                  )}
+                </div>
+              ))}
+
+              {notes.length === 0 && (
+                <div className="h-44 flex flex-col items-center justify-center text-center text-slate-500 border border-dashed border-slate-800 rounded-xl p-6">
+                  <FileText size={24} className="text-slate-600 mb-2" />
+                  <p className="text-xs font-bold text-slate-300 font-mono">No notes recorded</p>
+                  <p className="text-[10px] text-slate-500 mt-1 max-w-xs">
+                    Write down whispers, plot clues, and campaign reminders above!
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+
+        </div>
+      )}
       {isAddSourceModalOpen && (
         <div id="add-source-modal-overlay" className="fixed inset-0 bg-slate-950/85 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div 
@@ -3130,26 +3410,17 @@ export default function WorkspaceSync({
             />
           </div>
 
-          {/* Grounding Active Toggle */}
+          {/* Grounding Active Status */}
           <div className="pt-2 border-t border-slate-800 flex items-center justify-between">
             <div>
-              <span className="text-xs font-bold text-slate-200 font-mono block">Grounding Scope Status</span>
+              <span className="text-xs font-bold text-slate-200 font-mono block">Lore Database Status</span>
               <span className="text-[10px] text-slate-400 block">
-                {editFormIsActive ? "Active: Injected dynamically into active adventures and assistant queries" : "Inactive: Stored in library but excluded from active prompt scope"}
+                Permanently active knowledge: Injected dynamically into active adventures, RAG lookups, and assistant queries
               </span>
             </div>
-            <button
-              type="button"
-              id="toggle-active-edit-form"
-              onClick={() => setEditFormIsActive(!editFormIsActive)}
-              className={`px-3 py-1.5 rounded-xl font-mono text-[10px] font-bold border transition-all cursor-pointer ${
-                editFormIsActive
-                  ? "bg-emerald-950/80 text-emerald-300 border-emerald-500/40"
-                  : "bg-slate-800 text-slate-400 border-slate-700"
-              }`}
-            >
-              {editFormIsActive ? "● Active Grounding" : "○ Inactive / Standby"}
-            </button>
+            <div className="px-3 py-1.5 rounded-xl font-mono text-[10px] font-bold border bg-emerald-950/80 text-emerald-300 border-emerald-500/40 select-none">
+              ● Active Grounding Lore
+            </div>
           </div>
 
           {/* Submit Actions */}
@@ -3219,6 +3490,21 @@ export default function WorkspaceSync({
         </div>
       </div>
     </div>
+  )}
+
+  {/* Floating Back to Top Button */}
+  {showBackToTop && (
+    <button
+      type="button"
+      onClick={() => {
+        const root = document.getElementById("workspace-sync-root");
+        if (root) root.scrollTo({ top: 0, behavior: "smooth" });
+      }}
+      className="fixed bottom-6 right-6 lg:bottom-8 lg:right-8 z-50 px-3 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-full shadow-2xl border border-purple-400/30 flex items-center gap-1.5 text-xs font-mono font-bold cursor-pointer transition-all hover:scale-105 animate-in fade-in"
+      title="Scroll back to top"
+    >
+      <ArrowUp size={13} /> Back to Top
+    </button>
   )}
 
 </div>

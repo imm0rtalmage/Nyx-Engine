@@ -1,22 +1,24 @@
-import React, { memo } from "react";
+import React, { memo, useMemo, useState, useEffect } from "react";
 import { motion } from "motion/react";
 import {
   Brain,
-  Users,
   Edit3,
   Trash2,
   Check,
   ChevronLeft,
   ChevronRight,
   RefreshCw,
-  X,
+  Coins,
 } from "lucide-react";
 import ChatMessageMarkdown from "./ChatMessageMarkdown";
 import { Message, CharacterProfile } from "../types";
+import { parseContextEntityEntry, getTurnContextSnapshot } from "../lib/nyxLoreEngine";
+import { resolveTokenBreakdown, formatTokens } from "../utils/tokenCounter";
 
 export interface MessageItemProps {
   msg: Message;
   idx: number;
+  allMessages?: Message[];
   isUser: boolean;
   isEditing: boolean;
   editText: string;
@@ -29,9 +31,7 @@ export interface MessageItemProps {
   onStoreFact: (msgContent: string) => void;
   onRegenerateResponse: (thinkingLevel: string, msgId?: string) => void;
   onSelectMessageVersion?: (msgId: string, versionIndex: number) => void;
-  onUpdateMessageSpeakers: (msgId: string, speakerIds: string[]) => void;
-  showSpeakerPicker: boolean;
-  onToggleSpeakerPicker: (msgId: string | null) => void;
+  onOpenTokenBreakdown?: (msg: Message, turnIndex: number) => void;
   themeId?: string;
   activeBubbleStyleClass: string;
   activeThemeUserBubbleClass: string;
@@ -44,6 +44,7 @@ export interface MessageItemProps {
   portraitPosition?: string;
   thinkingLevel: string;
   renderPortrait: (url?: string, name?: string, sizeClass?: string, char?: CharacterProfile) => React.ReactNode;
+  turnHeader?: string;
 }
 
 const formatMsgTimestamp = (ts?: string) => {
@@ -57,6 +58,40 @@ const formatMsgTimestamp = (ts?: string) => {
   } catch {
     return ts || "";
   }
+};
+
+const resolveTurnHeader = (
+  template: string | undefined,
+  idx: number,
+  isUser: boolean,
+  userNickname: string,
+  speakers: CharacterProfile[],
+  timestamp?: string
+): string => {
+  if (!template || !template.trim()) {
+    return "";
+  }
+
+  let formatted = template.trim();
+  const speakerNames = speakers.length > 0
+    ? speakers.map((s) => s.name).join(", ")
+    : (isUser ? (userNickname || "Sir") : "Nyx");
+
+  const turnNum = String(idx + 1);
+  const padTurnNum = String(idx + 1).padStart(2, "0");
+
+  formatted = formatted
+    .replace(/\{turn\}/gi, turnNum)
+    .replace(/\{turn2\}/gi, padTurnNum)
+    .replace(/\{index\}/gi, turnNum)
+    .replace(/\{speaker\}/gi, speakerNames)
+    .replace(/\{speakers\}/gi, speakerNames)
+    .replace(/\{cast\}/gi, speakerNames)
+    .replace(/\{user\}/gi, userNickname || "Sir")
+    .replace(/\{author\}/gi, userNickname || "Sir")
+    .replace(/\{time\}/gi, formatMsgTimestamp(timestamp));
+
+  return formatted;
 };
 
 export const MessageItem = memo(function MessageItem({
@@ -74,9 +109,7 @@ export const MessageItem = memo(function MessageItem({
   onStoreFact,
   onRegenerateResponse,
   onSelectMessageVersion,
-  onUpdateMessageSpeakers,
-  showSpeakerPicker,
-  onToggleSpeakerPicker,
+  onOpenTokenBreakdown,
   themeId,
   activeBubbleStyleClass,
   activeThemeUserBubbleClass,
@@ -86,13 +119,97 @@ export const MessageItem = memo(function MessageItem({
   currentFontSizeClass,
   userNickname,
   characters,
+  allMessages,
   thinkingLevel,
   renderPortrait,
+  turnHeader,
 }: MessageItemProps) {
+  // Resolve active message version if multi-version exists
+  const currentMsgForTurn = useMemo(() => {
+    if (!msg) {
+      return { id: `msg-${idx}`, role: isUser ? "user" : "nyx", content: "", timestamp: new Date().toISOString() } as Message;
+    }
+    if (msg.versions && typeof msg.activeVersionIndex === "number" && msg.versions[msg.activeVersionIndex]) {
+      const activeVer = msg.versions[msg.activeVersionIndex];
+      return {
+        ...msg,
+        content: typeof activeVer.content === "string" ? activeVer.content : (msg.content || ""),
+        chainOfThought: activeVer.chainOfThought || msg.chainOfThought,
+        tokensUsed: activeVer.tokensUsed || msg.tokensUsed,
+        tokenBreakdown: activeVer.tokenBreakdown || msg.tokenBreakdown,
+        contextEntities: activeVer.contextEntities || msg.contextEntities,
+        speakerIds: activeVer.speakerIds || msg.speakerIds,
+      };
+    }
+    return msg;
+  }, [msg, idx, isUser]);
+
+  // Compute exact 4-part token breakdown for this turn
+  const tokenBreakdown = useMemo(() => {
+    return resolveTokenBreakdown(currentMsgForTurn, characters);
+  }, [currentMsgForTurn, characters]);
+
   // Fetch speakers for this message
-  const msgSpeakers = characters.filter((c) =>
-    (msg.speakerIds || []).includes(c.id)
+  const msgSpeakers = (characters || []).filter((c) =>
+    c && (currentMsgForTurn.speakerIds || []).includes(c.id)
   );
+
+  const resolvedTurnHeader = useMemo(() => {
+    const template = currentMsgForTurn.turnHeader || turnHeader;
+    return resolveTurnHeader(template, idx, isUser, userNickname, msgSpeakers, currentMsgForTurn.timestamp);
+  }, [currentMsgForTurn.turnHeader, turnHeader, idx, isUser, userNickname, msgSpeakers, currentMsgForTurn.timestamp]);
+
+  // Derive turn-specific in-context lore log snapshot
+  const rawContextList = useMemo(() => {
+    if (!msg || msg.role !== "nyx") return [];
+    return getTurnContextSnapshot(msg, allMessages || [], characters || [], idx);
+  }, [msg, allMessages, characters, idx]);
+
+  const parsedContextBadges = useMemo(() => {
+    return (rawContextList || []).map((entry) => parseContextEntityEntry(entry, characters || []));
+  }, [rawContextList, characters]);
+
+  const isTimelineAnomaly = useMemo(() => {
+    const text = typeof msg?.content === "string" ? msg.content : "";
+    return (
+      !isUser &&
+      (Boolean(msg?.isTimelineAnomaly) ||
+        text.includes("brief disturbance in the timeline") ||
+        text.includes("unexpected anomaly rippled") ||
+        text.includes("momentary spike in traffic") ||
+        text.includes("per-minute traffic limit"))
+    );
+  }, [isUser, msg?.content, msg?.isTimelineAnomaly]);
+
+  // Live rate-limit cooldown countdown timer
+  const [cooldownRemaining, setCooldownRemaining] = useState<number>(() => {
+    if (!isTimelineAnomaly) return 0;
+    const initialSecs = msg?.retrySeconds || 20;
+    const elapsedSecs = Math.max(0, Math.floor((Date.now() - new Date(msg.timestamp).getTime()) / 1000));
+    return Math.max(0, initialSecs - elapsedSecs);
+  });
+
+  useEffect(() => {
+    if (!isTimelineAnomaly) return;
+    const initialSecs = msg?.retrySeconds || 20;
+    const elapsedSecs = Math.max(0, Math.floor((Date.now() - new Date(msg.timestamp).getTime()) / 1000));
+    const remaining = Math.max(0, initialSecs - elapsedSecs);
+    setCooldownRemaining(remaining);
+
+    if (remaining <= 0) return;
+
+    const interval = setInterval(() => {
+      setCooldownRemaining((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isTimelineAnomaly, msg?.retrySeconds, msg?.timestamp]);
 
   // High Fidelity border decorations matching selected theme
   let activeBoxBorder = activeThemeBorderColor;
@@ -140,22 +257,22 @@ export const MessageItem = memo(function MessageItem({
           <button
             onClick={(e) => {
               e.stopPropagation();
+              onRegenerateResponse(thinkingLevel, msg.id);
+            }}
+            className="text-slate-400 hover:text-amber-400 p-0.5 transition-colors cursor-pointer"
+            title="Regenerate this storyteller turn"
+          >
+            <RefreshCw size={12} />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
               onStoreFact(msg.content);
             }}
             className="text-slate-400 hover:text-emerald-400 p-0.5 transition-colors cursor-pointer"
             title="Distill & store this scene's facts into Persistent Context memory"
           >
             <Brain size={12} />
-          </button>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleSpeakerPicker(showSpeakerPicker ? null : msg.id);
-            }}
-            className="text-slate-400 hover:text-purple-400 p-0.5 transition-colors cursor-pointer"
-            title="Assign/Change characters speaking"
-          >
-            <Users size={12} />
           </button>
           <button
             onClick={(e) => {
@@ -182,21 +299,52 @@ export const MessageItem = memo(function MessageItem({
         {/* Dialogue & Narrative Content Side */}
         <div className="flex-1 flex flex-col text-left justify-between min-w-0">
           <div>
-            {/* Name Header with game-like layout line */}
-            <div className="flex items-center gap-2 mb-2 border-b border-slate-800/40 pb-1.5">
-              <span
-                className={`text-[11px] font-extrabold tracking-widest uppercase font-mono ${activeHeadingText}`}
-              >
-                {msgSpeakers.length > 0
-                  ? msgSpeakers.map((c) => c.name).join(" | ")
-                  : isUser
-                  ? userNickname
-                  : "STORYTELLER / COMPANION"}
-              </span>
-              <div className="flex-1 h-[1px] bg-gradient-to-r from-purple-500/10 via-purple-500/30 to-transparent" />
-              <span className="text-[9px] text-slate-500 font-mono">
-                {formatMsgTimestamp(msg.timestamp)}
-              </span>
+            {/* Ambient Literary Scene Rule & Turn Header */}
+            <div className="flex items-center justify-between gap-2 mb-2.5 select-none opacity-90">
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                <span
+                  className={`text-[10px] select-none shrink-0 ${activeHeadingText}`}
+                  aria-hidden="true"
+                >
+                  ◆
+                </span>
+                <span
+                  className={`text-[11px] font-semibold tracking-wide truncate ${resolvedTurnHeader ? "font-serif" : "font-mono"} ${activeHeadingText}`}
+                  title={resolvedTurnHeader || `Turn ${idx + 1}`}
+                >
+                  {resolvedTurnHeader || `Turn ${idx + 1}`}
+                </span>
+                <div className="flex-1 h-[1px] min-w-[20px] bg-gradient-to-r from-purple-500/25 via-slate-800/60 to-transparent" />
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {/* Clickable Token Counter on the Turn UI */}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenTokenBreakdown?.(currentMsgForTurn, idx);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-900/90 hover:bg-purple-950/80 border border-slate-750 hover:border-purple-500/60 text-[10px] font-mono text-slate-300 hover:text-purple-200 transition-all cursor-pointer shadow-xs group/tok hover:scale-105 active:scale-95"
+                  title="Click token count to open Input, Retrieval, Thinking & Output breakdown"
+                >
+                  <Coins size={11} className="text-amber-400 group-hover/tok:text-purple-400 transition-colors shrink-0" />
+                  <span className="font-bold text-slate-100 group-hover/tok:text-purple-100 tabular-nums">
+                    {formatTokens(tokenBreakdown?.totalTokens)}
+                  </span>
+                  <span className="text-[8.5px] text-slate-400 group-hover/tok:text-purple-300 uppercase tracking-tight">
+                    tok
+                  </span>
+                </button>
+
+                {msgSpeakers.length > 0 && (
+                  <span className="text-[9px] text-purple-300/90 font-mono bg-purple-950/60 px-1.5 py-0.5 rounded border border-purple-800/40">
+                    {msgSpeakers.map(s => s?.name || "Speaker").join(", ")}
+                  </span>
+                )}
+                <span className="text-[9px] text-slate-500 font-mono tracking-wider opacity-70">
+                  {formatMsgTimestamp(currentMsgForTurn.timestamp || msg.timestamp)}
+                </span>
+              </div>
             </div>
 
             {/* Content Text body */}
@@ -206,7 +354,7 @@ export const MessageItem = memo(function MessageItem({
                 onClick={(e) => e.stopPropagation()}
               >
                 <textarea
-                  value={editText}
+                  value={editText || ""}
                   onChange={(e) => onEditTextChange(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
@@ -218,7 +366,7 @@ export const MessageItem = memo(function MessageItem({
                     }
                   }}
                   className={`w-full bg-slate-950/90 border border-purple-500/50 focus:border-purple-400 focus:ring-1 focus:ring-purple-500/30 rounded-xl p-3 ${currentFontSizeClass} font-serif text-slate-100 outline-none resize-y transition-all`}
-                  rows={Math.max(3, Math.min(30, editText.split("\n").length + 1))}
+                  rows={Math.max(3, Math.min(30, (editText || "").split("\n").length + 1))}
                   autoFocus
                   placeholder="Type or edit message text..."
                 />
@@ -264,155 +412,158 @@ export const MessageItem = memo(function MessageItem({
                 />
               </div>
             )}
-          </div>
 
-          {/* Metadata tokens and Version/Regeneration Controls block at the bottom */}
-          {msg.role === "nyx" && (
-            <div
-              className="mt-3 text-[9px] text-slate-500 font-mono flex items-center justify-between border-t border-slate-900/60 pt-2"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {/* Token metadata left aligned */}
-              <div className="flex items-center gap-1">
-                <Brain size={10} className="text-purple-400 shrink-0" />
-                <span>
-                  Analysis calibration:{" "}
-                  <strong className="text-purple-400/80">
-                    {msg.tokensUsed || 2400} tokens
-                  </strong>{" "}
-                  processed
-                </span>
-              </div>
-
-              {/* Version Switcher and Regeneration Control right aligned */}
-              <div className="flex items-center gap-1.5 bg-slate-950/80 px-2 py-1 rounded-lg border border-slate-800/80 shrink-0">
-                {msg.versions && msg.versions.length > 1 && (
-                  <div className="flex items-center gap-1.5 border-r border-slate-800/60 pr-1.5">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const vIdx =
-                          msg.activeVersionIndex !== undefined
-                            ? msg.activeVersionIndex
-                            : 0;
-                        if (vIdx > 0) {
-                          onSelectMessageVersion?.(msg.id, vIdx - 1);
-                        }
-                      }}
-                      disabled={
-                        msg.activeVersionIndex === 0 ||
-                        msg.activeVersionIndex === undefined
-                      }
-                      className="text-slate-400 hover:text-purple-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
-                      title="Previous version"
-                    >
-                      <ChevronLeft size={12} />
-                    </button>
-                    <span className="text-[9px] text-slate-300 font-semibold select-none">
-                      {(msg.activeVersionIndex !== undefined
-                        ? msg.activeVersionIndex
-                        : 0) + 1}{" "}
-                      / {msg.versions.length}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const vIdx =
-                          msg.activeVersionIndex !== undefined
-                            ? msg.activeVersionIndex
-                            : 0;
-                        if (msg.versions && vIdx < msg.versions.length - 1) {
-                          onSelectMessageVersion?.(msg.id, vIdx + 1);
-                        }
-                      }}
-                      disabled={
-                        msg.versions &&
-                        msg.activeVersionIndex === msg.versions.length - 1
-                      }
-                      className="text-slate-400 hover:text-purple-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
-                      title="Next version"
-                    >
-                      <ChevronRight size={12} />
-                    </button>
-                  </div>
-                )}
-
-                {/* Inline Regenerate Button */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    onRegenerateResponse(thinkingLevel, msg.id);
-                  }}
-                  className="text-slate-400 hover:text-purple-400 hover:bg-slate-900 px-1.5 py-0.5 rounded transition-all flex items-center gap-1 cursor-pointer"
-                  title="Regenerate another alternative at this point"
-                >
-                  <RefreshCw size={9} className="animate-none" />
-                  <span>Regen</span>
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Speaker Picker Dropdown Popover */}
-        {showSpeakerPicker && (
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="absolute z-50 mt-2 right-4 top-10 bg-slate-900 border border-slate-850 rounded-xl p-3 w-52 shadow-2xl space-y-2 text-xs text-slate-100"
-          >
-            <div className="font-semibold text-[10px] text-slate-400 uppercase tracking-wider border-b border-slate-800 pb-1 flex justify-between items-center">
-              <span>Dialogue Cast</span>
-              <button
-                onClick={() => onToggleSpeakerPicker(null)}
-                className="text-slate-400 hover:text-white"
+            {isTimelineAnomaly && (
+              <div
+                className="mt-3.5 p-3.5 rounded-xl bg-gradient-to-r from-amber-950/60 to-slate-900/70 border border-amber-500/40 backdrop-blur-xs shadow-lg space-y-2.5"
+                onClick={(e) => e.stopPropagation()}
               >
-                <X size={10} />
-              </button>
-            </div>
-            {characters.length === 0 ? (
-              <p className="text-[10px] text-slate-500 italic">
-                No registered characters. Register them in Sidebar!
-              </p>
-            ) : (
-              <div className="max-h-40 overflow-y-auto space-y-1 pr-1 font-sans">
-                {characters.map((char) => {
-                  const isSelected = (msg.speakerIds || []).includes(char.id);
-                  return (
-                    <button
-                      key={char.id}
-                      onClick={() => {
-                        const current = msg.speakerIds || [];
-                        const updated = isSelected
-                          ? current.filter((id) => id !== char.id)
-                          : [...current, char.id];
-                        onUpdateMessageSpeakers(msg.id, updated);
-                      }}
-                      className="w-full flex items-center justify-between text-left p-1.5 rounded hover:bg-slate-850 transition-all text-[11px]"
-                    >
-                      <div className="flex items-center gap-2 truncate">
-                        <span className="scale-75 origin-left shrink-0">
-                          {renderPortrait(char.portraitUrl, char.name, "w-8 h-8")}
-                        </span>
-                        <span className="truncate text-slate-200">
-                          {char.name}
-                        </span>
-                      </div>
-                      <div
-                        className={`w-4 h-4 rounded border flex items-center justify-center transition-all shrink-0 ${
-                          isSelected
-                            ? "bg-purple-600 border-purple-500 text-white"
-                            : "border-slate-700"
-                        }`}
-                      >
-                        {isSelected && <Check size={10} />}
-                      </div>
-                    </button>
-                  );
-                })}
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-2.5 text-amber-300 text-xs font-semibold">
+                    <span className="relative flex h-2.5 w-2.5 shrink-0">
+                      {cooldownRemaining > 0 ? (
+                        <>
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500"></span>
+                        </>
+                      ) : (
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-400"></span>
+                      )}
+                    </span>
+                    <span>
+                      {cooldownRemaining > 0
+                        ? `API Rate Limit Cooldown (${cooldownRemaining}s remaining)`
+                        : "Timeline Connection Cleared"}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => onRegenerateResponse(thinkingLevel, msg.id)}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-xs transition-all cursor-pointer ${
+                      cooldownRemaining > 0
+                        ? "bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 hover:scale-102"
+                        : "bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-400/50 hover:scale-104 shadow-emerald-950/40"
+                    }`}
+                  >
+                    <RefreshCw size={12} className={cooldownRemaining > 0 ? "" : "animate-spin-once"} />
+                    <span>{cooldownRemaining > 0 ? "Retry Anyway" : "Retry Turn Now"}</span>
+                  </button>
+                </div>
+
+                <p className="text-[11px] text-amber-200/80 leading-relaxed">
+                  <strong>You have not run out of tokens.</strong> Google&apos;s free-tier Gemini API enforces a brief per-minute request rate limit. Once this momentary cooldown clears, responses will resume normally.
+                </p>
               </div>
             )}
           </div>
-        )}
+
+          {/* Turn-specific In-Context Lore Log & Version Controls */}
+          {msg.role === "nyx" && (parsedContextBadges.length > 0 || (msg.versions && msg.versions.length > 1)) && (
+            <div
+              className="mt-3 text-[10px] text-slate-400 font-mono flex items-center justify-between gap-3 border-t border-slate-900/60 pt-2 flex-wrap"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Logged in-context entities snapshot for this specific turn */}
+              {parsedContextBadges.length > 0 ? (
+                <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+                  <span className="text-slate-500 font-bold shrink-0">In Context:</span>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {parsedContextBadges.map((ent, eIdx) => {
+                      let badgeStyle = "bg-slate-800 text-slate-400";
+                      if (ent.isPc) {
+                        badgeStyle = "bg-purple-950/80 text-purple-300 border border-purple-800/60 font-semibold";
+                      } else if (ent.weightPct >= 80) {
+                        badgeStyle = "bg-emerald-950/80 text-emerald-300 border border-emerald-800/60 font-medium";
+                      } else if (ent.weightPct >= 50) {
+                        badgeStyle = "bg-teal-950/80 text-teal-300 border border-teal-800/60";
+                      } else if (ent.weightPct >= 25) {
+                        badgeStyle = "bg-amber-950/80 text-amber-300 border border-amber-800/60";
+                      } else {
+                        badgeStyle = "bg-slate-900 text-slate-500 border border-slate-800";
+                      }
+
+                      return (
+                        <span key={eIdx} className="inline-flex items-center gap-1 text-slate-300">
+                          <span className="text-slate-200">{ent.name}</span>
+                          <span className={`text-[8px] px-1 py-0.2 rounded font-mono ${badgeStyle}`}>
+                            {ent.badge}
+                          </span>
+                          {eIdx < parsedContextBadges.length - 1 && (
+                            <span className="text-slate-600">·</span>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div />
+              )}
+
+              {/* Version Switcher when multiple versions exist */}
+              {msg.versions && msg.versions.length > 1 && (
+                <div className="flex items-center gap-1.5 bg-slate-950/80 px-2 py-1 rounded-lg border border-slate-800/80 shrink-0 ml-auto">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const vIdx =
+                        msg.activeVersionIndex !== undefined
+                          ? msg.activeVersionIndex
+                          : 0;
+                      if (vIdx > 0) {
+                        onSelectMessageVersion?.(msg.id, vIdx - 1);
+                      }
+                    }}
+                    disabled={
+                      msg.activeVersionIndex === 0 ||
+                      msg.activeVersionIndex === undefined
+                    }
+                    className="text-slate-400 hover:text-purple-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                    title="Previous version"
+                  >
+                    <ChevronLeft size={12} />
+                  </button>
+                  <span className="text-[9px] text-slate-300 font-semibold select-none">
+                    {(msg.activeVersionIndex !== undefined
+                      ? msg.activeVersionIndex
+                      : 0) + 1}{" "}
+                    / {msg.versions.length}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const vIdx =
+                        msg.activeVersionIndex !== undefined
+                          ? msg.activeVersionIndex
+                          : 0;
+                      if (msg.versions && vIdx < msg.versions.length - 1) {
+                        onSelectMessageVersion?.(msg.id, vIdx + 1);
+                      }
+                    }}
+                    disabled={
+                      msg.versions &&
+                      msg.activeVersionIndex === msg.versions.length - 1
+                    }
+                    className="text-slate-400 hover:text-purple-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                    title="Next version"
+                  >
+                    <ChevronRight size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onRegenerateResponse(thinkingLevel, msg.id)}
+                    className="ml-1 text-slate-400 hover:text-amber-400 transition-colors cursor-pointer"
+                    title="Generate another version"
+                  >
+                    <RefreshCw size={10} />
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </motion.div>
   );

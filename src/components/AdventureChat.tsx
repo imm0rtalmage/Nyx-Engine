@@ -1,29 +1,35 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { Message, Project, CharacterProfile, GeneratedImage, RelationshipTrack, LoreSource } from "../types";
+import { Message, Project, CharacterProfile, GeneratedImage, RelationshipTrack, LoreSource, DEFAULT_INITIAL_PROJECT } from "../types";
 import { LoreSourceStatusBadge, getSourceProcessingState } from "./LoreSourceStatusBadge";
 import { safeLocalStorage, loadProjectMessagesSafely } from "../App";
 import { 
   Send, Edit3, Trash2, HelpCircle, RefreshCw, ChevronLeft, 
   ChevronRight, Brain, Sparkles, Check, X, AlertTriangle, ListFilter,
   Users, Palette, Layout, Upload, Image as ImageIcon, Sparkle, UserPlus,
-  ArrowLeftRight, HelpCircle as HelpIcon, CheckCircle2, Camera, FileText, Download,
+  ArrowLeftRight, CheckCircle2, Camera, FileText, Download,
   Paperclip, FolderOpen, Clock, Eye, EyeOff, ClipboardList,
   User, Ghost, Scroll, MapPin, Rocket, Shield, Flag, Lock, Unlock, XCircle, Heart,
   Maximize2, Minimize2, Copy, ChevronDown, ChevronUp, Sliders, Type, Save,
-  Bold, Italic, Code as CodeIcon, Quote, List as ListIcon, BookOpen, Square, Loader2, Plus, Zap, Info, Layers, Database
+  Bold, Italic, Code as CodeIcon, Quote, List as ListIcon, BookOpen, Square, Loader2, Plus, Zap, Info, Layers, Database, Coins, Globe
 } from "lucide-react";
 import { THEME_PRESETS, CHAT_BG_PRESETS, BUBBLE_STYLE_PRESETS } from "../utils/themes";
 import ThematicDashboardBanner, { getDynamicArchetype } from "./ThematicDashboardBanner";
 import Markdown from "react-markdown";
 import ChatMessageMarkdown from "./ChatMessageMarkdown";
 import MessageItem from "./MessageItem";
+import MessageErrorBoundary from "./MessageErrorBoundary";
 import { motion, AnimatePresence } from "motion/react";
 import JSZip from "jszip";
 import { fetchGoogleDoc, listGoogleDocs, fetchGoogleFile, createGoogleDoc, updateGoogleDoc } from "../utils/googleWorkspace";
 import { GooglePickerButton } from "./GooglePickerButton";
 import { SaveToDrivePickerModal } from "./SaveToDrivePickerModal";
 import { ContextHUDModal } from "./ContextHUDModal";
-import { useFunnyLoading } from "../utils/useFunnyLoading";
+import { AuthorStyleModal } from "./AuthorStyleModal";
+import { computeGranularLoreContext } from "../lib/nyxLoreEngine";
+import { useFunnyLoading, triggerNextLoreFact } from "../utils/useFunnyLoading";
+import { LoreCodexModal } from "./LoreCodexModal";
+import { TokenBreakdownModal } from "./TokenBreakdownModal";
+import { CanonDeltaStudioModal } from "./CanonDeltaStudioModal";
 import { safeFetchJson } from "../utils/apiClient";
 
 export const NARRATIVE_FONT_SIZES: Record<string, { label: string; class: string; short: string; px: string }> = {
@@ -119,7 +125,6 @@ interface AdventureChatProps {
   ) => void;
   onDeleteCharacter: (id: string) => void;
   onUpdateCharacter: (id: string, updates: Partial<CharacterProfile>) => void;
-  onUpdateMessageSpeakers: (messageId: string, speakerIds: string[]) => void;
   gallery: GeneratedImage[];
   googleToken?: string | null;
   onGoogleSignIn?: () => Promise<string | undefined> | void;
@@ -130,28 +135,8 @@ interface AdventureChatProps {
   isCinemaMode?: boolean;
   onToggleCinemaMode?: () => void;
   onOpenStoryArchives?: () => void;
+  isMobileLite?: boolean;
 }
-
-// Helper to parse IC (In-Character) and OOC (Out-Of-Character) segments
-const splitIcAndOoc = (content: string) => {
-  const bracketRegex = /\[([\s\S]*?)\]/g;
-  const oocParts: string[] = [];
-  const matches = [...content.matchAll(bracketRegex)];
-  
-  matches.forEach(m => {
-    oocParts.push(m[1].trim());
-  });
-  
-  // Replace all bracketed text with empty string to get pure IC
-  const icText = content.replace(bracketRegex, "").trim();
-  
-  return {
-    ic: icText,
-    ooc: oocParts.join("\n\n"),
-    hasOoc: oocParts.length > 0,
-    hasIc: icText.length > 0
-  };
-};
 
 const LORE_CUSTOM_FIELDS: Record<string, string[]> = {
   pc: [
@@ -498,7 +483,6 @@ export default function AdventureChat({
   onAddCharacter,
   onDeleteCharacter,
   onUpdateCharacter,
-  onUpdateMessageSpeakers,
   gallery,
   googleToken,
   onGoogleSignIn,
@@ -509,57 +493,94 @@ export default function AdventureChat({
   isCinemaMode: isCinemaModeProp,
   onToggleCinemaMode,
   onOpenStoryArchives,
+  isMobileLite = false,
 }: AdventureChatProps) {
+  const safeProject = project || DEFAULT_INITIAL_PROJECT;
+  const projectId = safeProject.id || "default-campaign";
+
   const [isDragging, setIsDragging] = useState(false);
   const [inputText, setInputText] = useState(() => {
     try {
-      return safeLocalStorage.getItem(`nyx_chat_draft_${project.id}`) || "";
+      return safeLocalStorage.getItem(`nyx_chat_draft_${projectId}`) || "";
     } catch {
       return "";
     }
   });
 
-  const prevDraftProjectIdRef = useRef(project.id);
+  const prevDraftProjectIdRef = useRef(projectId);
 
   // Restore/update draft state when switching active project
   useEffect(() => {
-    if (prevDraftProjectIdRef.current !== project.id) {
-      prevDraftProjectIdRef.current = project.id;
+    if (prevDraftProjectIdRef.current !== projectId) {
+      prevDraftProjectIdRef.current = projectId;
       try {
-        const saved = safeLocalStorage.getItem(`nyx_chat_draft_${project.id}`) || "";
+        const saved = safeLocalStorage.getItem(`nyx_chat_draft_${projectId}`) || "";
         setInputText(saved);
       } catch {
         setInputText("");
       }
     }
-  }, [project.id]);
+  }, [projectId]);
 
   // Debounced auto-save draft in safeLocalStorage whenever inputText changes for active project
   useEffect(() => {
-    if (prevDraftProjectIdRef.current === project.id) {
+    if (prevDraftProjectIdRef.current === projectId) {
       const timer = setTimeout(() => {
         try {
           if (inputText.trim()) {
-            safeLocalStorage.setItem(`nyx_chat_draft_${project.id}`, inputText);
+            safeLocalStorage.setItem(`nyx_chat_draft_${projectId}`, inputText);
           } else {
-            safeLocalStorage.removeItem(`nyx_chat_draft_${project.id}`);
+            safeLocalStorage.removeItem(`nyx_chat_draft_${projectId}`);
           }
         } catch {}
       }, 400);
       return () => clearTimeout(timer);
     }
-  }, [inputText, project.id]);
+  }, [inputText, projectId]);
   const [thinkingLevel, setThinkingLevel] = useState("Medium");
+  const [generatingElapsedSeconds, setGeneratingElapsedSeconds] = useState(0);
+
+  useEffect(() => {
+    let interval: any = null;
+    if (isGenerating) {
+      setGeneratingElapsedSeconds(0);
+      interval = setInterval(() => {
+        setGeneratingElapsedSeconds(prev => prev + 1);
+      }, 1000);
+    } else {
+      setGeneratingElapsedSeconds(0);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isGenerating]);
+
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
-  const [activeCot, setActiveCot] = useState<string | null>(null);
-  const [showLeftPanel, setShowLeftPanel] = useState(true);
-  const [showRightPanel, setShowRightPanel] = useState(true);
+  const [showLeftPanel, setShowLeftPanel] = useState(!isMobileLite);
 
   // Cinema focus mode to hide non-narrative sidebars and top headers
   const [localCinemaMode, setLocalCinemaMode] = useState(false);
   const cinemaMode = isCinemaModeProp !== undefined ? isCinemaModeProp : localCinemaMode;
   const [showPacingControls, setShowPacingControls] = useState(false);
+
+  // Editable Adventure Log Header Title State
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [customTitle, setCustomTitle] = useState(
+    project.adventureLogTitle || project.name || "ADVENTURE LOG"
+  );
+
+  useEffect(() => {
+    setCustomTitle(project.adventureLogTitle || project.name || "ADVENTURE LOG");
+  }, [project.adventureLogTitle, project.name]);
+
+  const handleSaveTitle = () => {
+    const trimmed = customTitle.trim();
+    const finalTitle = trimmed || project.name || "ADVENTURE LOG";
+    onSetProjectValue("adventureLogTitle", finalTitle);
+    setIsEditingTitle(false);
+    onShowToast?.("Adventure Log Title", `Updated to "${finalTitle}"`, "success");
+  };
 
   const currentFontSizeKey = project.narrativeFontSize || "xs";
   const currentFontSizeObj = NARRATIVE_FONT_SIZES[currentFontSizeKey] || NARRATIVE_FONT_SIZES["xs"];
@@ -608,6 +629,7 @@ export default function AdventureChat({
 
   // --- LOCAL WORLD SETTINGS STATES & DEBOUNCED SYNCING TO AVOID FIRESTORE TYPING LAG ---
   const [showSaveDrivePickerModal, setShowSaveDrivePickerModal] = useState(false);
+  const [showAuthorStyleModal, setShowAuthorStyleModal] = useState(false);
   const [showSparkExportModal, setShowSparkExportModal] = useState(false);
   const [sparkThreadTitle, setSparkThreadTitle] = useState(`${project.name} - Thread Log ${new Date().toLocaleDateString()}`);
   const [isSparkExporting, setIsSparkExporting] = useState(false);
@@ -776,6 +798,9 @@ export default function AdventureChat({
   const [localCreatorNames, setLocalCreatorNames] = useState(project.creatorNames || "");
   const [localCustomInstructions, setLocalCustomInstructions] = useState(project.customInstructions || "");
   const [localStyleGuide, setLocalStyleGuide] = useState(project.styleGuide || "");
+  const [localMood, setLocalMood] = useState(project.emotionalTone || "");
+  const [localPacing, setLocalPacing] = useState(project.pacing || "");
+  const [localTurnHeader, setLocalTurnHeader] = useState(project.turnHeader || "");
 
   const activeSettingResolved = localSetting || project.setting || "";
   const funnyLoadingText = useFunnyLoading(
@@ -789,6 +814,12 @@ export default function AdventureChat({
       activeSetting: activeSettingResolved
     }
   );
+
+  const [isLoreCodexOpen, setIsLoreCodexOpen] = useState(false);
+  const [tokenBreakdownTarget, setTokenBreakdownTarget] = useState<{
+    msg: Message;
+    index: number;
+  } | null>(null);
 
   // --- EXPANDED WORLD SETTINGS MODAL & INLINE EXPAND STATE ---
   const [expandedModalField, setExpandedModalField] = useState<{
@@ -814,6 +845,9 @@ export default function AdventureChat({
     if (id === "creatorNames") return localCreatorNames;
     if (id === "customInstructions") return localCustomInstructions;
     if (id === "styleGuide") return localStyleGuide;
+    if (id === "emotionalTone" || id === "mood") return localMood;
+    if (id === "pacing") return localPacing;
+    if (id === "turnHeader") return localTurnHeader;
     if (id.startsWith("char-desc")) return editDesc;
     if (id.startsWith("char-rel")) return editRelationships;
     if (id.startsWith("char-sig")) return editSignatureItems;
@@ -840,6 +874,15 @@ export default function AdventureChat({
     } else if (id === "styleGuide") {
       setLocalStyleGuide(val);
       setFocusedField("styleGuide");
+    } else if (id === "emotionalTone" || id === "mood") {
+      setLocalMood(val);
+      setFocusedField("emotionalTone");
+    } else if (id === "pacing") {
+      setLocalPacing(val);
+      setFocusedField("pacing");
+    } else if (id === "turnHeader") {
+      setLocalTurnHeader(val);
+      setFocusedField("turnHeader");
     } else if (id.startsWith("char-desc")) {
       setEditDesc(val);
     } else if (id.startsWith("char-rel")) {
@@ -854,9 +897,9 @@ export default function AdventureChat({
   const handleCloseExpandedModal = () => {
     if (expandedModalField) {
       const fieldId = expandedModalField.id;
-      if (["setting", "plotOverview", "persistentContext", "creatorNames", "customInstructions", "styleGuide"].includes(fieldId)) {
+      if (["setting", "plotOverview", "persistentContext", "creatorNames", "customInstructions", "styleGuide", "emotionalTone", "mood", "pacing", "turnHeader"].includes(fieldId)) {
         const currentVal = getExpandedFieldValue(fieldId);
-        handleFieldBlur(fieldId, currentVal);
+        handleFieldBlur(fieldId === "mood" ? "emotionalTone" : fieldId, currentVal);
       }
       setExpandedModalField(null);
     }
@@ -913,6 +956,18 @@ export default function AdventureChat({
     if (focusedField !== "styleGuide") setLocalStyleGuide(project.styleGuide || "");
   }, [project.styleGuide, focusedField]);
 
+  useEffect(() => {
+    if (focusedField !== "emotionalTone" && focusedField !== "mood") setLocalMood(project.emotionalTone || "");
+  }, [project.emotionalTone, focusedField]);
+
+  useEffect(() => {
+    if (focusedField !== "pacing") setLocalPacing(project.pacing || "");
+  }, [project.pacing, focusedField]);
+
+  useEffect(() => {
+    if (focusedField !== "turnHeader") setLocalTurnHeader(project.turnHeader || "");
+  }, [project.turnHeader, focusedField]);
+
   // Full reset when project.id changes
   useEffect(() => {
     setLocalName(project.name || "");
@@ -923,6 +978,9 @@ export default function AdventureChat({
     setLocalCreatorNames(project.creatorNames || "");
     setLocalCustomInstructions(project.customInstructions || "");
     setLocalStyleGuide(project.styleGuide || "");
+    setLocalMood(project.emotionalTone || "");
+    setLocalPacing(project.pacing || "");
+    setLocalTurnHeader(project.turnHeader || "");
   }, [project.id]);
 
   // Debounced save for name
@@ -954,6 +1012,26 @@ export default function AdventureChat({
     }, 600);
     return () => clearTimeout(timer);
   }, [localSetting]);
+
+  // Debounced save for mood / emotionalTone
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (localMood !== (project.emotionalTone || "")) {
+        onSetProjectValue("emotionalTone", localMood);
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [localMood]);
+
+  // Debounced save for pacing
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (localPacing !== (project.pacing || "")) {
+        onSetProjectValue("pacing", localPacing);
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [localPacing]);
 
   // Debounced save for plotOverview
   useEffect(() => {
@@ -1004,6 +1082,16 @@ export default function AdventureChat({
     }, 600);
     return () => clearTimeout(timer);
   }, [localStyleGuide]);
+
+  // Debounced save for turnHeader
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (localTurnHeader !== (project.turnHeader || "")) {
+        onSetProjectValue("turnHeader", localTurnHeader);
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [localTurnHeader]);
 
   // Target item navigation handler from assistant actions
   useEffect(() => {
@@ -1060,18 +1148,11 @@ export default function AdventureChat({
 
   // Column sizes (percentages)
   const [leftWidth, setLeftWidth] = useState(26); // %
-  const [rightWidth, setRightWidth] = useState(24); // %
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Tabs for settings panel: lore, cast of characters
   const [leftTab, setLeftTab] = useState<"lore" | "cast">("lore");
-
-  // Speaker picker visibility state
-  const [showSpeakerPickerId, setShowSpeakerPickerId] = useState<string | null>(null);
-
-  // Quick Switch Active PC Popover state
-  const [showPCSwitcher, setShowPCSwitcher] = useState(false);
 
   // New character creation state
   const [charName, setCharName] = useState("");
@@ -1139,14 +1220,28 @@ export default function AdventureChat({
   const [editRelMilestones, setEditRelMilestones] = useState("");
   const [editRelOpenness, setEditRelOpenness] = useState("");
 
+  // Granular Character Accuracy Breakdown state (edit mode)
+  const [editAppearanceBuild, setEditAppearanceBuild] = useState("");
+  const [editDistinguishingMarks, setEditDistinguishingMarks] = useState("");
+  const [editAttireWardrobe, setEditAttireWardrobe] = useState("");
+  const [editVoiceCadence, setEditVoiceCadence] = useState("");
+  const [editMannerisms, setEditMannerisms] = useState("");
+  const [editTemperament, setEditTemperament] = useState("");
+  const [editMotivationsSecrets, setEditMotivationsSecrets] = useState("");
+  const [editTacticalStyle, setEditTacticalStyle] = useState("");
+
+  // Canon & Delta Tracking state (edit mode)
+  const [editCanonSource, setEditCanonSource] = useState("");
+  const [editTimelineStage, setEditTimelineStage] = useState("");
+  const [editCanonDelta, setEditCanonDelta] = useState("");
+
+  // Canon Delta Studio Modal states
+  const [showCanonDeltaStudio, setShowCanonDeltaStudio] = useState(false);
+  const [canonStudioTargetChar, setCanonStudioTargetChar] = useState<CharacterProfile | null>(null);
+  const [showGranularSectionInEdit, setShowGranularSectionInEdit] = useState(false);
+
   // Import Doc Profile
-  const [selectedImportDocId, setSelectedImportDocId] = useState("");
   const [isPullingApart, setIsPullingApart] = useState(false);
-  
-  // GDoc Lore Ingest states
-  const [showGDocIngestModal, setShowGDocIngestModal] = useState(false);
-  const [gdocIngestLoading, setGdocIngestLoading] = useState(false);
-  const [gdocIngestStatus, setGdocIngestStatus] = useState("");
 
   // AI-powered dynamic lore update state & handler
   const [aiUpdatingCharId, setAiUpdatingCharId] = useState<string | null>(null);
@@ -1480,12 +1575,12 @@ export default function AdventureChat({
         console.error("Fetch document error:", err);
         const errMsg = err.message || "";
         if (errMsg.includes("401") || errMsg.includes("403") || errMsg.includes("Unauthorized") || errMsg.includes("Forbidden")) {
-          alert("Google Session expired or insufficient permissions. We have reset your connection. Please connect/sign in again to grant newly requested permissions!");
+          onShowToast?.("Google Session Expired", "Google Session expired or insufficient permissions. Please connect or sign in again to grant permissions.", "error");
           if (onClearGoogleToken) {
             onClearGoogleToken();
           }
         } else {
-          alert("Failed to fetch document content: " + err.message);
+          onShowToast?.("Google Drive Error", "Failed to fetch document content: " + err.message, "error");
         }
       } finally {
         setIsFetchingDocText(false);
@@ -1633,67 +1728,6 @@ export default function AdventureChat({
       reader.readAsDataURL(file);
     }
   };
-
-  // Assistant chatbot states
-  const [assistantInput, setAssistantInput] = useState("");
-  const [isAssistantGenerating, setIsAssistantGenerating] = useState(false);
-  const assistantAbortControllerRef = useRef<AbortController | null>(null);
-  const [assistantMessages, setAssistantMessages] = useState<any[]>(() => {
-    try {
-      const saved = safeLocalStorage.getItem(`nyx_assistant_msgs_${project.id}`);
-      if (saved) return JSON.parse(saved);
-    } catch (e) {}
-    return [
-      {
-        id: "init",
-        role: "assistant",
-        content: "[Greetings, director. I am Nyx, your automated storyteller assistant. Direct me to set setting values, register character profiles, customize campaign styles, or draw high-fidelity concept art right here! E.g. 'Change setting to Cyberpunk' or 'Draw a portrait of Saito']",
-        timestamp: new Date().toISOString()
-      }
-    ];
-  });
-
-  // Storyteller (ST) Screen States
-  const [showSTScreen, setShowSTScreen] = useState(false);
-  const [isGeneratingSTModule, setIsGeneratingSTModule] = useState(false);
-  const [stEditMode, setStEditMode] = useState(false);
-  const [stModuleText, setStModuleText] = useState(project.stAdventureModule || "");
-  const [stAuthorsMix, setStAuthorsMix] = useState(project.creatorNames || "Matt Mercer & Stephen King");
-  const [stCopied, setStCopied] = useState(false);
-
-  useEffect(() => {
-    setStModuleText(project.stAdventureModule || "");
-    setStAuthorsMix(project.creatorNames || "Matt Mercer & Stephen King");
-  }, [project.id, project.stAdventureModule, project.creatorNames]);
-
-  const handleGenerateSTModule = async () => {
-    setIsGeneratingSTModule(true);
-    try {
-      const data = await safeFetchJson<any>("/api/generate-st-module", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: project.name,
-          setting: project.setting,
-          authorsMix: stAuthorsMix,
-          plotOverview: project.plotOverview || ""
-        }),
-        timeout: 60000
-      });
-      setStModuleText(data.module);
-      onSetProjectValue("stAdventureModule", data.module);
-      onSetProjectValue("creatorNames", stAuthorsMix);
-    } catch (err: any) {
-      console.error(err);
-      alert("Error generating adventure module: " + err.message);
-    } finally {
-      setIsGeneratingSTModule(false);
-    }
-  };
-
-  useEffect(() => {
-    safeLocalStorage.setItem(`nyx_assistant_msgs_${project.id}`, JSON.stringify(assistantMessages));
-  }, [assistantMessages, project.id]);
 
   const [driveFiles, setDriveFiles] = useState<WorkspaceFile[]>([]);
 
@@ -1851,187 +1885,13 @@ export default function AdventureChat({
         console.log("Ingestion aborted for file:", fileName);
         return;
       }
-      alert("Error ingesting document: " + err.message);
+      onShowToast?.("Ingestion Error", "Error ingesting document: " + err.message, "error");
     } finally {
       setIsIngesting(false);
       if (ingestAbortControllerRef.current === controller) {
         ingestAbortControllerRef.current = null;
       }
     }
-  };
-
-  const handleAssistantSend = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!assistantInput.trim() || isAssistantGenerating) return;
-    const txt = assistantInput;
-    setAssistantInput("");
-
-    const userMsg = {
-      id: "ast-" + Date.now(),
-      role: "user",
-      content: txt,
-      timestamp: new Date().toISOString()
-    };
-    setAssistantMessages(prev => [...prev, userMsg]);
-    setIsAssistantGenerating(true);
-
-    if (assistantAbortControllerRef.current) {
-      assistantAbortControllerRef.current.abort();
-    }
-    const controller = new AbortController();
-    assistantAbortControllerRef.current = controller;
-
-    try {
-      const data = await safeFetchJson<any>("/api/assistant", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: txt,
-          project,
-          characters
-        }),
-        signal: controller.signal,
-        timeout: 60000
-      });
-      if (data.error) throw new Error(data.error);
-
-      if (controller.signal.aborted) return;
-
-      const assistantMsg = {
-        id: "ast-" + (Date.now() + 1),
-        role: "assistant",
-        content: data.reply || "[Directives processed! App settings synced.]",
-        timestamp: new Date().toISOString()
-      };
-      setAssistantMessages(prev => [...prev, assistantMsg]);
-
-      // Execute automated actions!
-      if (data.commands && Array.isArray(data.commands)) {
-        const seenCommandKeys = new Set<string>();
-        data.commands.forEach((cmd: any) => {
-          const cmdSig = `${cmd.action || ""}::${JSON.stringify(cmd)}`;
-          if (seenCommandKeys.has(cmdSig)) return;
-          seenCommandKeys.add(cmdSig);
-
-          const act = (cmd.action || "").toUpperCase();
-          if (act === "SET_PROJECT_VALUE" || act === "UPDATE_PROJECT_VALUE" || act === "SETTING") {
-            onSetProjectValue(cmd.key, cmd.value);
-          } else if (act === "ADD_CHARACTER" || act === "ADD_CHARACTER_OR_LORE" || act === "CREATE") {
-            const isPC = !!cmd.isPlayerCharacter || cmd.type === "pc" || (cmd.name || "").toLowerCase().includes("pc");
-            const resolvedType = cmd.type || (isPC ? "pc" : "npc");
-            onAddCharacter(
-              cmd.name || (isPC ? "Protagonist" : "New Character"),
-              cmd.role || (isPC ? "Protagonist" : resolvedType === "companion" ? "Companion" : "NPC"),
-              cmd.portraitUrl || "",
-              cmd.description || "",
-              isPC,
-              cmd.relationships || "",
-              cmd.factionName || "",
-              !!cmd.isMook,
-              resolvedType,
-              cmd.customFields || {},
-              cmd.signatureItems || "",
-              cmd.backstory || ""
-            );
-          } else if (act === "UPDATE_CHARACTER" || act === "UPDATE_CHARACTER_OR_LORE" || act === "UPDATE") {
-            const targetQuery = (cmd.name || cmd.id || "").toLowerCase().trim();
-            const match = characters.find(c => 
-              (cmd.id && c.id === cmd.id) || 
-              (targetQuery && c.name.toLowerCase().trim() === targetQuery) || 
-              (targetQuery && (c.name.toLowerCase().includes(targetQuery) || targetQuery.includes(c.name.toLowerCase()))) ||
-              (c.isPlayerCharacter && (targetQuery.includes("pc") || targetQuery.includes("player") || targetQuery.includes("protagonist")))
-            );
-
-            let incomingCustomFields: Record<string, string> = {};
-            if (cmd.customFields) {
-              if (typeof cmd.customFields === "object" && !Array.isArray(cmd.customFields)) {
-                incomingCustomFields = { ...cmd.customFields };
-              } else if (typeof cmd.customFields === "string") {
-                try {
-                  const parsed = JSON.parse(cmd.customFields);
-                  if (typeof parsed === "object" && parsed) incomingCustomFields = { ...parsed };
-                } catch {
-                  incomingCustomFields = { "Specifications": cmd.customFields };
-                }
-              }
-            }
-            if (cmd.updates?.customFields) {
-              if (typeof cmd.updates.customFields === "object") {
-                incomingCustomFields = { ...incomingCustomFields, ...cmd.updates.customFields };
-              }
-            }
-
-            const standardKeys = new Set(["id", "name", "role", "description", "action", "updates", "type", "factionName", "relationships", "backstory", "signatureItems", "customFields", "portraitUrl"]);
-            for (const [k, v] of Object.entries(cmd)) {
-              if (!standardKeys.has(k) && v !== undefined && v !== null) {
-                incomingCustomFields[k] = typeof v === "string" ? v : JSON.stringify(v);
-              }
-            }
-
-            if (match) {
-              const mergedCustomFields = {
-                ...(match.customFields || {}),
-                ...incomingCustomFields
-              };
-              onUpdateCharacter(match.id, {
-                ...(cmd.updates || {}),
-                ...(cmd.role ? { role: cmd.role } : {}),
-                ...(cmd.description ? { description: cmd.description } : {}),
-                ...(cmd.factionName ? { factionName: cmd.factionName } : {}),
-                ...(cmd.relationships ? { relationships: cmd.relationships } : {}),
-                ...(cmd.backstory ? { backstory: cmd.backstory } : {}),
-                ...(cmd.signatureItems ? { signatureItems: cmd.signatureItems } : {}),
-                ...(cmd.type ? { type: cmd.type } : {}),
-                customFields: mergedCustomFields
-              });
-            } else if (cmd.name) {
-              // If not found, create character directly
-              onAddCharacter(cmd.name, cmd.role || "Character", "", cmd.description || "", false, "", "", false, cmd.type || "npc", incomingCustomFields, cmd.signatureItems || "", cmd.backstory || "");
-            }
-          } else if (act === "DELETE_CHARACTER" || act === "DELETE_CHARACTER_OR_LORE" || act === "DELETE") {
-            const targetName = (cmd.name || cmd.id || "").toLowerCase();
-            const match = characters.find(c => c.id === cmd.id || (targetName && c.name.toLowerCase() === targetName));
-            if (match) onDeleteCharacter(match.id);
-          } else if (act === "CLEAR_CHAT") {
-            onClearChat();
-          } else if (act === "GENERATE_IMAGE") {
-            fetch("/api/image", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                prompt: cmd.prompt,
-                aspectRatio: "1:1",
-                projectId: project.id
-              })
-            }).catch(console.error);
-          }
-        });
-      }
-    } catch (err: any) {
-      if (err?.name === "AbortError" || err?.message?.includes("aborted") || controller.signal.aborted) {
-        console.log("Assistant generation stopped by user");
-        return;
-      }
-      setAssistantMessages(prev => [...prev, {
-        id: "ast-" + (Date.now() + 2),
-        role: "assistant",
-        content: `[An error occurred: ${err.message || "Please retry."}]`,
-        timestamp: new Date().toISOString()
-      }]);
-    } finally {
-      if (assistantAbortControllerRef.current === controller) {
-        assistantAbortControllerRef.current = null;
-      }
-      setIsAssistantGenerating(false);
-    }
-  };
-
-  const handleStopAssistantSend = () => {
-    if (assistantAbortControllerRef.current) {
-      assistantAbortControllerRef.current.abort();
-      assistantAbortControllerRef.current = null;
-    }
-    setIsAssistantGenerating(false);
   };
 
   const [isGeneratingPortraitId, setIsGeneratingPortraitId] = useState<string | null>(null);
@@ -2056,40 +1916,19 @@ export default function AdventureChat({
         const generatedUrl = `data:image/jpeg;base64,${data.image}`;
         onUpdateCharacter(char.id, { portraitUrl: generatedUrl });
       } else {
-        alert("Portrait generation failed: " + (data.error || "unknown error"));
+        onShowToast?.("Portrait Generation", "Portrait generation failed: " + (data.error || "unknown error"), "error");
       }
     } catch (err: any) {
       console.error(err);
-      alert("Error generating portrait: " + err.message);
+      onShowToast?.("Portrait Error", "Error generating portrait: " + err.message, "error");
     } finally {
       setIsGeneratingPortraitId(null);
     }
   };
 
-  // Smart Context Query variables
-  const [contextQuery, setContextQuery] = useState("");
-  const [queryResult, setQueryResult] = useState<any>(null);
-  const [isQuerying, setIsQuerying] = useState(false);
-
-  // Smart Sync variables
-  const [syncTarget, setSyncTarget] = useState("");
-  const [isSyncing, setIsSyncing] = useState(false);
-
-  // OOC and IC separation states
-  const [rightTab, setRightTab] = useState<"ooc" | "backstage">("ooc");
-  const [oocInput, setOocInput] = useState("");
-  const oocEndRef = useRef<HTMLDivElement>(null);
-
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isGenerating]);
-
-  // Auto scroll OOC whispers tab to bottom when messages list grows or right tab is clicked
-  useEffect(() => {
-    if (rightTab === "ooc") {
-      oocEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [messages, rightTab]);
 
   // Dynamic Theme Styling mappings
   const activeTheme = THEME_PRESETS[project.themeId || "slate"] || THEME_PRESETS["slate"];
@@ -2113,19 +1952,6 @@ export default function AdventureChat({
 
   // Fetch current active PC character
   const activePC = characters.find(c => c.id === project.activeCharacterId) || characters.find(c => c.role.toLowerCase().includes("protagonist")) || characters[0];
-
-  // Dynamically generate context-aware starter prompts/themes based on setting and active character
-  const getSuggestionPrompts = () => {
-    const s = project.setting || "a mysterious world";
-    const pcName = activePC ? activePC.name : "my character";
-    
-    return [
-      { label: `Initiate campaign`, prompt: `[Nyx, let's start: I am playing as ${pcName}. We begin in the setting of ${s} as a pivotal event unfolds.]` },
-      { label: "Dramatic escalation", prompt: `[Nyx, let's start: A sudden crisis or conflict emerges in ${s}, forcing ${pcName} to make an immediate, high-stakes choice.]` },
-      { label: "Quiet moment of focus", prompt: `[Nyx, let's start: During a rare wind-down moment in ${s}, ${pcName} takes a quiet moment to reflect, but an unexpected detail catches our attention.]` },
-      { label: "Undercover approach", prompt: `[Nyx, let's start: Operating under complete stealth in ${s}, ${pcName} attempts to bypass security or gather critical intelligence.]` }
-    ];
-  };
 
   // Handle message send & 2.0 Slash Commands
   const handleSend = async (e?: React.FormEvent | React.KeyboardEvent) => {
@@ -2236,26 +2062,18 @@ export default function AdventureChat({
         const current = project.persistentContext || "";
         const updated = current ? `${current}\n- ${data.fact}` : `- ${data.fact}`;
         onSetProjectValue("persistentContext", updated);
-        alert(`Fact distilled & stored! Added to Persistent Context:\n"${data.fact}"`);
+        onShowToast?.("Fact Distilled & Stored", `Added to Persistent Context:\n"${data.fact}"`, "success");
       } else {
         throw new Error("No fact returned");
       }
     } catch (err: any) {
-      alert("Failed to store fact: " + err.message);
+      onShowToast?.("Store Fact Error", "Failed to store fact: " + err.message, "error");
     }
   }, [project.persistentContext, onSetProjectValue]);
 
-  const handleToggleSpeakerPicker = useCallback((id: string | null) => {
-    setShowSpeakerPickerId(id);
+  const handleMessageClick = useCallback((_msg: Message) => {
+    // Clicked message handler
   }, []);
-
-  const handleMessageClick = useCallback((msg: Message) => {
-    if (msg.chainOfThought) {
-      setActiveCot(msg.chainOfThought);
-    } else {
-      setActiveCot(`[CoT] System calibration for turn:\n- User input length: ${msg.content.length} chars\n- Character anchor checking\n- Output generated under '${thinkingLevel}' mode.`);
-    }
-  }, [thinkingLevel]);
 
   // Drag resizing left panel
   const startResizeLeft = (e: React.MouseEvent) => {
@@ -2264,23 +2082,6 @@ export default function AdventureChat({
       const percentage = (moveEvent.clientX / window.innerWidth) * 100;
       if (percentage > 15 && percentage < 45) {
         setLeftWidth(percentage);
-      }
-    };
-    const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-  };
-
-  // Drag resizing right panel
-  const startResizeRight = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const handleMouseMove = (moveEvent: MouseEvent) => {
-      const percentage = ((window.innerWidth - moveEvent.clientX) / window.innerWidth) * 100;
-      if (percentage > 15 && percentage < 40) {
-        setRightWidth(percentage);
       }
     };
     const handleMouseUp = () => {
@@ -2316,7 +2117,7 @@ export default function AdventureChat({
       
       const entities = data.entities || [];
       if (entities.length === 0) {
-        alert("No character profiles or entities were found in this document. Please make sure the document describes characters/NPCs.");
+        onShowToast?.("No Entities Found", "No character profiles or entities were found in this document. Please make sure the document describes characters/NPCs.", "info");
         return;
       }
       
@@ -2415,7 +2216,7 @@ export default function AdventureChat({
       }
     } catch (err: any) {
       console.error("Error auto-filling from GDoc:", err);
-      alert("Error pulling apart character: " + err.message);
+      onShowToast?.("Character Extraction Error", "Error pulling apart character: " + err.message, "error");
     } finally {
       setIsPullingApart(false);
     }
@@ -2470,6 +2271,18 @@ export default function AdventureChat({
     setEditType(currentType);
     setEditIsInScene(!!entity.isInScene);
     setEditActivationKeys((entity.activationKeys || []).join(", "));
+    // Granular character accuracy and canon delta specs
+    setEditAppearanceBuild(entity.appearanceBuild || "");
+    setEditDistinguishingMarks(entity.distinguishingMarks || "");
+    setEditAttireWardrobe(entity.attireWardrobe || "");
+    setEditVoiceCadence(entity.voiceCadence || "");
+    setEditMannerisms(entity.mannerisms || "");
+    setEditTemperament(entity.temperament || "");
+    setEditMotivationsSecrets(entity.motivationsSecrets || "");
+    setEditTacticalStyle(entity.tacticalStyle || "");
+    setEditCanonSource(entity.canonSource || "");
+    setEditTimelineStage(entity.timelineStage || "");
+    setEditCanonDelta(entity.canonDelta || "");
   };
 
   const handleMoveLoreCategory = (char: CharacterProfile, targetCategory: "pc" | "npc" | "companion" | "chronicle" | "location" | "vehicle" | "equipment" | "faction") => {
@@ -2528,7 +2341,18 @@ export default function AdventureChat({
       type: editType,
       isPlayerCharacter: editType === "pc",
       isInScene: editIsInScene,
-      activationKeys: parsedKeys
+      activationKeys: parsedKeys,
+      appearanceBuild: editAppearanceBuild,
+      distinguishingMarks: editDistinguishingMarks,
+      attireWardrobe: editAttireWardrobe,
+      voiceCadence: editVoiceCadence,
+      mannerisms: editMannerisms,
+      temperament: editTemperament,
+      motivationsSecrets: editMotivationsSecrets,
+      tacticalStyle: editTacticalStyle,
+      canonSource: editCanonSource,
+      timelineStage: editTimelineStage,
+      canonDelta: editCanonDelta
     });
 
     if (oldType !== editType) {
@@ -2552,6 +2376,79 @@ export default function AdventureChat({
       }
     }
     setEditingEntityId(null);
+  };
+
+  // Reconcile and apply profile from Canon Delta Studio
+  const handleApplyCanonProfile = (updatedProfile: Partial<CharacterProfile>, targetCharId?: string) => {
+    const existingChar = targetCharId
+      ? characters.find(c => c.id === targetCharId)
+      : characters.find(c => c.name.trim().toLowerCase() === (updatedProfile.name || "").trim().toLowerCase());
+
+    if (existingChar) {
+      onUpdateCharacter(existingChar.id, updatedProfile);
+      if (editingEntityId === existingChar.id) {
+        if (updatedProfile.name) setEditName(updatedProfile.name);
+        if (updatedProfile.role) setEditRole(updatedProfile.role);
+        if (updatedProfile.description) setEditDesc(updatedProfile.description);
+        if (updatedProfile.backstory) setEditBackstory(updatedProfile.backstory);
+        if (updatedProfile.factionName) setEditFactionName(updatedProfile.factionName);
+        if (updatedProfile.relationships) setEditRelationships(updatedProfile.relationships);
+        if (updatedProfile.signatureItems) setEditSignatureItems(updatedProfile.signatureItems);
+        if (updatedProfile.appearanceBuild) setEditAppearanceBuild(updatedProfile.appearanceBuild);
+        if (updatedProfile.distinguishingMarks) setEditDistinguishingMarks(updatedProfile.distinguishingMarks);
+        if (updatedProfile.attireWardrobe) setEditAttireWardrobe(updatedProfile.attireWardrobe);
+        if (updatedProfile.voiceCadence) setEditVoiceCadence(updatedProfile.voiceCadence);
+        if (updatedProfile.mannerisms) setEditMannerisms(updatedProfile.mannerisms);
+        if (updatedProfile.temperament) setEditTemperament(updatedProfile.temperament);
+        if (updatedProfile.motivationsSecrets) setEditMotivationsSecrets(updatedProfile.motivationsSecrets);
+        if (updatedProfile.tacticalStyle) setEditTacticalStyle(updatedProfile.tacticalStyle);
+        if (updatedProfile.canonSource) setEditCanonSource(updatedProfile.canonSource);
+        if (updatedProfile.timelineStage) setEditTimelineStage(updatedProfile.timelineStage);
+        if (updatedProfile.canonDelta) setEditCanonDelta(updatedProfile.canonDelta);
+      }
+      if (onShowToast) {
+        onShowToast(
+          "Canon Delta Reconciled",
+          `Updated "${updatedProfile.name || existingChar.name}" with online canon and campaign narrative delta.`,
+          "success"
+        );
+      }
+    } else {
+      const charType = (loreTab === "companion" || loreTab === "pc" || loreTab === "npc") ? loreTab : "companion";
+      onAddCharacter(
+        updatedProfile.name || "Unknown Figure",
+        updatedProfile.role || "Operative",
+        updatedProfile.portraitUrl || "",
+        updatedProfile.description || "",
+        charType === "pc",
+        updatedProfile.relationships || "",
+        updatedProfile.factionName || "",
+        false,
+        charType,
+        updatedProfile.customFields || {},
+        updatedProfile.signatureItems || "",
+        updatedProfile.backstory || "",
+        updatedProfile.romanceTracks || [],
+        updatedProfile.linkedLoreIds || [],
+        true,
+        []
+      );
+
+      setTimeout(() => {
+        const added = characters.find(c => c.name.trim().toLowerCase() === (updatedProfile.name || "").trim().toLowerCase());
+        if (added) {
+          onUpdateCharacter(added.id, updatedProfile);
+        }
+      }, 150);
+
+      if (onShowToast) {
+        onShowToast(
+          "Canon Character Registered",
+          `Added "${updatedProfile.name}" into campaign lore with synthesized delta profile.`,
+          "success"
+        );
+      }
+    }
   };
 
   // Handle direct file upload to base64
@@ -2578,30 +2475,25 @@ export default function AdventureChat({
     reader.readAsDataURL(file);
   };
 
-  // 2.0 Dynamic Engine: In-Scene Entities & Active Keyword Triggers
-  const inSceneCharacters = characters.filter(c => c.isInScene || c.type === "companion" || c.isPlayerCharacter);
-  const outOfSceneCharacters = characters.filter(c => !c.isInScene && c.type !== "companion" && !c.isPlayerCharacter);
-
-  const recentTurnsText = messages.slice(-5).map(m => m.content).join(" ").toLowerCase();
-  
-  const activeKeywordTriggers = outOfSceneCharacters.filter(c => {
-    if (!c.name) return false;
-    const nameMatch = recentTurnsText.includes(c.name.toLowerCase());
-    const factionMatch = c.factionName && recentTurnsText.includes(c.factionName.toLowerCase());
-    const keysMatch = c.activationKeys && c.activationKeys.some(k => k.trim() && recentTurnsText.includes(k.trim().toLowerCase()));
-    return nameMatch || factionMatch || keysMatch;
-  });
-
-  const remainingBackgroundLore = outOfSceneCharacters.filter(c => !activeKeywordTriggers.some(t => t.id === c.id));
-
-  // Estimated token footprint for the 4-tier context engine
-  const estTier1Tokens = characters.filter(c => c.isPlayerCharacter).length * 350;
-  const estTier2Tokens = characters.filter(c => !c.isPlayerCharacter && (c.isInScene || c.type === "companion")).length * 300;
-  const estTier3Tokens = activeKeywordTriggers.length * 280;
-  const estTier4Tokens = remainingBackgroundLore.length * 25;
+  // Nyx Engine v2.0 - Unified Dirac-Compliant Mathematical Lore Context
   const slidingTurnsLimit = project.slidingContextTurns ?? 12;
-  const estHistoryTokens = messages.slice(-slidingTurnsLimit).reduce((acc, m) => acc + Math.round(m.content.length / 4), 0);
-  const estTotalContextTokens = estTier1Tokens + estTier2Tokens + estTier3Tokens + estTier4Tokens + estHistoryTokens;
+  const loreEngineResult = computeGranularLoreContext(characters, messages, slidingTurnsLimit);
+  const {
+    pcEntities,
+    granularEntities,
+    activeLoreEntities,
+    allActiveContextLore,
+    inSceneEntities: inSceneCharacters,
+    remainingBackgroundLore,
+    estimatedTokens
+  } = loreEngineResult;
+
+  const activeKeywordTriggers = activeLoreEntities;
+  const estTier1Tokens = estimatedTokens.tier1Protagonist;
+  const estTier2Tokens = estimatedTokens.tier2DynamicContext;
+  const estTier4Tokens = estimatedTokens.tier4BackgroundIndex;
+  const estHistoryTokens = estimatedTokens.slidingHistory;
+  const estTotalContextTokens = estimatedTokens.total;
 
   // Recommendation for next turn
   const lastAssistantMessage = [...messages].reverse().find(m => m.role === "nyx" || m.role === "assistant");
@@ -2665,97 +2557,6 @@ export default function AdventureChat({
 
     return avatarEl;
   }, []);
-
-  // Helper to render high fidelity portrait panel inside the chat box
-  const renderGamePortraitPanel = (speakers: CharacterProfile[], position: "left" | "right") => {
-    if (speakers.length === 0) return null;
-
-    // Outer border classes matching bubble styles
-    let borderTheme = "border-purple-500/20";
-    let textTheme = "text-purple-400";
-    if (project.themeId === "cyberpunk") {
-      borderTheme = "border-cyan-500/30";
-      textTheme = "text-cyan-400";
-    } else if (project.themeId === "emerald") {
-      borderTheme = "border-emerald-500/25";
-      textTheme = "text-emerald-400";
-    } else if (project.themeId === "crimson") {
-      borderTheme = "border-red-500/30";
-      textTheme = "text-red-400";
-    } else if (project.themeId === "twilight") {
-      borderTheme = "border-amber-500/25";
-      textTheme = "text-amber-400";
-    } else if (project.themeId === "noir") {
-      borderTheme = "border-neutral-700";
-      textTheme = "text-neutral-200";
-    }
-
-    // Multiple portraits are rendered side-by-side in columns
-    const totalCount = speakers.length;
-    const isSingle = totalCount === 1;
-
-    return (
-      <div 
-        className={`shrink-0 flex overflow-hidden rounded-xl bg-black/40 border ${borderTheme} p-1.5 shadow-2xl relative ${
-          isSingle 
-            ? "w-[120px] aspect-[3/4] h-[160px]" 
-            : "w-[180px] aspect-[4/3] h-[135px]"
-        }`}
-      >
-        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent pointer-events-none z-10" />
-        
-        <div className="flex w-full h-full divide-x divide-slate-800/60">
-          {speakers.map((char, cIdx) => (
-            <div 
-              key={char.id} 
-              className="relative flex-1 h-full overflow-hidden group/char text-left"
-            >
-              {isGeneratingPortraitId === char.id && (
-                <div className="absolute inset-0 bg-black/85 z-30 flex flex-col items-center justify-center gap-1">
-                  <RefreshCw size={14} className="text-purple-400 animate-spin" />
-                  <span className="text-[7px] text-purple-300 font-mono tracking-widest animate-pulse">GENERATING...</span>
-                </div>
-              )}
-
-              {char.portraitUrl === "nyx" || char.portraitUrl === "hero" || char.portraitUrl === "mage" || char.portraitUrl === "fixer" || char.portraitUrl === "shadow" || char.portraitUrl === "beast" ? (
-                // Preset render adapted to full frame
-                <div className="w-full h-full flex items-center justify-center bg-slate-900/60 scale-125 select-none">
-                  {renderPortrait(char.portraitUrl, char.name, "w-14 h-14")}
-                </div>
-              ) : (
-                <img
-                  src={char.portraitUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${char.name}`}
-                  alt={char.name}
-                  referrerPolicy="no-referrer"
-                  className="w-full h-full object-cover transition-transform duration-500 group-hover/char:scale-110"
-                  onError={(e) => {
-                    (e.currentTarget as HTMLImageElement).src = `https://api.dicebear.com/7.x/bottts/svg?seed=${char.name}`;
-                  }}
-                />
-              )}
-
-              {/* Character overlay detail tags */}
-              <div className="absolute bottom-2 left-2 right-2 z-20 text-[9px]">
-                <p className={`font-semibold ${textTheme} truncate leading-tight`}>{char.name}</p>
-                <p className="text-[7px] text-slate-400 truncate tracking-tight">{char.role}</p>
-              </div>
-
-              {/* Full Hover Card */}
-              <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 hidden group-hover/char:block bg-slate-950/95 text-[10px] text-slate-200 py-2 px-3 rounded-xl border border-slate-800 z-50 shadow-2xl min-w-[150px] font-sans">
-                <p className="font-bold text-purple-400 truncate">{char.name}</p>
-                <p className="text-[8px] text-slate-400 font-mono mb-1">{char.role}</p>
-                {char.description && (
-                  <p className="text-[8px] text-slate-400 leading-snug border-t border-slate-900 pt-1">
-                    {char.description}
-                  </p>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  };
 
   return (
     <div className={`flex h-full text-slate-100 rounded-2xl overflow-hidden border ${activeTheme.borderColor} ${activeTheme.bgClass} ${activeTheme.fontFamilyClass}`}>
@@ -2876,6 +2677,84 @@ export default function AdventureChat({
                   </div>
                 </div>
 
+                {/* Turn Header / Episode Code */}
+                <div>
+                  <div className="flex justify-between items-center mb-1">
+                    <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                      <span>Turn Header (Post Title)</span>
+                      <button
+                        type="button"
+                        onClick={() => onShowToast?.("🏷️ Turn Header", "Custom title or episode format displayed at the top of every narrative turn in the Adventure Log. E.g., 'The Mortician - S01E11' or 'The Household - Fun in the Sun'. Supports tags like {turn}, {speaker}, {time}.", "info")}
+                        className="text-slate-500 hover:text-purple-300 font-bold px-1 cursor-pointer"
+                        title="How Turn Headers work"
+                      >
+                        ?
+                      </button>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedModalField({
+                        id: "turnHeader",
+                        title: "🏷️ Turn Header & Post Title Template",
+                        description: "Sets the custom title or episode header displayed at the top of each narrative post (e.g. 'The Mortician - S01E11', 'The Household - Fun in the Sun', or '{turn}. {speaker}').",
+                        badge: "Post Header"
+                      })}
+                      className="text-[10px] text-purple-400 hover:text-purple-200 bg-purple-950/40 hover:bg-purple-900/60 border border-purple-800/40 px-2 py-0.5 rounded flex items-center gap-1 transition-colors font-mono cursor-pointer"
+                      title="Expand turn header editor"
+                    >
+                      <Maximize2 size={10} /> Expand
+                    </button>
+                  </div>
+                  <input
+                    id="setting-field-turnHeader"
+                    type="text"
+                    value={localTurnHeader}
+                    onFocus={() => setFocusedField("turnHeader")}
+                    onBlur={() => handleFieldBlur("turnHeader", localTurnHeader)}
+                    onChange={(e) => setLocalTurnHeader(e.target.value)}
+                    placeholder="E.g., The Mortician - S01E11, The Household - Fun in the Sun..."
+                    className="w-full bg-slate-950 border border-slate-850 rounded px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-purple-500 font-sans"
+                  />
+                  {/* Quick Preset Chips */}
+                  <div className="flex flex-wrap gap-1 mt-1.5">
+                    {[
+                      "The Mortician - S01E11",
+                      "The Household - Fun in the Sun",
+                      "Episode {turn}",
+                      "Scene {turn}",
+                      "{speaker}"
+                    ].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => {
+                          setLocalTurnHeader(preset);
+                          onSetProjectValue("turnHeader", preset);
+                        }}
+                        className={`text-[9px] px-1.5 py-0.5 rounded transition-all font-mono border cursor-pointer ${
+                          localTurnHeader === preset
+                            ? "bg-purple-950 text-purple-200 border-purple-600 font-semibold shadow-sm"
+                            : "bg-slate-900/80 text-slate-400 border-slate-800 hover:border-slate-700 hover:text-slate-200"
+                        }`}
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                    {localTurnHeader && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLocalTurnHeader("");
+                          onSetProjectValue("turnHeader", "");
+                        }}
+                        className="text-[9px] px-1.5 py-0.5 rounded transition-all font-mono border bg-slate-900/80 text-red-400/80 hover:text-red-300 border-slate-800 hover:border-red-900/50 cursor-pointer"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                </div>
+
                 {/* Current Setting */}
                 <div>
                   <div className="flex justify-between items-center mb-1">
@@ -2904,6 +2783,186 @@ export default function AdventureChat({
                     placeholder="Star Wars Canon Year, Jump City, Night City 2077..."
                     className="w-full bg-slate-950 border border-slate-850 rounded px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-purple-500 font-sans"
                   />
+                </div>
+
+                {/* Campaign Fact Index(es) & Lore Grounding */}
+                <div className="p-3 rounded-xl bg-slate-950/80 border border-purple-500/20 space-y-2.5 shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5 font-mono">
+                      <Sparkles size={11} className="text-purple-400" />
+                      <span>Campaign Fact Index(es)</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setIsLoreCodexOpen(true)}
+                      className="text-[9px] text-purple-400 hover:text-purple-200 underline font-mono flex items-center gap-0.5 cursor-pointer"
+                    >
+                      <span>Lore Codex</span>
+                      <ChevronRight size={9} />
+                    </button>
+                  </div>
+
+                  <div className="text-[11px] text-slate-300">
+                    {project.activeFactIndexes && project.activeFactIndexes.length > 0 ? (
+                      <div className="flex flex-wrap gap-1 items-center">
+                        <span className="text-[10px] text-slate-500 font-mono">Active:</span>
+                        {project.activeFactIndexes.map(idx => (
+                          <span key={idx} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-purple-950 text-purple-200 border border-purple-800/60 font-semibold">
+                            {idx}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-[10px] text-slate-400 leading-relaxed">
+                        <span className="text-emerald-400 font-medium font-mono">Auto:</span> Grounds trivia and lore facts automatically to {activeSettingResolved ? `"${activeSettingResolved}"` : "the active setting"}.
+                      </p>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsLoreCodexOpen(true)}
+                    className="w-full py-1.5 px-2 bg-slate-900 hover:bg-slate-850 border border-slate-800 hover:border-purple-500/40 rounded-lg text-[10px] font-medium text-slate-200 flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                  >
+                    <Sliders size={11} className="text-amber-400" />
+                    <span>Select Fact Index(es) for Campaign</span>
+                  </button>
+                </div>
+
+                {/* Narrative Mood / Atmosphere */}
+                <div>
+                  <div className="flex justify-between items-center mb-1">
+                    <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                      <span>Mood / Atmosphere</span>
+                      <button
+                        type="button"
+                        onClick={() => onShowToast?.("🎭 Narrative Mood", "Sets the emotional atmosphere and sensory tone. When set to 'Default to Author(s)' or unadjusted, mood automatically defaults to the signature mood & atmosphere of the author(s) specified in your style.", "info")}
+                        className="text-slate-500 hover:text-purple-300 font-bold px-1"
+                        title="How AI treats Mood"
+                      >
+                        ?
+                      </button>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedModalField({
+                        id: "emotionalTone",
+                        title: "🎭 Narrative Mood & Atmosphere",
+                        description: "Sets the emotional atmosphere, tone, tension level, and sensory mood for Nyx's narration (e.g. Default to Author(s), Gritty & Dark, Suspenseful Noir, Epic & Grand, Cozy & Introspective).",
+                        badge: "Atmosphere Engine"
+                      })}
+                      className="text-[10px] text-purple-400 hover:text-purple-200 bg-purple-950/40 hover:bg-purple-900/60 border border-purple-800/40 px-2 py-0.5 rounded flex items-center gap-1 transition-colors font-mono cursor-pointer"
+                      title="Expand mood editor"
+                    >
+                      <Maximize2 size={10} /> Expand
+                    </button>
+                  </div>
+                  <input
+                    id="setting-field-emotionalTone"
+                    type="text"
+                    value={localMood}
+                    onFocus={() => setFocusedField("emotionalTone")}
+                    onBlur={() => handleFieldBlur("emotionalTone", localMood)}
+                    onChange={(e) => setLocalMood(e.target.value)}
+                    placeholder="Default to Author(s) (or Gritty & Dark, Noir, Cozy...)"
+                    className="w-full bg-slate-950 border border-slate-850 rounded px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-purple-500 font-sans"
+                  />
+                  {/* Quick Mood Preset Chips */}
+                  <div className="flex flex-wrap gap-1 mt-1.5">
+                    {[
+                      "Default to Author(s)",
+                      "Dramatic & Atmospheric",
+                      "Gritty & Dark",
+                      "Suspenseful Noir",
+                      "Lighthearted & Witty",
+                      "Epic & Grand",
+                      "Eerie Cosmic Horror",
+                      "Cozy & Introspective"
+                    ].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => {
+                          setLocalMood(preset);
+                          onSetProjectValue("emotionalTone", preset);
+                        }}
+                        className={`text-[9px] px-1.5 py-0.5 rounded transition-all font-mono border ${
+                          localMood === preset || (!localMood && preset === "Default to Author(s)")
+                            ? "bg-purple-950 text-purple-200 border-purple-600 font-semibold shadow-sm"
+                            : "bg-slate-900/80 text-slate-400 border-slate-800 hover:border-slate-700 hover:text-slate-200"
+                        }`}
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Narrative Pacing */}
+                <div>
+                  <div className="flex justify-between items-center mb-1">
+                    <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                      <span>Story Pacing</span>
+                      <button
+                        type="button"
+                        onClick={() => onShowToast?.("⚡ Story Pacing", "Controls the speed of scene progression and beat intervals. When set to 'Default to Author(s)' or unadjusted, pacing automatically defaults to the signature narrative tempo of the author(s) specified in your style.", "info")}
+                        className="text-slate-500 hover:text-purple-300 font-bold px-1"
+                        title="How AI treats Pacing"
+                      >
+                        ?
+                      </button>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedModalField({
+                        id: "pacing",
+                        title: "⚡ Story Pacing & Progression Speed",
+                        description: "Governs the rhythm of narrative progression, beat intervals, combat speed, and prose density (e.g. Default to Author(s), Balanced, Fast-Paced & Kinetic, Slow-Burn & Detailed).",
+                        badge: "Pacing Controller"
+                      })}
+                      className="text-[10px] text-purple-400 hover:text-purple-200 bg-purple-950/40 hover:bg-purple-900/60 border border-purple-800/40 px-2 py-0.5 rounded flex items-center gap-1 transition-colors font-mono cursor-pointer"
+                      title="Expand pacing editor"
+                    >
+                      <Maximize2 size={10} /> Expand
+                    </button>
+                  </div>
+                  <input
+                    id="setting-field-pacing"
+                    type="text"
+                    value={localPacing}
+                    onFocus={() => setFocusedField("pacing")}
+                    onBlur={() => handleFieldBlur("pacing", localPacing)}
+                    onChange={(e) => setLocalPacing(e.target.value)}
+                    placeholder="Default to Author(s) (or Balanced, Fast-Paced, Slow-Burn...)"
+                    className="w-full bg-slate-950 border border-slate-850 rounded px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-purple-500 font-sans"
+                  />
+                  {/* Quick Pacing Preset Chips */}
+                  <div className="flex flex-wrap gap-1 mt-1.5">
+                    {[
+                      "Default to Author(s)",
+                      "Balanced",
+                      "Fast-Paced & Kinetic",
+                      "Slow-Burn & Detailed",
+                      "Breakneck Adrenaline",
+                      "Episodic & Methodical"
+                    ].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => {
+                          setLocalPacing(preset);
+                          onSetProjectValue("pacing", preset);
+                        }}
+                        className={`text-[9px] px-1.5 py-0.5 rounded transition-all font-mono border ${
+                          localPacing === preset || (!localPacing && preset === "Default to Author(s)")
+                            ? "bg-purple-950 text-purple-200 border-purple-600 font-semibold shadow-sm"
+                            : "bg-slate-900/80 text-slate-400 border-slate-800 hover:border-slate-700 hover:text-slate-200"
+                        }`}
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
                 {/* Plot Overview (Storyteller Outline) */}
@@ -3039,13 +3098,30 @@ export default function AdventureChat({
                       </button>
                     </div>
                   </div>
+
+                  {/* Free-Form Stylistic Influence & Writing Room Launcher */}
+                  <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1.5">
+                    <span className="text-slate-400 font-mono text-[10px]">
+                      Free-form: Any authors, show writing rooms, DMs, or blends
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowAuthorStyleModal(true)}
+                      className="text-[10px] px-2 py-0.5 rounded font-mono border border-purple-800/50 bg-purple-950/70 text-purple-300 hover:bg-purple-900/80 hover:text-purple-200 transition-all cursor-pointer font-semibold flex items-center gap-1 shadow-sm"
+                      title="Open the Free-Form Stylistic Influence Studio"
+                    >
+                      <Palette size={11} className="text-purple-400" />
+                      <span>Influence Studio &amp; Anti-Drift</span>
+                    </button>
+                  </div>
+
                   <textarea
                     id="setting-field-creatorNames"
                     value={localCreatorNames}
                     onFocus={() => setFocusedField("creatorNames")}
                     onBlur={() => handleFieldBlur("creatorNames", localCreatorNames)}
                     onChange={(e) => setLocalCreatorNames(e.target.value)}
-                    placeholder="George Lucas, Neil Gaiman, Gary Gygax..."
+                    placeholder='e.g. "Avatar the Last Airbender show writers", "Matt Mercer + RA Salvatore", "Andor writing room", "Denis Villeneuve & Frank Herbert"...'
                     rows={expandedInlineRows.creatorNames ? 8 : 4}
                     className="w-full bg-slate-950 border border-slate-850 rounded-lg px-2.5 py-2 text-xs text-slate-200 outline-none focus:border-purple-500 resize-y leading-relaxed font-sans transition-all"
                   />
@@ -3191,10 +3267,6 @@ export default function AdventureChat({
                               <LoreSourceStatusBadge
                                 source={src}
                                 size="sm"
-                                onToggleActive={async () => {
-                                  const updated = sourcesList.map((s) => s.id === src.id ? { ...s, isActive: s.isActive === false ? true : false } : s);
-                                  await onSetProjectValue("sources", updated);
-                                }}
                               />
                               <button
                                 type="button"
@@ -3401,6 +3473,36 @@ export default function AdventureChat({
                         </button>
                       );
                     })}
+                  </div>
+
+                  {/* Canon & Narrative Delta Studio Quick Launcher */}
+                  <div className="flex items-center justify-between gap-2 p-2.5 bg-gradient-to-r from-teal-950/50 via-slate-900/60 to-purple-950/40 border border-teal-800/40 rounded-xl shadow-md">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="p-1.5 rounded-lg bg-teal-950/80 border border-teal-800/60 text-teal-400 shrink-0">
+                        <Globe size={15} />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-slate-100 truncate">Canon & Narrative Delta Studio</span>
+                          <span className="text-[9px] px-1.5 py-0.2 rounded bg-teal-900/60 text-teal-200 border border-teal-700/50 font-mono shrink-0">Wiki + Logs Engine</span>
+                        </div>
+                        <p className="text-[10px] text-slate-400 truncate mt-0.5">
+                          Search online canon wiki, harvest campaign logs, and reconcile prequel & adaptation deltas.
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCanonStudioTargetChar(null);
+                        setShowCanonDeltaStudio(true);
+                      }}
+                      className="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 active:bg-teal-700 text-white rounded-lg text-xs font-semibold transition-all shadow cursor-pointer flex items-center gap-1.5 shrink-0"
+                      title="Open Canon & Narrative Delta Studio"
+                    >
+                      <Globe size={13} />
+                      <span>Open Studio</span>
+                    </button>
                   </div>
 
                   {/* Filtered Entities List */}
@@ -4109,6 +4211,156 @@ export default function AdventureChat({
                                         )}
                                       </div>
 
+                                      {/* Granular Character Accuracy Breakdown & Canon Delta (Edit Mode) */}
+                                      <div className="border-t border-slate-900 pt-2 space-y-2">
+                                        <div className="flex items-center justify-between">
+                                          <button
+                                            type="button"
+                                            onClick={() => setShowGranularSectionInEdit(!showGranularSectionInEdit)}
+                                            className="flex items-center gap-1.5 text-[9px] font-mono font-bold uppercase tracking-wider text-teal-400 hover:text-teal-300 transition-colors"
+                                          >
+                                            <Globe size={11} />
+                                            <span>Character Accuracy & Canon Delta Breakdown</span>
+                                            <span className="text-slate-500 font-normal">{showGranularSectionInEdit ? "[- Collapse]" : "[+ Expand]"}</span>
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setCanonStudioTargetChar(char);
+                                              setShowCanonDeltaStudio(true);
+                                            }}
+                                            className="px-2 py-0.5 rounded text-[9px] font-semibold bg-teal-950/60 hover:bg-teal-900/50 border border-teal-800/40 text-teal-300 flex items-center gap-1 cursor-pointer transition-all"
+                                            title="Launch Canon Delta Studio for this character"
+                                          >
+                                            <Sparkles size={10} />
+                                            <span>Reconcile with Studio</span>
+                                          </button>
+                                        </div>
+
+                                        {showGranularSectionInEdit && (
+                                          <div className="p-2.5 bg-slate-950/70 rounded-lg border border-teal-900/30 space-y-2.5 text-[10px]">
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-teal-400 mb-0.5">Canon Source / Origin</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="e.g., Forgotten Realms Wiki, Star Wars Canon..."
+                                                  value={editCanonSource}
+                                                  onChange={(e) => setEditCanonSource(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-teal-500"
+                                                />
+                                              </div>
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-teal-400 mb-0.5">Timeline Stage / Era</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="e.g., Prequel, Pre-Spellplague, Post-Endor..."
+                                                  value={editTimelineStage}
+                                                  onChange={(e) => setEditTimelineStage(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-teal-500"
+                                                />
+                                              </div>
+                                            </div>
+
+                                            <div>
+                                              <label className="block text-[8px] font-mono uppercase text-teal-400 mb-0.5">
+                                                Strict Campaign Delta (Deviations from online canon, past injuries, secret prequel state)
+                                              </label>
+                                              <textarea
+                                                rows={2}
+                                                placeholder="Describe how this campaign's reality diverges from general internet canon..."
+                                                value={editCanonDelta}
+                                                onChange={(e) => setEditCanonDelta(e.target.value)}
+                                                className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-teal-500 font-sans resize-none"
+                                              />
+                                            </div>
+
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1 border-t border-slate-900">
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-slate-400 mb-0.5">Build & Silhouette</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="Height, stance, posture, build..."
+                                                  value={editAppearanceBuild}
+                                                  onChange={(e) => setEditAppearanceBuild(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-purple-500"
+                                                />
+                                              </div>
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-slate-400 mb-0.5">Distinguishing Marks, Eyes & Hair</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="Eye color, scars, tattoos, hair styling..."
+                                                  value={editDistinguishingMarks}
+                                                  onChange={(e) => setEditDistinguishingMarks(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-purple-500"
+                                                />
+                                              </div>
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-slate-400 mb-0.5">Attire & Wardrobe</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="Typical fabrics, insignia, cloaks, armor..."
+                                                  value={editAttireWardrobe}
+                                                  onChange={(e) => setEditAttireWardrobe(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-purple-500"
+                                                />
+                                              </div>
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-slate-400 mb-0.5">Voice Pitch & Cadence</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="Tone, rhythm, accent, speech quirks..."
+                                                  value={editVoiceCadence}
+                                                  onChange={(e) => setEditVoiceCadence(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-purple-500"
+                                                />
+                                              </div>
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-slate-400 mb-0.5">Mannerisms & Behavioral Tells</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="Gestures, nervous tics, physical presence..."
+                                                  value={editMannerisms}
+                                                  onChange={(e) => setEditMannerisms(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-purple-500"
+                                                />
+                                              </div>
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-slate-400 mb-0.5">Temperament & Morals</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="Discipline, lines they will never cross..."
+                                                  value={editTemperament}
+                                                  onChange={(e) => setEditTemperament(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-purple-500"
+                                                />
+                                              </div>
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-slate-400 mb-0.5">Motivations & Secrets</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="Hidden agendas, vulnerabilities, driving desires..."
+                                                  value={editMotivationsSecrets}
+                                                  onChange={(e) => setEditMotivationsSecrets(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-purple-500"
+                                                />
+                                              </div>
+                                              <div>
+                                                <label className="block text-[8px] font-mono uppercase text-slate-400 mb-0.5">Combat & Tactical Style</label>
+                                                <input
+                                                  type="text"
+                                                  placeholder="Preferred engagements, spells, defensive tactics..."
+                                                  value={editTacticalStyle}
+                                                  onChange={(e) => setEditTacticalStyle(e.target.value)}
+                                                  className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 outline-none focus:border-purple-500"
+                                                />
+                                              </div>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+
                                       {/* Action buttons */}
                                       <div className="flex gap-2 justify-end pt-1">
                                         <button
@@ -4203,6 +4455,97 @@ export default function AdventureChat({
                                         </div>
                                       )}
 
+                                      {/* Canon & Narrative Delta Display */}
+                                      {(char.timelineStage || char.canonSource || char.canonDelta) && (
+                                        <div className="bg-teal-950/20 border border-teal-800/40 rounded-lg p-2.5 space-y-1.5 mt-1">
+                                          <div className="flex items-center justify-between flex-wrap gap-1.5">
+                                            <div className="flex items-center gap-1.5">
+                                              <Globe size={11} className="text-teal-400" />
+                                              <span className="text-[8px] uppercase tracking-wider text-teal-300 font-mono font-bold">
+                                                Canon & Narrative Delta
+                                              </span>
+                                            </div>
+                                            <div className="flex items-center gap-1 font-mono text-[8px]">
+                                              {char.timelineStage && (
+                                                <span className="px-1.5 py-0.2 rounded bg-teal-900/40 text-teal-200 border border-teal-700/50">
+                                                  {char.timelineStage}
+                                                </span>
+                                              )}
+                                              {char.canonSource && (
+                                                <span className="px-1.5 py-0.2 rounded bg-slate-900 text-slate-400 border border-slate-800">
+                                                  Source: {char.canonSource}
+                                                </span>
+                                              )}
+                                            </div>
+                                          </div>
+                                          {char.canonDelta && (
+                                            <div className="text-[10px] text-slate-300 bg-slate-950/60 p-2 rounded border border-teal-900/30 leading-relaxed font-sans">
+                                              <strong className="text-teal-400 font-mono text-[8px] uppercase block mb-0.5">Campaign Delta & Divergence:</strong>
+                                              <p className="whitespace-pre-wrap">{char.canonDelta}</p>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
+
+                                      {/* Granular Character Breakdown Display */}
+                                      {(char.appearanceBuild || char.distinguishingMarks || char.attireWardrobe || char.voiceCadence || char.mannerisms || char.temperament || char.motivationsSecrets || char.tacticalStyle) && (
+                                        <div className="bg-slate-900/35 p-2.5 rounded-lg border border-slate-850/80 space-y-1.5 mt-1">
+                                          <span className="text-[8px] uppercase tracking-wider text-indigo-400 font-mono font-bold block">
+                                            Granular Character Breakdown
+                                          </span>
+                                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-[10px]">
+                                            {char.appearanceBuild && (
+                                              <div className="bg-slate-950/50 p-1.5 rounded border border-slate-900">
+                                                <span className="text-[8px] uppercase font-mono text-slate-500 block">Build & Silhouette</span>
+                                                <p className="text-slate-300 leading-normal mt-0.5">{char.appearanceBuild}</p>
+                                              </div>
+                                            )}
+                                            {char.distinguishingMarks && (
+                                              <div className="bg-slate-950/50 p-1.5 rounded border border-slate-900">
+                                                <span className="text-[8px] uppercase font-mono text-slate-500 block">Distinguishing Marks / Eyes / Hair</span>
+                                                <p className="text-slate-300 leading-normal mt-0.5">{char.distinguishingMarks}</p>
+                                              </div>
+                                            )}
+                                            {char.attireWardrobe && (
+                                              <div className="bg-slate-950/50 p-1.5 rounded border border-slate-900">
+                                                <span className="text-[8px] uppercase font-mono text-slate-500 block">Attire & Wardrobe</span>
+                                                <p className="text-slate-300 leading-normal mt-0.5">{char.attireWardrobe}</p>
+                                              </div>
+                                            )}
+                                            {char.voiceCadence && (
+                                              <div className="bg-slate-950/50 p-1.5 rounded border border-slate-900">
+                                                <span className="text-[8px] uppercase font-mono text-slate-500 block">Voice & Speech Cadence</span>
+                                                <p className="text-slate-300 leading-normal mt-0.5">{char.voiceCadence}</p>
+                                              </div>
+                                            )}
+                                            {char.mannerisms && (
+                                              <div className="bg-slate-950/50 p-1.5 rounded border border-slate-900">
+                                                <span className="text-[8px] uppercase font-mono text-slate-500 block">Mannerisms & Behavioral Tells</span>
+                                                <p className="text-slate-300 leading-normal mt-0.5">{char.mannerisms}</p>
+                                              </div>
+                                            )}
+                                            {char.temperament && (
+                                              <div className="bg-slate-950/50 p-1.5 rounded border border-slate-900">
+                                                <span className="text-[8px] uppercase font-mono text-slate-500 block">Temperament & Morals</span>
+                                                <p className="text-slate-300 leading-normal mt-0.5">{char.temperament}</p>
+                                              </div>
+                                            )}
+                                            {char.motivationsSecrets && (
+                                              <div className="bg-slate-950/50 p-1.5 rounded border border-slate-900">
+                                                <span className="text-[8px] uppercase font-mono text-slate-500 block">Motivations & Secrets</span>
+                                                <p className="text-slate-300 leading-normal mt-0.5">{char.motivationsSecrets}</p>
+                                              </div>
+                                            )}
+                                            {char.tacticalStyle && (
+                                              <div className="bg-slate-950/50 p-1.5 rounded border border-slate-900">
+                                                <span className="text-[8px] uppercase font-mono text-slate-500 block">Tactical Style & Protocols</span>
+                                                <p className="text-slate-300 leading-normal mt-0.5">{char.tacticalStyle}</p>
+                                              </div>
+                                            )}
+                                          </div>
+                                        </div>
+                                      )}
+
                                       {/* Linked connections display */}
                                       {char.linkedLoreIds && char.linkedLoreIds.length > 0 && (
                                         <div className="space-y-1.5 pt-1.5 border-t border-slate-900/80">
@@ -4280,6 +4623,19 @@ export default function AdventureChat({
 
                                        <button
                                          type="button"
+                                         onClick={() => {
+                                           setCanonStudioTargetChar(char);
+                                           setShowCanonDeltaStudio(true);
+                                         }}
+                                         className="px-2.5 py-1 bg-teal-950/40 hover:bg-teal-900/30 text-teal-300 hover:text-teal-200 rounded border border-teal-800/40 font-semibold text-[10px] transition-all flex items-center gap-1 cursor-pointer"
+                                         title="Research online canon and reconcile campaign delta for this character"
+                                       >
+                                         <Globe size={11} className="text-teal-400" />
+                                         <span>Canon Delta</span>
+                                       </button>
+
+                                       <button
+                                         type="button"
                                          disabled={aiUpdatingCharId === char.id}
                                          onClick={() => handleAiUpdateLore(char)}
                                           className={`px-2.5 py-1 ${aiUpdatingCharId === char.id ? 'bg-indigo-950/50 text-indigo-300' : 'bg-indigo-950/30 hover:bg-indigo-900/20 text-indigo-400 hover:text-indigo-300'} rounded border border-indigo-800/35 font-semibold text-[10px] transition-all flex items-center gap-1 cursor-pointer`}
@@ -4334,30 +4690,44 @@ export default function AdventureChat({
                     {showRegisterActor && (
                       <div className="space-y-3 mt-3 bg-slate-950/30 p-2.5 rounded-lg border border-slate-900">
                         {/* Instant AI Auto-Generator Toolbar */}
-                        <div className="flex items-center justify-between bg-purple-950/30 border border-purple-800/40 p-2 rounded-md">
+                        <div className="flex flex-wrap items-center justify-between gap-2 bg-purple-950/30 border border-purple-800/40 p-2 rounded-md">
                           <div className="flex items-center gap-1.5">
                             <Sparkles size={13} className="text-purple-400 animate-pulse" />
                             <span className="text-[11px] font-semibold text-purple-200">AI Profile Co-Pilot</span>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => handleAiAutoFillEntity(false)}
-                            disabled={isAiGeneratingEntity}
-                            className="flex items-center gap-1.5 px-2.5 py-1 bg-purple-600 hover:bg-purple-500 active:bg-purple-700 disabled:opacity-50 text-white rounded text-[10px] font-bold shadow transition-all cursor-pointer"
-                            title="Auto-completes and enriches all unlocked fields with rich setting-appropriate lore"
-                          >
-                            {isAiGeneratingEntity ? (
-                              <>
-                                <Loader2 size={11} className="animate-spin" />
-                                <span>Generating...</span>
-                              </>
-                            ) : (
-                              <>
-                                <Sparkles size={11} />
-                                <span>Auto-Fill All Fields</span>
-                              </>
-                            )}
-                          </button>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCanonStudioTargetChar(null);
+                                setShowCanonDeltaStudio(true);
+                              }}
+                              className="flex items-center gap-1.5 px-2.5 py-1 bg-teal-600/90 hover:bg-teal-500 text-white rounded text-[10px] font-semibold shadow transition-all cursor-pointer"
+                              title="Research internet canon and extract campaign logs to generate a reconciled profile"
+                            >
+                              <Globe size={11} />
+                              <span>Grab Online Canon</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleAiAutoFillEntity(false)}
+                              disabled={isAiGeneratingEntity}
+                              className="flex items-center gap-1.5 px-2.5 py-1 bg-purple-600 hover:bg-purple-500 active:bg-purple-700 disabled:opacity-50 text-white rounded text-[10px] font-bold shadow transition-all cursor-pointer"
+                              title="Auto-completes and enriches all unlocked fields with rich setting-appropriate lore"
+                            >
+                              {isAiGeneratingEntity ? (
+                                <>
+                                  <Loader2 size={11} className="animate-spin" />
+                                  <span>Generating...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Sparkles size={11} />
+                                  <span>Auto-Fill All Fields</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
                         </div>
 
                         {/* Name Input */}
@@ -4938,7 +5308,7 @@ export default function AdventureChat({
       )}
 
       {/* Button to restore Left panel */}
-      {!showLeftPanel && (
+      {!showLeftPanel && !isMobileLite && (
         <button 
           onClick={() => setShowLeftPanel(true)}
           className={`h-full ${activeTheme.cardBgClass} hover:bg-slate-850 border-r ${activeTheme.borderColor} px-1.5 flex items-center justify-center text-slate-400 hover:text-white`}
@@ -4987,28 +5357,72 @@ export default function AdventureChat({
         
         {/* Chat Header */}
         <div className={`px-3.5 py-2 border-b ${activeTheme.borderColor} bg-slate-900/60 flex flex-wrap sm:flex-nowrap justify-between items-center gap-2 z-10 shrink-0`}>
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
             <Sparkles size={14} className={`${activeTheme.accentIcon} shrink-0`} />
-            <h3 className={`text-xs sm:text-sm font-semibold ${activeTheme.headingFontClass} truncate`}>
-              {activeTheme.name.toUpperCase()} ADVENTURE LOG
-            </h3>
-            <span className="hidden md:inline-block text-[9px] text-purple-300/80 font-mono bg-purple-950/40 border border-purple-800/40 px-2 py-0.5 rounded-full shrink-0">
-              OOC: [brackets]
-            </span>
+            
+            {isEditingTitle ? (
+              <div className="flex items-center gap-1.5 max-w-md w-full">
+                <input
+                  type="text"
+                  value={customTitle}
+                  onChange={(e) => setCustomTitle(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleSaveTitle();
+                    if (e.key === "Escape") {
+                      setCustomTitle(project.adventureLogTitle || project.name || "ADVENTURE LOG");
+                      setIsEditingTitle(false);
+                    }
+                  }}
+                  autoFocus
+                  placeholder="Enter Adventure Log Title..."
+                  className="bg-slate-950 text-slate-100 px-2 py-0.5 rounded border border-purple-500/60 text-xs font-semibold focus:outline-none focus:ring-1 focus:ring-purple-400 w-full"
+                />
+                <button
+                  type="button"
+                  onClick={handleSaveTitle}
+                  className="p-1 rounded bg-purple-600 hover:bg-purple-500 text-white transition-colors cursor-pointer shrink-0"
+                  title="Save title (Enter)"
+                >
+                  <Check size={12} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCustomTitle(project.adventureLogTitle || project.name || "ADVENTURE LOG");
+                    setIsEditingTitle(false);
+                  }}
+                  className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors cursor-pointer shrink-0"
+                  title="Cancel (Esc)"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ) : (
+              <div 
+                className="group flex items-center gap-1.5 cursor-pointer max-w-full truncate"
+                onClick={() => setIsEditingTitle(true)}
+                title="Click to rename Adventure Log"
+              >
+                <h3 className={`text-xs sm:text-sm font-semibold ${activeTheme.headingFontClass} truncate text-slate-100 group-hover:text-purple-300 transition-colors`}>
+                  {project.adventureLogTitle || `${activeTheme.name.toUpperCase()} ADVENTURE LOG`}
+                </h3>
+                <Edit3 size={11} className="text-slate-500 group-hover:text-purple-400 opacity-0 group-hover:opacity-100 transition-all shrink-0" />
+              </div>
+            )}
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0 max-w-full overflow-x-auto scrollbar-none py-0.5">
             {/* Thinking / Model tier selector */}
-            <div className="flex items-center gap-1 bg-slate-950/80 p-0.5 rounded-lg border border-slate-800/80">
+            <div className="flex items-center gap-1 bg-slate-950/80 p-0.5 rounded-lg border border-slate-800/80 shrink-0">
               {[
-                { id: "High", label: "3.7-Ext", full: "3.7 Flash - Extended (High Reasoning)" },
-                { id: "Medium", label: "3.7 Flash", full: "3.7 Flash (Standard)" },
-                { id: "Minimal", label: "3.5 Lite", full: "3.5 Flash Lite (Fast)" }
+                { id: "High", label: "High", full: "Flash-Latest (High Thinking / Extended Reasoning)" },
+                { id: "Medium", label: "Medium", full: "Flash-Latest (Medium Thinking / Standard)" },
+                { id: "Low", label: "Low", full: "Flash-Latest (Low Thinking / Fast)" }
               ].map(tier => (
                 <button
                   key={tier.id}
                   onClick={() => setThinkingLevel(tier.id)}
-                  className={`px-2 py-0.5 rounded text-[9.5px] font-semibold font-mono transition-all cursor-pointer ${
+                  className={`px-1.5 sm:px-2 py-0.5 rounded text-[9.5px] font-semibold font-mono transition-all cursor-pointer ${
                     thinkingLevel === tier.id 
                       ? "bg-purple-600 text-white shadow shadow-purple-900" 
                       : "text-slate-400 hover:text-slate-200"
@@ -5019,6 +5433,25 @@ export default function AdventureChat({
                 </button>
               ))}
             </div>
+
+            {/* Quick Turn Token Inspector Button */}
+            {messages.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  const lastAssistant = [...messages].reverse().find(m => m.role === "nyx" || m.role === "assistant") || messages[messages.length - 1];
+                  const lastIdx = messages.findIndex(m => m.id === lastAssistant.id);
+                  setTokenBreakdownTarget({ msg: lastAssistant, index: lastIdx >= 0 ? lastIdx : messages.length - 1 });
+                }}
+                className="hidden lg:flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-950/80 border border-slate-800 hover:border-purple-500/60 text-[10px] font-mono text-slate-300 hover:text-purple-200 transition-all cursor-pointer group shadow-xs"
+                title="View Turn Token Breakdown (Input, Retrieval, Thinking, Output)"
+              >
+                <Coins size={11} className="text-amber-400 group-hover:text-purple-400 transition-colors shrink-0" />
+                <span className="font-semibold text-slate-200 group-hover:text-purple-100 tabular-nums">
+                  Turn {messages.length} Tokens
+                </span>
+              </button>
+            )}
 
             {/* Font Size Adjuster Stepper */}
             <div 
@@ -5152,6 +5585,28 @@ export default function AdventureChat({
               onShowToast={onShowToast}
             />
 
+            {/* Author Style & Literary Anti-Drift Modal */}
+            <AuthorStyleModal
+              isOpen={showAuthorStyleModal}
+              onClose={() => setShowAuthorStyleModal(false)}
+              currentAuthors={localCreatorNames || project.creatorNames || ""}
+              onSelectAuthor={(authorName) => {
+                setLocalCreatorNames(authorName);
+                onSetProjectValue("creatorNames", authorName);
+              }}
+              onAnchorStyle={(authorName) => {
+                setLocalCreatorNames(authorName);
+                onSetProjectValue("creatorNames", authorName);
+              }}
+              onPurgeDrift={(authorName) => {
+                setInputText((prev) => {
+                  const reminder = `[Narrator directive: Strict adherence to ${authorName}'s literary style requested. Avoid generic assistant prose, eliminate repetitious dialogue, and ground narration in concrete sensory textures.]\n\n`;
+                  return reminder + prev;
+                });
+              }}
+              onShowToast={onShowToast}
+            />
+
             {onOpenStoryArchives && (
               <button
                 type="button"
@@ -5165,6 +5620,16 @@ export default function AdventureChat({
             )}
 
             <button
+              type="button"
+              onClick={() => setIsLoreCodexOpen(true)}
+              className="text-[10px] text-amber-300 hover:text-amber-100 font-mono bg-amber-950/40 hover:bg-amber-900/60 p-1.5 sm:px-2.5 sm:py-1 rounded-lg border border-amber-800/50 hover:border-amber-600/60 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+              title="Open Did You Know? Lore Codex archives to explore deep universe trivia"
+            >
+              <Sparkles size={11} className="text-amber-400 shrink-0" />
+              <span className="hidden sm:inline">Lore Codex</span>
+            </button>
+
+            <button
               onClick={() => setShowClearLogModal(true)}
               className="text-[10px] text-slate-400 hover:text-red-300 font-mono bg-slate-950 hover:bg-red-950/40 p-1.5 sm:px-2 sm:py-1 rounded-lg border border-slate-800 hover:border-red-800/50 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
               title="Clear active story narrative log"
@@ -5176,7 +5641,7 @@ export default function AdventureChat({
         </div>
 
         {/* Messages Feed */}
-        <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6 z-10 flex flex-col justify-start">
+        <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-3 sm:py-6 space-y-4 sm:space-y-6 z-10 flex flex-col justify-start">
           {messages.length === 0 && (
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-lg mx-auto space-y-3">
               <div className="w-12 h-12 rounded-2xl bg-purple-950/40 border border-purple-800/30 flex items-center justify-center text-purple-400 shadow-inner">
@@ -5224,38 +5689,45 @@ export default function AdventureChat({
 
           <AnimatePresence initial={false}>
             {messages.map((msg, idx) => (
-              <MessageItem
+              <MessageErrorBoundary
                 key={msg.id || `msg-${idx}`}
-                msg={msg}
-                idx={idx}
-                isUser={msg.role === "user"}
-                isEditing={editingMessageId === msg.id}
-                editText={editText}
-                onEditTextChange={handleEditTextChange}
-                onSaveEdit={handleSaveEdit}
-                onCancelEdit={handleCancelEdit}
-                onStartEdit={handleStartEdit}
+                messageId={msg.id}
                 onDeleteMessage={onDeleteMessage}
-                onMessageClick={handleMessageClick}
-                onStoreFact={handleStoreFact}
-                onRegenerateResponse={onRegenerateResponse}
-                onSelectMessageVersion={onSelectMessageVersion}
-                onUpdateMessageSpeakers={onUpdateMessageSpeakers}
-                showSpeakerPicker={showSpeakerPickerId === msg.id}
-                onToggleSpeakerPicker={handleToggleSpeakerPicker}
-                themeId={project.themeId}
-                activeBubbleStyleClass={activeBubbleStyle.class}
-                activeThemeUserBubbleClass={activeTheme.userBubbleClass}
-                activeThemeNyxBubbleClass={activeTheme.nyxBubbleClass}
-                activeThemeBorderColor={activeTheme.borderColor}
-                activeThemeAccentText={activeTheme.accentText}
-                currentFontSizeClass={currentFontSizeObj.class}
-                userNickname={project.userNickname}
-                characters={characters}
-                portraitPosition={project.portraitPosition}
-                thinkingLevel={thinkingLevel}
-                renderPortrait={renderPortrait}
-              />
+              >
+                <MessageItem
+                  msg={msg}
+                  idx={idx}
+                  isUser={msg.role === "user"}
+                  isEditing={editingMessageId === msg.id}
+                  editText={editText}
+                  onEditTextChange={handleEditTextChange}
+                  onSaveEdit={handleSaveEdit}
+                  onCancelEdit={handleCancelEdit}
+                  onStartEdit={handleStartEdit}
+                  onDeleteMessage={onDeleteMessage}
+                  onMessageClick={handleMessageClick}
+                  onStoreFact={handleStoreFact}
+                  onRegenerateResponse={onRegenerateResponse}
+                  onSelectMessageVersion={onSelectMessageVersion}
+                  onOpenTokenBreakdown={(targetMsg, targetIdx) => {
+                    setTokenBreakdownTarget({ msg: targetMsg, index: targetIdx });
+                  }}
+                  themeId={project?.themeId}
+                  activeBubbleStyleClass={activeBubbleStyle?.class || ""}
+                  activeThemeUserBubbleClass={activeTheme?.userBubbleClass || ""}
+                  activeThemeNyxBubbleClass={activeTheme?.nyxBubbleClass || ""}
+                  activeThemeBorderColor={activeTheme?.borderColor || ""}
+                  activeThemeAccentText={activeTheme?.accentText || ""}
+                  currentFontSizeClass={currentFontSizeObj?.class || "text-xs"}
+                  userNickname={project?.userNickname}
+                  characters={characters || []}
+                  allMessages={messages || []}
+                  portraitPosition={project?.portraitPosition}
+                  thinkingLevel={thinkingLevel}
+                  renderPortrait={renderPortrait}
+                  turnHeader={project?.turnHeader}
+                />
+              </MessageErrorBoundary>
             ))}
 
             {isGenerating && (
@@ -5267,34 +5739,98 @@ export default function AdventureChat({
                 transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
                 className="flex w-full justify-center"
               >
-                <div className={`w-full border border-dashed border-purple-500/30 bg-slate-900/40 p-5 rounded-2xl flex relative shadow-xl shadow-purple-950/20 ${activeBubbleStyle.class}`}>
+                <div className={`w-full border border-dashed border-purple-500/30 bg-slate-900/60 p-5 rounded-2xl flex flex-col relative shadow-xl shadow-purple-950/20 backdrop-blur-sm ${activeBubbleStyle.class}`}>
+                  {/* Status header with thinking level, model indicator, and live elapsed timer */}
+                  <div className="flex items-center justify-between gap-2 pb-3 mb-3 border-b border-purple-500/20 text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className="relative flex h-2.5 w-2.5">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-purple-500"></span>
+                      </span>
+                      <span className="font-semibold text-purple-200">
+                        {thinkingLevel === "High" 
+                          ? "Deep Reasoning & Context Synthesis Active" 
+                          : thinkingLevel === "Low" 
+                            ? "Fast Narrative Generation Active" 
+                            : "Narrative Generation Active"}
+                      </span>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-medium ${
+                        thinkingLevel === "High" 
+                          ? "bg-purple-900/60 text-purple-300 border border-purple-500/40" 
+                          : thinkingLevel === "Low" 
+                            ? "bg-blue-900/50 text-blue-300 border border-blue-500/30" 
+                            : "bg-slate-800 text-slate-300 border border-slate-700"
+                      }`}>
+                        {thinkingLevel} Thinking
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2 font-mono text-[11px] text-slate-400">
+                      <span className="text-purple-300 font-bold tabular-nums">
+                        {generatingElapsedSeconds}s elapsed
+                      </span>
+                    </div>
+                  </div>
+
                   <div className="flex-1 flex flex-col justify-between">
                     <div>
-                      <div className="h-4 bg-slate-850 rounded w-1/3 mb-4 animate-pulse" />
+                      <div className="h-4 bg-slate-800/60 rounded w-1/3 mb-4 animate-pulse" />
                       <div className="space-y-2">
-                        <div className="h-3 bg-slate-850 rounded w-full animate-pulse" />
-                        <div className="h-3 bg-slate-850 rounded w-5/6 animate-pulse" />
-                        <div className="h-3 bg-slate-850 rounded w-2/3 animate-pulse" />
+                        <div className="h-3 bg-slate-800/50 rounded w-full animate-pulse" />
+                        <div className="h-3 bg-slate-800/50 rounded w-5/6 animate-pulse" />
+                        <div className="h-3 bg-slate-800/50 rounded w-2/3 animate-pulse" />
                       </div>
                     </div>
-                    <div className="flex flex-wrap items-center justify-between gap-3 mt-4 pt-3 border-t border-purple-500/15 text-[11px] text-purple-300 font-mono">
-                      <div className="flex items-start gap-2 flex-1 min-w-[200px]">
-                        <Sparkles size={13} className="text-amber-400 shrink-0 mt-0.5 animate-pulse" />
-                        <span className="italic text-slate-300">
-                          {funnyLoadingText}
-                        </span>
-                      </div>
-                      {onStopGeneration && (
-                        <button
-                          type="button"
-                          onClick={onStopGeneration}
-                          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold shadow-lg shadow-red-950/60 transition-all cursor-pointer hover:scale-105 active:scale-95 shrink-0"
-                          title="Halt storyteller generation immediately"
-                        >
-                          <Square size={11} className="fill-white" />
-                          <span>Stop Generation</span>
-                        </button>
+                    <div className="flex flex-col gap-2 mt-4 pt-3 border-t border-purple-500/15 text-[11px] text-purple-300 font-mono">
+                      {generatingElapsedSeconds > 10 && thinkingLevel === "High" && (
+                        <div className="flex items-center gap-2 text-amber-400/90 text-[10px]">
+                          <Sparkles size={12} className="animate-spin" />
+                          <span>Auditing narrative continuity, relationship matrix & lore canon ({generatingElapsedSeconds}s)...</span>
+                        </div>
                       )}
+                      
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-start gap-2 flex-1 min-w-[200px]">
+                          <Sparkles size={13} className="text-amber-400 shrink-0 mt-0.5 animate-pulse" />
+                          <span className="italic text-slate-200 select-text leading-relaxed">
+                            {funnyLoadingText}
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => triggerNextLoreFact()}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-purple-950/70 hover:bg-purple-900 border border-purple-500/30 text-purple-200 text-[10px] font-semibold transition-all cursor-pointer hover:scale-105 active:scale-95"
+                            title="Skip to next Did You Know? lore fact"
+                          >
+                            <RefreshCw size={11} />
+                            <span>Next Fact</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setIsLoreCodexOpen(true)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700 border border-slate-600/40 text-slate-200 text-[10px] font-semibold transition-all cursor-pointer hover:scale-105 active:scale-95"
+                            title="Open the Lore Codex archives"
+                          >
+                            <BookOpen size={11} />
+                            <span>Lore Codex</span>
+                          </button>
+
+                          {onStopGeneration && (
+                            <button
+                              type="button"
+                              onClick={onStopGeneration}
+                              className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold shadow-lg shadow-red-950/60 transition-all cursor-pointer hover:scale-105 active:scale-95"
+                              title="Halt storyteller generation immediately"
+                            >
+                              <Square size={11} className="fill-white" />
+                              <span>Stop</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -5308,134 +5844,45 @@ export default function AdventureChat({
         {/* Input area */}
         <div className={`p-2.5 sm:p-3 border-t ${activeTheme.borderColor} bg-slate-900/40 flex flex-col gap-2 z-10 shrink-0 relative`}>
           
-          {/* 2.0 Active Scene Floating Roster Bar */}
-          <div className="flex flex-wrap items-center justify-between gap-1.5 px-2 py-1.5 bg-slate-950/90 rounded-xl border border-slate-850 shadow-sm text-xs font-mono">
-            {/* Left: Active In-Scene Entities */}
-            <div className="flex items-center gap-1.5 flex-wrap flex-1 min-w-0">
-              <div className="flex items-center gap-1 text-[10px] font-bold text-emerald-400 shrink-0" title="Entities actively injected into prompt memory (Tier 1 & Tier 2)">
-                <Zap size={11} className="text-emerald-400 shrink-0" />
-                <span>Scene ({inSceneCharacters.length}):</span>
-              </div>
+          {/* Nyx Engine v2.0 - Granular In-Context Readout */}
+          {allActiveContextLore.length > 0 && (
+            <div className="flex items-center gap-1.5 px-2 py-0.5 text-[10px] text-slate-400 font-mono select-none overflow-x-auto no-scrollbar">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+              <span className="text-slate-500 font-bold shrink-0">Nyx 2.0 Context:</span>
+              <div className="flex items-center gap-1.5 truncate">
+                {allActiveContextLore.map((ent, idx) => {
+                  const isPc = ent.isPlayerCharacter || ent.type === "pc";
+                  const granularInfo = granularEntities.find(g => g.entity.id === ent.id);
+                  const weightPct = isPc ? 100 : (granularInfo ? granularInfo.weightPercent : 100);
+                  
+                  let badgeStyle = "bg-slate-800 text-slate-400";
+                  if (isPc) {
+                    badgeStyle = "bg-purple-950/80 text-purple-300 border border-purple-800/60 font-semibold";
+                  } else if (weightPct >= 80) {
+                    badgeStyle = "bg-emerald-950/80 text-emerald-300 border border-emerald-800/60 font-medium";
+                  } else if (weightPct >= 50) {
+                    badgeStyle = "bg-teal-950/80 text-teal-300 border border-teal-800/60";
+                  } else if (weightPct >= 25) {
+                    badgeStyle = "bg-amber-950/80 text-amber-300 border border-amber-800/60";
+                  } else {
+                    badgeStyle = "bg-slate-900 text-slate-500 border border-slate-800";
+                  }
 
-              {inSceneCharacters.length === 0 ? (
-                <span className="text-[10px] text-slate-500 italic">Solo (No companions in scene)</span>
-              ) : (
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  {inSceneCharacters.map(char => (
-                    <div
-                      key={char.id}
-                      className="group flex items-center gap-1 px-1.5 py-0.5 rounded-lg bg-slate-900 border border-slate-800 hover:border-emerald-500/40 transition-all text-[10px]"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                      <span className="text-slate-200 font-semibold max-w-[90px] truncate" title={char.name}>
-                        {char.name}
+                  const label = isPc ? "PC" : `${weightPct}%`;
+
+                  return (
+                    <span key={ent.id || idx} className="inline-flex items-center gap-1 text-slate-300">
+                      <span>{ent.name}</span>
+                      <span className={`text-[8px] px-1 py-0.2 rounded font-mono ${badgeStyle}`}>
+                        {label}
                       </span>
-                      <span className="text-[8px] px-1 py-0.2 rounded bg-slate-950 text-slate-400 font-mono">
-                        {char.isPlayerCharacter ? "PC" : (char.type || "NPC")}
-                      </span>
-                      {!char.isPlayerCharacter && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            onUpdateCharacter(char.id, { isInScene: false });
-                            onShowToast?.("⚪ Scene Left", `"${char.name}" returned to Lorebook.`, "info");
-                          }}
-                          className="text-slate-500 hover:text-red-400 p-0.5 rounded transition-colors ml-0.5 cursor-pointer"
-                          title="Remove from active scene (keep in lorebook)"
-                        >
-                          <X size={9} />
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Add Entity to Scene Dropdown Popover */}
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => setShowAddSceneEntityDropdown(prev => !prev)}
-                  className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-md bg-purple-950/60 hover:bg-purple-900/80 border border-purple-800/60 text-purple-300 hover:text-purple-100 transition-all cursor-pointer"
-                  title="Quick-add Lorebook entity to active scene"
-                >
-                  <Plus size={10} />
-                  <span>Add Entity</span>
-                </button>
-
-                {showAddSceneEntityDropdown && (
-                  <div className="absolute bottom-full left-0 mb-1.5 w-56 max-h-56 overflow-y-auto bg-slate-950 border border-slate-800 rounded-xl shadow-2xl p-1.5 z-50 flex flex-col gap-1 animate-in fade-in zoom-in-95 duration-100">
-                    <div className="flex items-center justify-between px-2 py-1 border-b border-slate-850 text-[9px] font-bold text-slate-400 uppercase">
-                      <span>Add to Active Scene</span>
-                      <button
-                        type="button"
-                        onClick={() => setShowAddSceneEntityDropdown(false)}
-                        className="text-slate-500 hover:text-slate-300"
-                      >
-                        <X size={10} />
-                      </button>
-                    </div>
-
-                    {outOfSceneCharacters.length === 0 ? (
-                      <p className="text-[10px] text-slate-500 p-2 text-center">All Lorebook entities are already in scene.</p>
-                    ) : (
-                      outOfSceneCharacters.map(char => (
-                        <button
-                          key={char.id}
-                          type="button"
-                          onClick={() => {
-                            onUpdateCharacter(char.id, { isInScene: true });
-                            onShowToast?.("🟢 Scene Joined", `"${char.name}" added to active scene.`, "success");
-                            setShowAddSceneEntityDropdown(false);
-                          }}
-                          className="flex items-center justify-between p-1.5 rounded-lg hover:bg-slate-900 text-left transition-colors cursor-pointer group"
-                        >
-                          <div className="flex items-center gap-1.5 min-w-0">
-                            <div className="w-4 h-4 rounded bg-slate-800 flex items-center justify-center text-[8px] text-slate-300 font-bold shrink-0">
-                              {char.name.charAt(0)}
-                            </div>
-                            <div className="truncate">
-                              <span className="text-[10px] text-slate-200 group-hover:text-emerald-300 font-semibold block truncate">
-                                {char.name}
-                              </span>
-                              <span className="text-[8px] text-slate-500 block truncate font-mono">
-                                {char.role || char.type}
-                              </span>
-                            </div>
-                          </div>
-                          <Plus size={11} className="text-emerald-400 shrink-0 ml-1 opacity-0 group-hover:opacity-100" />
-                        </button>
-                      ))
-                    )}
-                  </div>
-                )}
+                      {idx < allActiveContextLore.length - 1 && <span className="text-slate-600">·</span>}
+                    </span>
+                  );
+                })}
               </div>
             </div>
-
-            {/* Right: 2.0 Memory & Context HUD Pill */}
-            <div className="flex items-center gap-1 shrink-0">
-              {activeKeywordTriggers.length > 0 && (
-                <div
-                  className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-950/60 border border-amber-800/60 text-amber-300 text-[9px] font-mono cursor-pointer"
-                  onClick={() => setShowContextHUDModal(true)}
-                  title={`${activeKeywordTriggers.length} Lorebook entries dynamically triggered by recent keywords!`}
-                >
-                  <Sparkles size={9} className="text-amber-400 animate-pulse shrink-0" />
-                  <span>{activeKeywordTriggers.length} Triggers</span>
-                </div>
-              )}
-
-              <button
-                type="button"
-                onClick={() => setShowContextHUDModal(true)}
-                className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-900 hover:bg-purple-950/60 border border-slate-800 hover:border-purple-600/50 text-slate-300 hover:text-purple-200 text-[9px] font-mono transition-all cursor-pointer"
-                title="Open 2.0 Dynamic Memory & Context Inspector"
-              >
-                <Brain size={10} className="text-purple-400 shrink-0" />
-                <span>2.0 HUD: ~{estTotalContextTokens.toLocaleString()} tok</span>
-              </button>
-            </div>
-          </div>
+          )}
           
           {/* Collapsible Token range controls & RAG Anchor status bar */}
           {showPacingControls && (
@@ -5540,6 +5987,23 @@ export default function AdventureChat({
                 <span>{project.narrativePerspective === "second_person" ? "🎯 2nd (You)" : "👤 3rd (Sena)"}</span>
               </button>
 
+              {/* Author Style & Zero-Drift Quick Anchor */}
+              <button
+                type="button"
+                onClick={() => setShowAuthorStyleModal(true)}
+                className={`flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-lg border transition-all cursor-pointer ${
+                  project.creatorNames
+                    ? "bg-purple-950/80 border-purple-500/60 text-purple-200 hover:bg-purple-900/80 shadow-sm"
+                    : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200"
+                }`}
+                title="Click to view literary blueprint, switch author, or lock anti-drift enforcement"
+              >
+                <Palette size={11} className="text-purple-400 shrink-0" />
+                <span className="text-purple-400 font-bold">Style:</span>
+                <span className="max-w-[120px] truncate">{project.creatorNames || "Master Literary"}</span>
+                <Lock size={10} className={project.creatorNames ? "text-emerald-400" : "text-slate-500"} />
+              </button>
+
               {/* RAG Grounding Active Anchor Badge */}
               <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono bg-slate-900 px-2 py-0.5 rounded-lg border border-slate-800">
                 <Brain size={11} className="text-purple-400 shrink-0" />
@@ -5571,26 +6035,40 @@ export default function AdventureChat({
             </div>
           )}
 
-          <div className="flex items-center gap-2 relative">
+          <div className="flex items-center gap-1.5 sm:gap-2 relative">
             {/* Action Toggles & Attachment Buttons */}
             <div className="relative shrink-0 flex items-center gap-1">
               {/* Pacing & Config Toggle Button */}
               <button
                 type="button"
                 onClick={() => setShowPacingControls(prev => !prev)}
-                className={`flex items-center justify-center p-2 rounded-xl border transition-all text-slate-400 hover:text-slate-200 h-9.5 w-9.5 ${
+                className={`flex items-center justify-center p-1.5 sm:p-2 rounded-xl border transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5 ${
                   showPacingControls
                     ? "bg-purple-950/80 border-purple-500/80 text-purple-200 shadow-sm shadow-purple-950/50"
                     : "bg-slate-950 border-slate-800 hover:bg-slate-900"
                 }`}
                 title={showPacingControls ? "Hide Narrative Pacing & Token Controls" : "Show Narrative Pacing & Token Controls"}
               >
-                <Sliders size={15} className={showPacingControls ? "text-purple-400" : "text-slate-400"} />
+                <Sliders size={14} className={showPacingControls ? "text-purple-400" : "text-slate-400"} />
+              </button>
+
+              {/* Author Style & Literary Anti-Drift Engine Quick Button */}
+              <button
+                type="button"
+                onClick={() => setShowAuthorStyleModal(true)}
+                className={`flex items-center justify-center p-1.5 sm:p-2 rounded-xl border transition-all h-8.5 w-8.5 sm:h-9.5 sm:w-9.5 cursor-pointer ${
+                  project.creatorNames
+                    ? "bg-purple-950/80 border-purple-500/60 text-purple-200 hover:bg-purple-900/80 shadow-sm"
+                    : "bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+                }`}
+                title={`Author Style & Anti-Drift Engine: ${project.creatorNames || "Master Literary Fiction"}`}
+              >
+                <Palette size={14} className={project.creatorNames ? "text-purple-300" : "text-slate-400"} />
               </button>
 
               {/* File Attachment Button */}
-              <label className="flex items-center justify-center p-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl cursor-pointer transition-all text-slate-400 hover:text-slate-200 h-9.5 w-9.5" title="Attach local files (Up to 10)">
-                <Paperclip size={15} className="text-purple-400 hover:text-purple-300" />
+              <label className="flex items-center justify-center p-1.5 sm:p-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl cursor-pointer transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5" title="Attach local files (Up to 10)">
+                <Paperclip size={14} className="text-purple-400 hover:text-purple-300" />
                 <input 
                   type="file" 
                   multiple
@@ -5599,7 +6077,7 @@ export default function AdventureChat({
                 />
               </label>
 
-              {/* Google Drive Picker Button */}
+              {/* Google Drive Picker Button (collapses on very small screens) */}
               <button
                 type="button"
                 onClick={() => {
@@ -5609,10 +6087,10 @@ export default function AdventureChat({
                   }
                   setShowWorkspaceBrowser("drive");
                 }}
-                className="flex items-center justify-center p-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl transition-all text-slate-400 hover:text-slate-200 h-9.5 w-9.5"
+                className="hidden xs:flex items-center justify-center p-1.5 sm:p-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5"
                 title="Select documents from Google Drive"
               >
-                <FolderOpen size={15} className="text-blue-400 hover:text-blue-300" />
+                <FolderOpen size={14} className="text-blue-400 hover:text-blue-300" />
               </button>
             </div>
 
@@ -6200,7 +6678,7 @@ export default function AdventureChat({
                                 if (showWorkspaceBrowser === "photos") {
                                   setAssistantAttachments(prev => {
                                     if (prev.length >= 10) {
-                                      alert("Maximum 10 attachments reached.");
+                                      onShowToast?.("Attachment Limit", "Maximum 10 attachments reached.", "info");
                                       return prev;
                                     }
                                     return [...prev, {
@@ -6675,6 +7153,49 @@ export default function AdventureChat({
           </div>
         </div>
       )}
+
+      {/* Encyclopedic Lore Archives & Codex Modal */}
+      <LoreCodexModal
+        isOpen={isLoreCodexOpen}
+        onClose={() => setIsLoreCodexOpen(false)}
+        activeUniverse={activeSettingResolved}
+        currentCampaign={{
+          id: project?.id,
+          name: project?.name,
+          activeFactIndexes: project?.activeFactIndexes
+        }}
+        onUpdateCampaignIndexes={(indexes) => {
+          onSetProjectValue("activeFactIndexes", indexes);
+        }}
+        onShowToast={onShowToast}
+      />
+
+      {/* Turn-Level Token Breakdown Modal */}
+      <TokenBreakdownModal
+        isOpen={!!tokenBreakdownTarget}
+        onClose={() => setTokenBreakdownTarget(null)}
+        msg={tokenBreakdownTarget?.msg || null}
+        turnIndex={tokenBreakdownTarget?.index ?? 0}
+        characters={characters}
+        turnHeader={project.turnHeader}
+        allMessages={messages}
+        onSelectTurn={(newIdx) => {
+          if (newIdx >= 0 && newIdx < messages.length) {
+            setTokenBreakdownTarget({ msg: messages[newIdx], index: newIdx });
+          }
+        }}
+      />
+
+      {/* Canon & Narrative Delta Studio Modal */}
+      <CanonDeltaStudioModal
+        isOpen={showCanonDeltaStudio}
+        onClose={() => setShowCanonDeltaStudio(false)}
+        initialCharacter={canonStudioTargetChar}
+        existingCharacters={characters}
+        chatMessages={messages}
+        projectSetting={project.setting || project.name || ""}
+        onApplyProfile={handleApplyCanonProfile}
+      />
 
     </div>
   );

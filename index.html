@@ -1,12 +1,24 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="bg-slate-950 text-slate-100">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Nyx RPG — AI Dungeon Master</title>
+    <title>Nyx Roleplay Dashboard</title>
+    <meta name="description" content="An advanced roleplay companion and DM campaign dashboard featuring real-time sync, narrative editors, grounding lore codex, and AI generation." />
+    <meta property="og:title" content="Nyx Roleplay Dashboard" />
+    <meta property="og:description" content="An advanced roleplay companion and DM campaign dashboard featuring real-time sync, narrative editors, grounding lore codex, and AI generation." />
+    <style>
+      html, body, #root {
+        background-color: #020617 !important;
+        color: #f8fafc;
+        min-height: 100vh;
+        margin: 0;
+        padding: 0;
+      }
+    </style>
   </head>
-  <body>
-    <div id="root"></div>
+  <body class="bg-slate-950 text-slate-100 min-h-screen">
+    <div id="root" class="min-h-screen bg-slate-950 text-slate-100"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

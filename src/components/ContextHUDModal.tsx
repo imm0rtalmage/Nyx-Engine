@@ -1,6 +1,7 @@
 import React from "react";
 import { Brain, Layers, Sliders, Sparkles, User, X, Zap } from "lucide-react";
 import { CharacterProfile, Message } from "../types";
+import { computeGranularLoreContext } from "../lib/nyxLoreEngine";
 
 interface ContextHUDModalProps {
   isOpen: boolean;
@@ -25,53 +26,19 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
 }) => {
   if (!isOpen) return null;
 
-  const inSceneCharacters = characters.filter(
-    (c) => c.isInScene || c.type === "companion" || c.isPlayerCharacter
-  );
-  const outOfSceneCharacters = characters.filter(
-    (c) => !c.isInScene && c.type !== "companion" && !c.isPlayerCharacter
-  );
+  const {
+    pcEntities,
+    granularEntities,
+    activeLoreEntities,
+    remainingBackgroundLore,
+    estimatedTokens
+  } = computeGranularLoreContext(characters, messages, slidingTurnsLimit);
 
-  const recentTurnsText = messages
-    .slice(-5)
-    .map((m) => m.content)
-    .join(" ")
-    .toLowerCase();
-
-  const activeKeywordTriggers = outOfSceneCharacters.filter((c) => {
-    if (!c.name) return false;
-    const nameMatch = recentTurnsText.includes(c.name.toLowerCase());
-    const factionMatch =
-      c.factionName && recentTurnsText.includes(c.factionName.toLowerCase());
-    const keysMatch =
-      c.activationKeys &&
-      c.activationKeys.some(
-        (k) => k.trim() && recentTurnsText.includes(k.trim().toLowerCase())
-      );
-    return nameMatch || factionMatch || keysMatch;
-  });
-
-  const remainingBackgroundLore = outOfSceneCharacters.filter(
-    (c) => !activeKeywordTriggers.some((t) => t.id === c.id)
-  );
-
-  const estTier1Tokens =
-    characters.filter((c) => c.isPlayerCharacter).length * 350;
-  const estTier2Tokens =
-    characters.filter(
-      (c) => !c.isPlayerCharacter && (c.isInScene || c.type === "companion")
-    ).length * 300;
-  const estTier3Tokens = activeKeywordTriggers.length * 280;
-  const estTier4Tokens = remainingBackgroundLore.length * 25;
-  const estHistoryTokens = messages
-    .slice(-slidingTurnsLimit)
-    .reduce((acc, m) => acc + Math.round(m.content.length / 4), 0);
-  const estTotalContextTokens =
-    estTier1Tokens +
-    estTier2Tokens +
-    estTier3Tokens +
-    estTier4Tokens +
-    estHistoryTokens;
+  const estTier1Tokens = estimatedTokens.tier1Protagonist;
+  const estTier2Tokens = estimatedTokens.tier2DynamicContext;
+  const estTier4Tokens = estimatedTokens.tier4BackgroundIndex;
+  const estHistoryTokens = estimatedTokens.slidingHistory;
+  const estTotalContextTokens = estimatedTokens.total;
 
   return (
     <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
@@ -85,14 +52,14 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <h3 className="text-base font-bold text-slate-100 uppercase tracking-wider">
-                  2.0 Dynamic Memory & Context HUD
+                  Nyx Engine v2.0 Memory & Context HUD
                 </h3>
                 <span className="px-2 py-0.5 rounded-full text-[9px] font-mono bg-emerald-950 text-emerald-300 border border-emerald-800/60 font-bold">
-                  ACTIVE
+                  GRANULAR DECAY ACTIVE
                 </span>
               </div>
               <p className="text-xs text-slate-400 font-mono">
-                4-Tier Sliding Context & Dynamic Lorebook Injection Engine
+                Continuous Per-Turn Recency Decay & Dynamic Lorebook Injection Engine
               </p>
             </div>
           </div>
@@ -140,25 +107,25 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
 
             <div className="bg-slate-950/80 p-3.5 rounded-xl border border-slate-800 flex flex-col">
               <span className="text-[10px] uppercase font-mono text-slate-400">
-                Active In-Scene
+                Active Lore Entities
               </span>
               <span className="text-xl font-bold font-mono text-emerald-300 mt-1">
-                {inSceneCharacters.length}
+                {pcEntities.length + granularEntities.length}
               </span>
               <span className="text-[9px] text-slate-500 font-mono">
-                Tier 1 & Tier 2 entities
+                Injected in Context
               </span>
             </div>
 
             <div className="bg-slate-950/80 p-3.5 rounded-xl border border-slate-800 flex flex-col">
               <span className="text-[10px] uppercase font-mono text-slate-400">
-                Keyword Triggers
+                Dormant Lore Index
               </span>
               <span className="text-xl font-bold font-mono text-amber-300 mt-1">
-                {activeKeywordTriggers.length}
+                {remainingBackgroundLore.length}
               </span>
               <span className="text-[9px] text-slate-500 font-mono">
-                Tier 3 active lore
+                Background 1-line index
               </span>
             </div>
           </div>
@@ -171,8 +138,7 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
                 Sliding Context Window Size:
               </span>
               <span className="text-slate-400">
-                Controls how many recent message turns are sent directly to the
-                model.
+                Controls how many recent message turns are sent directly to the model.
               </span>
             </div>
             <div className="flex items-center gap-2">
@@ -191,25 +157,25 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
             </div>
           </div>
 
-          {/* 4-Tier Memory Hierarchy Breakdown */}
+          {/* Granular Memory Allocation Breakdown */}
           <div className="space-y-4">
             <h4 className="text-xs font-bold uppercase tracking-wider text-purple-400 font-mono flex items-center gap-1.5">
               <Layers size={13} />
-              <span>4-Tier Memory Allocation Breakdown</span>
+              <span>Granular Recency Memory Allocation</span>
             </h4>
 
-            {/* Tier 1: Player Characters */}
+            {/* Protagonist Anchor */}
             <div className="bg-slate-950/80 p-4 rounded-xl border border-purple-900/40 space-y-2">
               <div className="flex items-center justify-between flex-wrap gap-2 border-b border-slate-850 pb-2">
                 <div className="flex items-center gap-2">
                   <span className="px-2 py-0.5 rounded bg-purple-950 border border-purple-700 text-purple-300 text-[10px] font-bold font-mono">
-                    TIER 1
+                    PROTAGONIST
                   </span>
                   <span className="text-xs font-bold text-slate-200">
-                    Player Character (Protagonist)
+                    Player Character (Permanent Anchor)
                   </span>
                   <span className="text-[10px] text-purple-400 font-mono">
-                    (Permanent Anchor & Anti-Godmoding)
+                    (100% Immutable Anchor)
                   </span>
                 </div>
                 <span className="text-[10px] text-slate-400 font-mono">
@@ -217,37 +183,35 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
                 </span>
               </div>
               <div className="flex flex-wrap gap-2 pt-1">
-                {characters
-                  .filter((c) => c.isPlayerCharacter)
-                  .map((pc) => (
-                    <div
-                      key={pc.id}
-                      className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-purple-800/40"
-                    >
-                      <User size={13} className="text-purple-400" />
-                      <span className="text-xs font-bold text-purple-200">
-                        {pc.name}
-                      </span>
-                      <span className="text-[10px] text-slate-400 font-mono">
-                        ({pc.role})
-                      </span>
-                    </div>
-                  ))}
+                {pcEntities.map((pc) => (
+                  <div
+                    key={pc.id}
+                    className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-purple-800/40"
+                  >
+                    <User size={13} className="text-purple-400" />
+                    <span className="text-xs font-bold text-purple-200">
+                      {pc.name}
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-mono">
+                      ({pc.role || "Protagonist"})
+                    </span>
+                  </div>
+                ))}
               </div>
             </div>
 
-            {/* Tier 2: In-Scene Entities */}
+            {/* Granular Weighted Lore Entities */}
             <div className="bg-slate-950/80 p-4 rounded-xl border border-emerald-900/40 space-y-2">
               <div className="flex items-center justify-between flex-wrap gap-2 border-b border-slate-850 pb-2">
                 <div className="flex items-center gap-2">
                   <span className="px-2 py-0.5 rounded bg-emerald-950 border border-emerald-700 text-emerald-300 text-[10px] font-bold font-mono">
-                    TIER 2
+                    DYNAMIC CONTEXT
                   </span>
                   <span className="text-xs font-bold text-slate-200">
-                    Active In-Scene Presence
+                    Active Granular Sliding Lore
                   </span>
                   <span className="text-[10px] text-emerald-400 font-mono">
-                    (Full Dossier Injection)
+                    (Mathematically Scaled per Turn Distance)
                   </span>
                 </div>
                 <span className="text-[10px] text-slate-400 font-mono">
@@ -255,112 +219,58 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
                 </span>
               </div>
               <div className="flex flex-wrap gap-2 pt-1">
-                {characters
-                  .filter(
-                    (c) =>
-                      !c.isPlayerCharacter &&
-                      (c.isInScene || c.type === "companion")
-                  )
-                  .map((char) => (
+                {granularEntities.map((g) => {
+                  let badgeStyle = "bg-slate-800 text-slate-400";
+                  if (g.weightPercent >= 80) {
+                    badgeStyle = "bg-emerald-950 text-emerald-300 border border-emerald-800/60 font-bold";
+                  } else if (g.weightPercent >= 50) {
+                    badgeStyle = "bg-teal-950 text-teal-300 border border-teal-800/60 font-medium";
+                  } else if (g.weightPercent >= 25) {
+                    badgeStyle = "bg-amber-950 text-amber-300 border border-amber-800/60";
+                  } else {
+                    badgeStyle = "bg-slate-900 text-slate-500 border border-slate-800";
+                  }
+
+                  const distanceLabel = g.turnDistance === 0 ? "Current turn" : `${g.turnDistance} turn${g.turnDistance > 1 ? "s" : ""} ago`;
+
+                  return (
                     <div
-                      key={char.id}
-                      className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-emerald-800/40"
+                      key={g.entity.id}
+                      className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800"
                     >
-                      <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                      <span className="text-xs font-semibold text-emerald-200">
-                        {char.name}
+                      <Sparkles size={12} className={g.weightPercent >= 80 ? "text-emerald-400" : "text-amber-400"} />
+                      <span className="text-xs font-semibold text-slate-200">
+                        {g.entity.name}
                       </span>
-                      <span className="text-[10px] text-slate-400 font-mono">
-                        ({char.role || char.type})
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${badgeStyle}`}>
+                        {g.weightPercent}% weight
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onUpdateCharacter(char.id, { isInScene: false });
-                          onShowToast?.(
-                            "⚪ Scene Left",
-                            `"${char.name}" removed from scene.`,
-                            "info"
-                          );
-                        }}
-                        className="text-slate-500 hover:text-red-400 p-0.5 rounded ml-1 cursor-pointer"
-                        title="Move to background Lorebook"
-                      >
-                        <X size={10} />
-                      </button>
+                      <span className="text-[9px] text-slate-500 font-mono">
+                        ({distanceLabel})
+                      </span>
                     </div>
-                  ))}
-                {characters.filter(
-                  (c) =>
-                    !c.isPlayerCharacter &&
-                    (c.isInScene || c.type === "companion")
-                ).length === 0 && (
+                  );
+                })}
+                {granularEntities.length === 0 && (
                   <p className="text-xs text-slate-500 italic">
-                    No non-PC entities currently marked in-scene. Use the '+ Add
-                    Entity' button above chat or type /inscene [name].
+                    No off-scene lorebook entities currently detected in the sliding conversation window. As soon as you or Nyx mention someone, they will automatically activate and decay turn by turn.
                   </p>
                 )}
               </div>
             </div>
 
-            {/* Tier 3: Keyword-Triggered Lore */}
-            <div className="bg-slate-950/80 p-4 rounded-xl border border-amber-900/40 space-y-2">
-              <div className="flex items-center justify-between flex-wrap gap-2 border-b border-slate-850 pb-2">
-                <div className="flex items-center gap-2">
-                  <span className="px-2 py-0.5 rounded bg-amber-950 border border-amber-700 text-amber-300 text-[10px] font-bold font-mono">
-                    TIER 3
-                  </span>
-                  <span className="text-xs font-bold text-slate-200">
-                    Keyword-Triggered Lore
-                  </span>
-                  <span className="text-[10px] text-amber-400 font-mono">
-                    (Dynamic Activation via Recent Turns)
-                  </span>
-                </div>
-                <span className="text-[10px] text-slate-400 font-mono">
-                  ~{estTier3Tokens} tokens
-                </span>
-              </div>
-              <div className="flex flex-wrap gap-2 pt-1">
-                {activeKeywordTriggers.map((char) => (
-                  <div
-                    key={char.id}
-                    className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-amber-800/40"
-                  >
-                    <Sparkles size={11} className="text-amber-400 shrink-0" />
-                    <span className="text-xs font-semibold text-amber-200">
-                      {char.name}
-                    </span>
-                    <span className="text-[10px] text-slate-400 font-mono">
-                      ({char.role || char.type})
-                    </span>
-                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 font-mono border border-amber-800/50">
-                      Detected in Turn History
-                    </span>
-                  </div>
-                ))}
-                {activeKeywordTriggers.length === 0 && (
-                  <p className="text-xs text-slate-500 italic">
-                    No off-scene lorebook keywords detected in the last 5 turns.
-                    When you or Nyx mention an off-scene character, vehicle, or
-                    location, it will automatically activate here.
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {/* Tier 4: Background Lorebook Index */}
+            {/* Background Lorebook Index */}
             <div className="bg-slate-950/80 p-4 rounded-xl border border-slate-800 space-y-2">
               <div className="flex items-center justify-between flex-wrap gap-2 border-b border-slate-850 pb-2">
                 <div className="flex items-center gap-2">
                   <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-400 text-[10px] font-bold font-mono">
-                    TIER 4
+                    DORMANT REGISTRY
                   </span>
                   <span className="text-xs font-bold text-slate-200">
-                    Background Lorebook Index
+                    Background World Lore Index
                   </span>
                   <span className="text-[10px] text-slate-500 font-mono">
-                    (Condensed 1-Line Reference)
+                    (0% Token Waste / 1-Line Reference)
                   </span>
                 </div>
                 <span className="text-[10px] text-slate-400 font-mono">
@@ -378,8 +288,7 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
                 ))}
                 {remainingBackgroundLore.length === 0 && (
                   <p className="text-xs text-slate-500 italic">
-                    All lorebook entities are currently promoted to Tier 1, 2, or
-                    3.
+                    All entities in this project are currently active in context.
                   </p>
                 )}
               </div>
@@ -396,25 +305,25 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
               <div className="p-2 rounded bg-slate-900/80 border border-slate-800 flex items-center justify-between">
                 <span className="text-purple-300 font-bold">/inscene &lt;name&gt;</span>
                 <span className="text-[10px] text-slate-400">
-                  Move entity to active scene
+                  Mention/activate entity
                 </span>
               </div>
               <div className="p-2 rounded bg-slate-900/80 border border-slate-800 flex items-center justify-between">
                 <span className="text-purple-300 font-bold">/leave &lt;name&gt;</span>
                 <span className="text-[10px] text-slate-400">
-                  Return entity to lorebook
+                  Decay entity from scene
                 </span>
               </div>
               <div className="p-2 rounded bg-slate-900/80 border border-slate-800 flex items-center justify-between">
                 <span className="text-purple-300 font-bold">/scene</span>
                 <span className="text-[10px] text-slate-400">
-                  List all in-scene entities
+                  List all active context entities
                 </span>
               </div>
               <div className="p-2 rounded bg-slate-900/80 border border-slate-800 flex items-center justify-between">
                 <span className="text-purple-300 font-bold">/clearscene</span>
                 <span className="text-[10px] text-slate-400">
-                  Reset scene to solo PC
+                  Reset active context to PC only
                 </span>
               </div>
             </div>

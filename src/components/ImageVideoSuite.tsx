@@ -77,7 +77,11 @@ export default function ImageVideoSuite({
         return prev.filter(r => r !== imgUrl);
       }
       if (prev.length >= 14) {
-        alert("Maximum 14 reference images allowed!");
+        if (onShowToast) {
+          onShowToast("Reference Limit", "Maximum 14 reference images allowed.", "info");
+        } else {
+          console.warn("Maximum 14 reference images allowed!");
+        }
         return prev;
       }
       return [...prev, imgUrl];

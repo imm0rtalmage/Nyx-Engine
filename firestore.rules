@@ -19,54 +19,49 @@ service cloud.firestore {
 
     // Validation Blueprint for Projects
     function isValidProject(data) {
-      return (!('id' in data) || data.id is string)
-        && data.name is string
-        && data.name.size() > 0
-        && data.name.size() <= 256;
+      return (!('id' in data) || data.id == null || data.id is string)
+        && (!('name' in data) || (data.name is string && data.name.size() > 0 && data.name.size() <= 256));
     }
 
     // Validation Blueprint for Messages
     function isValidMessage(data) {
-      return (!('id' in data) || data.id is string)
-        && data.role is string
-        && (data.role == "user" || data.role == "nyx" || data.role == "assistant")
-        && data.content is string;
+      return (!('id' in data) || data.id == null || data.id is string)
+        && (!('role' in data) || (data.role is string && (data.role == "user" || data.role == "nyx" || data.role == "assistant")))
+        && (!('content' in data) || data.content is string);
     }
 
     // Validation Blueprint for Prompts
     function isValidPrompt(data) {
-      return (!('id' in data) || data.id is string)
-        && data.title is string
-        && data.title.size() > 0
-        && data.promptText is string;
+      return (!('id' in data) || data.id == null || data.id is string)
+        && (!('title' in data) || (data.title is string && data.title.size() > 0))
+        && (!('promptText' in data) || data.promptText is string);
     }
 
     // Validation Blueprint for Characters
     function isValidCharacter(data) {
-      return (!('id' in data) || data.id is string)
-        && data.name is string
-        && data.name.size() > 0;
+      return (!('id' in data) || data.id == null || data.id is string)
+        && (!('name' in data) || (data.name is string && data.name.size() > 0));
     }
 
     // Validation Blueprint for KeepNote
     function isValidNote(data) {
-      return (!('id' in data) || data.id is string)
-        && data.title is string
-        && data.content is string;
+      return (!('id' in data) || data.id == null || data.id is string)
+        && (!('title' in data) || data.title is string)
+        && (!('content' in data) || data.content is string);
     }
 
     // Validation Blueprint for KeepTask
     function isValidTask(data) {
-      return (!('id' in data) || data.id is string)
-        && data.text is string
-        && data.completed is bool;
+      return (!('id' in data) || data.id == null || data.id is string)
+        && (!('text' in data) || data.text is string)
+        && (!('completed' in data) || data.completed is bool);
     }
 
     // Validation Blueprint for GeneratedImage
     function isValidImage(data) {
-      return (!('id' in data) || data.id is string)
-        && data.url is string
-        && data.prompt is string;
+      return (!('id' in data) || data.id == null || data.id is string)
+        && (!('url' in data) || data.url is string)
+        && (!('prompt' in data) || data.prompt is string);
     }
 
     // ----------------------------------------------------

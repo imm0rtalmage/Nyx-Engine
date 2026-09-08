@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { 
-  Project, Message, PromptVaultItem, GeneratedImage, KeepNote, KeepTask, CharacterProfile, SyncActivityLog, RelationshipTrack, LoreSource 
+  Project, Message, GeneratedImage, KeepNote, KeepTask, CharacterProfile, SyncActivityLog, RelationshipTrack, LoreSource 
 } from "./types";
 import { 
   auth, db, googleProvider, googleDriveProvider, signInWithPopup, signOut, onAuthStateChanged,
@@ -18,17 +18,21 @@ import AdventureChat from "./components/AdventureChat";
 import NarrativeSuite from "./components/NarrativeSuite";
 import ImageVideoSuite from "./components/ImageVideoSuite";
 import WorkspaceSync from "./components/WorkspaceSync";
-import PromptVault from "./components/PromptVault";
 import { StoryArchiveModal } from "./components/StoryArchiveModal";
 import { StudioAssistantSidebar } from "./components/StudioAssistantSidebar";
+import { MobileWorldSettings } from "./components/MobileWorldSettings";
 import { createGoogleDoc } from "./utils/googleWorkspace";
 import { ParsedMessage } from "./utils/domParser";
 import { safeFetchJson } from "./utils/apiClient";
 import { 
   Sparkles, Layers, BookOpen, FileText, Image as ImageIcon, 
-  Settings, LogIn, LogOut, Plus, Globe, Trash2, CheckCircle, RefreshCw, FolderOpen,
-  Check, X, Edit3, Copy
+  LogIn, LogOut, Plus, Globe, Trash2, FolderOpen,
+  Check, X, Edit3, Copy, Smartphone, Monitor,
+  Cloud, RefreshCw
 } from "lucide-react";
+
+import { cleanForFirestore } from "./lib/firebase";
+export { cleanForFirestore };
 
 const DEFAULT_INITIAL_PROJECT: Project = {
   id: "proj-default-nyx",
@@ -39,8 +43,8 @@ const DEFAULT_INITIAL_PROJECT: Project = {
   customInstructions: "",
   narrationStyle: "Vivid novel-grade detail",
   narrativePerspective: "third_person",
-  pacing: "Balanced",
-  emotionalTone: "Dramatic / Atmospheric",
+  pacing: "Default to Author(s)",
+  emotionalTone: "Default to Author(s)",
   canonSource: "Custom Core",
   styleGuide: "",
   storyModules: "",
@@ -52,7 +56,8 @@ const DEFAULT_INITIAL_PROJECT: Project = {
   chatBubbleStyle: "glass",
   sources: [],
   persistentContext: "",
-  plotOverview: ""
+  plotOverview: "",
+  turnHeader: ""
 };
 
 function sanitizeProjects(rawList: any[]): Project[] {
@@ -73,8 +78,8 @@ function sanitizeProjects(rawList: any[]): Project[] {
       creatorNames: p?.creatorNames || "Custom Authors",
       customInstructions: p?.customInstructions || "",
       narrationStyle: p?.narrationStyle || "Vivid novel-grade detail",
-      pacing: p?.pacing || "Balanced",
-      emotionalTone: p?.emotionalTone || "Dramatic / Atmospheric",
+      pacing: p?.pacing || "Default to Author(s)",
+      emotionalTone: p?.emotionalTone || "Default to Author(s)",
       canonSource: p?.canonSource || "Custom Core",
       styleGuide: p?.styleGuide || "",
       storyModules: p?.storyModules || "",
@@ -83,7 +88,8 @@ function sanitizeProjects(rawList: any[]): Project[] {
       ragSummary: p?.ragSummary || "",
       themeId: p?.themeId || "slate",
       chatBgPreset: p?.chatBgPreset || "none",
-      chatBubbleStyle: p?.chatBubbleStyle || "glass"
+      chatBubbleStyle: p?.chatBubbleStyle || "glass",
+      turnHeader: typeof p?.turnHeader === "string" ? p.turnHeader : ""
     } as Project;
   });
   return sanitized.length > 0 ? sanitized : [DEFAULT_INITIAL_PROJECT];
@@ -222,14 +228,12 @@ export function loadAllProjectsSafely(currentUid?: string): Project[] {
         }
 
         // Reconstruct campaigns from messages/characters keys
-        if (k.startsWith("local_messages_") || k.startsWith("local_characters_") || k.startsWith("local_prompts_")) {
+        if (k.startsWith("local_messages_") || k.startsWith("local_characters_")) {
           const inferredId = k
             .replace("local_messages_backup_", "")
             .replace("local_messages_", "")
             .replace("local_characters_backup_", "")
-            .replace("local_characters_", "")
-            .replace("local_prompts_backup_", "")
-            .replace("local_prompts_", "");
+            .replace("local_characters_", "");
 
           if (inferredId && !seenIds.has(inferredId)) {
             const rawVal = safeLocalStorage.getItem(k);
@@ -355,32 +359,6 @@ export function loadProjectMessagesSafely(projectId: string, projectName?: strin
   return [];
 }
 
-export function loadProjectPromptsSafely(projectId: string): PromptVaultItem[] {
-  if (!projectId) return [];
-  try {
-    const primaryStr = safeLocalStorage.getItem(`local_prompts_${projectId}`);
-    if (primaryStr !== null) {
-      try {
-        const parsed = JSON.parse(primaryStr);
-        if (Array.isArray(parsed)) return parsed;
-      } catch {}
-    }
-    const backupStr = safeLocalStorage.getItem(`local_prompts_backup_${projectId}`);
-    if (backupStr !== null) {
-      try {
-        const parsed = JSON.parse(backupStr);
-        if (Array.isArray(parsed)) {
-          safeLocalStorage.setItem(`local_prompts_${projectId}`, backupStr);
-          return parsed;
-        }
-      } catch {}
-    }
-  } catch (e) {
-    console.error("Error in loadProjectPromptsSafely:", e);
-  }
-  return [];
-}
-
 export function loadProjectCharactersSafely(projectId: string): CharacterProfile[] {
   if (!projectId) return [];
   try {
@@ -444,6 +422,39 @@ export default function App() {
   const [isSigningIn, setIsSigningIn] = useState(false);
   const loadedProjectIdRef = React.useRef<string>("");
   const [activeTab, setActiveTab] = useState<"chat" | "editor" | "image" | "workspace">("chat");
+
+  // Streamlined Mobile Mode state: specifically focuses into Narration, Assistant, and World Settings
+  const [isMobileLite, setIsMobileLite] = useState<boolean>(() => {
+    try {
+      const saved = safeLocalStorage.getItem("nyx_mobile_compact_mode") || safeLocalStorage.getItem("nyx_mobile_lite_mode");
+      if (saved !== null) return saved === "true";
+      return typeof window !== "undefined" && window.innerWidth < 768;
+    } catch {
+      return false;
+    }
+  });
+
+  const [mobileLiteTab, setMobileLiteTab] = useState<"chat" | "assistant" | "settings">("chat");
+
+  const toggleMobileLiteMode = () => {
+    setIsMobileLite(prev => {
+      const next = !prev;
+      try {
+        safeLocalStorage.setItem("nyx_mobile_compact_mode", String(next));
+      } catch (e) {
+        // ignore
+      }
+      showToast(
+        next ? "📱 Streamlined Mobile View Active" : "💻 Full Studio Mode Active",
+        next 
+          ? "Streamlined interface focused on Narration, Assistant, and World Settings." 
+          : "Full desktop suite with Narrative Editing, Image Generator, and Workspace Sync enabled.",
+        "info"
+      );
+      return next;
+    });
+  };
+
   const [isOnline, setIsOnline] = useState<boolean>(() => {
     return typeof navigator !== "undefined" ? navigator.onLine : true;
   });
@@ -494,16 +505,6 @@ export default function App() {
       const activeId = (lastUid ? safeLocalStorage.getItem(`local_activeProjectId_${lastUid}`) : null) || safeLocalStorage.getItem("local_activeProjectId") || "";
       if (activeId) {
         return loadProjectMessagesSafely(activeId);
-      }
-    } catch {}
-    return [];
-  });
-  const [prompts, setPrompts] = useState<PromptVaultItem[]>(() => {
-    try {
-      const lastUid = safeLocalStorage.getItem("nyx_last_user_uid");
-      const activeId = (lastUid ? safeLocalStorage.getItem(`local_activeProjectId_${lastUid}`) : null) || safeLocalStorage.getItem("local_activeProjectId") || "";
-      if (activeId) {
-        return loadProjectPromptsSafely(activeId);
       }
     } catch {}
     return [];
@@ -596,10 +597,6 @@ export default function App() {
           safeLocalStorage.setItem(`local_messages_${prevProjectId}`, JSON.stringify(messages));
           safeLocalStorage.setItem(`local_messages_backup_${prevProjectId}`, JSON.stringify(messages));
         }
-        if (prompts.length > 0) {
-          safeLocalStorage.setItem(`local_prompts_${prevProjectId}`, JSON.stringify(prompts));
-          safeLocalStorage.setItem(`local_prompts_backup_${prevProjectId}`, JSON.stringify(prompts));
-        }
         if (characters.length > 0) {
           safeLocalStorage.setItem(`local_characters_${prevProjectId}`, JSON.stringify(characters));
           safeLocalStorage.setItem(`local_characters_backup_${prevProjectId}`, JSON.stringify(characters));
@@ -609,11 +606,9 @@ export default function App() {
       // Now load target project's data cleanly
       const targetProj = projects.find(p => p.id === activeProjectId);
       const loadedMsgs = loadProjectMessagesSafely(activeProjectId, targetProj?.name);
-      const loadedPrompts = loadProjectPromptsSafely(activeProjectId);
       const loadedChars = loadProjectCharactersSafely(activeProjectId);
 
       setMessages(loadedMsgs);
-      setPrompts(loadedPrompts);
       setCharacters(loadedChars);
 
       currentDataProjectIdRef.current = activeProjectId;
@@ -649,16 +644,6 @@ export default function App() {
       }
     }
   }, [messages, activeProjectId]);
-
-  // Persist active prompts safely
-  useEffect(() => {
-    if (activeProjectId && currentDataProjectIdRef.current === activeProjectId) {
-      safeLocalStorage.setItem(`local_prompts_${activeProjectId}`, JSON.stringify(prompts));
-      if (prompts.length > 0) {
-        safeLocalStorage.setItem(`local_prompts_backup_${activeProjectId}`, JSON.stringify(prompts));
-      }
-    }
-  }, [prompts, activeProjectId]);
 
   // Persist active characters safely
   useEffect(() => {
@@ -767,90 +752,6 @@ export default function App() {
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editingTitleText, setEditingTitleText] = useState("");
 
-  // 1b. Polling Interval for Chrome Extension Direct Synced Ingestion
-  useEffect(() => {
-    if (!activeProjectId || !user) return;
-
-    const interval = setInterval(async () => {
-      try {
-        if (!isOnline) return;
-        const response = await fetch(`/api/projects/${activeProjectId}/import-queue`);
-        if (!response.ok) return;
-        const data = await response.json();
-
-        if (data.hasData && Array.isArray(data.messages) && data.messages.length > 0) {
-          showToast(
-            "⚡ Extension Import Synced!",
-            `Successfully loaded ${data.messages.length} external chat messages into active campaign!`,
-            "success"
-          );
-
-          const colRef = collection(db, `users/${user.uid}/projects/${activeProjectId}/messages`);
-          
-          // Write messages to Firestore client-side
-          const writePromises = data.messages.map((msg: any, idx: number) => {
-            const msgId = `imported_${Date.now()}_${idx}`;
-            const activeProj = projects.find(p => p.id === activeProjectId);
-            const userNickname = activeProj?.userNickname || "commander";
-            
-            // Check if speaker is player or user
-            const speakerLower = msg.speaker.toLowerCase();
-            const isPlayer = speakerLower.includes("user") || 
-                            speakerLower.includes("player") || 
-                            speakerLower.includes(userNickname.toLowerCase());
-            const role = isPlayer ? "user" : "nyx";
-
-            const newMsg = {
-              id: msgId,
-              role,
-              content: msg.content,
-              timestamp: msg.timestamp || new Date(Date.now() + idx * 1000).toISOString(),
-              speakerIds: []
-            };
-            return setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, msgId), newMsg);
-          });
-
-          await Promise.all(writePromises);
-
-          // Auto backup to Google Doc if connected
-          const activeProj = projects.find(p => p.id === activeProjectId);
-          if (googleToken && activeProj) {
-            try {
-              // Construct whole chronicle transcript
-              const compiledTranscript = [...messages, ...data.messages.map((m: any) => ({ role: m.speaker, content: m.content }))]
-                .map(m => `[${m.role}] ${m.content}`)
-                .join("\n\n");
-
-              const newDocId = await createGoogleDoc(
-                googleToken,
-                `[SSoT] ${activeProj.name} - Campaign Chronicle`,
-                compiledTranscript
-              );
-
-              // Update linked GDocs
-              const existingGDocs = activeProj.linkedGDocs || [];
-              if (!existingGDocs.includes(newDocId)) {
-                await handleSetProjectValue("linkedGDocs", [newDocId, ...existingGDocs]);
-              }
-              showToast(
-                "📄 GDoc SSoT Updated!",
-                "Campaign Single Source of Truth Google Doc automatically compiled and uploaded.",
-                "info"
-              );
-            } catch (errG) {
-              console.error("GDoc SSoT auto-backup failed:", errG);
-            }
-          }
-        }
-      } catch (err) {
-        // Quietly handle connection lapses during container restart or boot
-        console.debug("Background poll pending connection...", err);
-      }
-    }, 4000);
-
-    return () => clearInterval(interval);
-  }, [user, activeProjectId, googleToken, messages, projects]);
-
   // Background Sync: Auto-sync any unsynced local campaigns, characters, messages & notes to Firestore
   const syncLocalDataToFirestore = async (currentUser: any, forceSyncAll: boolean = false) => {
     if (!currentUser) return;
@@ -912,23 +813,14 @@ export default function App() {
           syncedToCloud: true
         };
 
-        await setDoc(projRef, cleanedProj, { merge: true });
+        await setDoc(projRef, cleanForFirestore(cleanedProj), { merge: true });
 
         // 2. Sync active chat messages
         const messagesList = loadProjectMessagesSafely(lp.id, lp.name);
         for (const m of messagesList) {
           if (m && m.id) {
             const mRef = doc(db, `users/${currentUser.uid}/projects/${lp.id}/messages`, m.id);
-            await setDoc(mRef, m, { merge: true });
-          }
-        }
-
-        // 3. Sync active prompts
-        const promptsList = loadProjectPromptsSafely(lp.id);
-        for (const p of promptsList) {
-          if (p && p.id) {
-            const pRef = doc(db, `users/${currentUser.uid}/projects/${lp.id}/prompts`, p.id);
-            await setDoc(pRef, p, { merge: true });
+            await setDoc(mRef, cleanForFirestore(m), { merge: true }).catch(console.warn);
           }
         }
 
@@ -937,7 +829,7 @@ export default function App() {
         for (const c of charsList) {
           if (c && c.id) {
             const cRef = doc(db, `users/${currentUser.uid}/projects/${lp.id}/characters`, c.id);
-            await setDoc(cRef, c, { merge: true });
+            await setDoc(cRef, cleanForFirestore(c), { merge: true }).catch(console.warn);
           }
         }
 
@@ -951,7 +843,7 @@ export default function App() {
           const notesList: KeepNote[] = JSON.parse(savedNotes);
           for (const n of notesList) {
             if (n && n.id) {
-              await setDoc(doc(db, `users/${currentUser.uid}/notes`, n.id), n, { merge: true });
+              await setDoc(doc(db, `users/${currentUser.uid}/notes`, n.id), cleanForFirestore(n), { merge: true }).catch(console.warn);
             }
           }
         } catch {}
@@ -963,7 +855,7 @@ export default function App() {
           const tasksList: KeepTask[] = JSON.parse(savedTasks);
           for (const t of tasksList) {
             if (t && t.id) {
-              await setDoc(doc(db, `users/${currentUser.uid}/tasks`, t.id), t, { merge: true });
+              await setDoc(doc(db, `users/${currentUser.uid}/tasks`, t.id), cleanForFirestore(t), { merge: true }).catch(console.warn);
             }
           }
         } catch {}
@@ -975,10 +867,15 @@ export default function App() {
           const galleryList: GeneratedImage[] = JSON.parse(savedGallery);
           for (const g of galleryList) {
             if (g && g.id) {
-              await setDoc(doc(db, `users/${currentUser.uid}/gallery`, g.id), g, { merge: true });
+              await setDoc(doc(db, `users/${currentUser.uid}/gallery`, g.id), cleanForFirestore(g), { merge: true }).catch(console.warn);
             }
           }
         } catch {}
+      }
+
+      // Sync active project id to user profile
+      if (activeProjectId) {
+        await setDoc(doc(db, `users/${currentUser.uid}`), cleanForFirestore({ activeProjectId }), { merge: true }).catch(console.warn);
       }
 
       // Update local storage marked as synced
@@ -1004,6 +901,41 @@ export default function App() {
     } catch (err: any) {
       console.error("Local sync to Firestore failed:", err);
       showToast("Sync Notice", "Some offline projects could not be fully synced online: " + err.message, "error");
+    }
+  };
+
+  const [isSyncingDesktop, setIsSyncingDesktop] = useState(false);
+
+  // Manual or automatic desktop & cloud synchronization trigger
+  const handleSyncWithDesktop = async () => {
+    if (!user) {
+      handleGoogleSignIn();
+      return;
+    }
+    setIsSyncingDesktop(true);
+    try {
+      showToast("☁️ Desktop Sync", "Synchronizing all campaigns, stories, and characters with desktop...", "info");
+      await syncLocalDataToFirestore(user, true);
+      
+      // Also check user profile active project from cloud
+      try {
+        const userSnap = await getDoc(doc(db, `users/${user.uid}`));
+        if (userSnap.exists() && userSnap.data()?.activeProjectId) {
+          const cloudActiveId = userSnap.data().activeProjectId;
+          if (cloudActiveId && cloudActiveId !== activeProjectId) {
+            setActiveProjectId(cloudActiveId);
+          }
+        }
+      } catch (errUserSnap) {
+        console.warn("Could not query user doc activeProjectId:", errUserSnap);
+      }
+
+      showToast("✅ Synced with Desktop", "All campaigns, transcripts, and settings are up to date!", "success");
+    } catch (err: any) {
+      console.error("Sync with desktop error:", err);
+      showToast("Sync Notice", "Sync completed: " + (err?.message || err), "info");
+    } finally {
+      setIsSyncingDesktop(false);
     }
   };
 
@@ -1102,6 +1034,18 @@ export default function App() {
 
         return sanitizeProjects(combined);
       });
+
+      // Automatically select desktop synced project if current project is default initial placeholder
+      setActiveProjectId((prev) => {
+        if (!prev || prev === "proj-initial" || prev === "proj-default-nyx") {
+          const desktopProj = projs.find(p => p.id !== "proj-initial" && p.id !== "proj-default-nyx");
+          if (desktopProj) {
+            return desktopProj.id;
+          }
+        }
+        return prev;
+      });
+
       setIsInitialLoad(false);
       setIsConnectingEngine(false);
     }, (error) => {
@@ -1168,15 +1112,20 @@ export default function App() {
   useEffect(() => {
     if (!user || !activeProjectId) return;
 
-    // A. Sync active chat messages
+    // A. Sync active chat messages (sort in-memory for resilience across date formats)
     const qMessages = query(
-      collection(db, `users/${user.uid}/projects/${activeProjectId}/messages`),
-      orderBy("timestamp", "asc")
+      collection(db, `users/${user.uid}/projects/${activeProjectId}/messages`)
     );
     const unsubMessages = onSnapshot(qMessages, (snap) => {
       const list: Message[] = [];
       snap.forEach((doc) => {
         list.push({ id: doc.id, ...doc.data() } as Message);
+      });
+
+      list.sort((a, b) => {
+        const tA = typeof a.timestamp === "number" ? a.timestamp : new Date(a.timestamp || 0).getTime();
+        const tB = typeof b.timestamp === "number" ? b.timestamp : new Date(b.timestamp || 0).getTime();
+        return tA - tB;
       });
 
       if (list.length > 0) {
@@ -1195,7 +1144,7 @@ export default function App() {
           loadedProjectIdRef.current = activeProjectId;
           // Sync local messages up to Firestore cloud so they remain backed up in both places
           for (const m of localMsgs) {
-            setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, m.id), m).catch(console.warn);
+            setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, m.id), cleanForFirestore(m)).catch(console.warn);
           }
         } else {
           setMessages([]);
@@ -1203,34 +1152,6 @@ export default function App() {
       }
     }, (err) => {
       console.warn("Firestore messages snapshot error (using local storage fallback):", err?.message);
-    });
-
-    // B. Sync active prompt vault items
-    const qPrompts = query(
-      collection(db, `users/${user.uid}/projects/${activeProjectId}/prompts`)
-    );
-    const unsubPrompts = onSnapshot(qPrompts, (snap) => {
-      const list: PromptVaultItem[] = [];
-      snap.forEach((doc) => {
-        list.push({ id: doc.id, ...doc.data() } as PromptVaultItem);
-      });
-      if (list.length > 0) {
-        setPrompts(list);
-        safeLocalStorage.setItem(`local_prompts_${activeProjectId}`, JSON.stringify(list));
-        safeLocalStorage.setItem(`local_prompts_backup_${activeProjectId}`, JSON.stringify(list));
-      } else {
-        const localPrompts = loadProjectPromptsSafely(activeProjectId);
-        if (localPrompts.length > 0) {
-          setPrompts(localPrompts);
-          for (const p of localPrompts) {
-            setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/prompts`, p.id), p).catch(console.warn);
-          }
-        } else {
-          setPrompts([]);
-        }
-      }
-    }, (err) => {
-      console.warn("Firestore prompts snapshot error:", err?.message);
     });
 
     // C. Sync active character profiles
@@ -1263,7 +1184,6 @@ export default function App() {
 
     return () => {
       unsubMessages();
-      unsubPrompts();
       unsubCharacters();
     };
   }, [user, activeProjectId]);
@@ -1282,11 +1202,9 @@ export default function App() {
       
       const targetProj = sanitized.find(p => p.id === targetId);
       const loadedMsgs = loadProjectMessagesSafely(targetId, targetProj?.name);
-      const loadedPrompts = loadProjectPromptsSafely(targetId);
       const loadedChars = loadProjectCharactersSafely(targetId);
 
       setMessages(loadedMsgs);
-      setPrompts(loadedPrompts);
       setCharacters(loadedChars);
 
       currentDataProjectIdRef.current = targetId;
@@ -1472,8 +1390,6 @@ export default function App() {
         // Explicitly initialize local storage to empty arrays so no scanners grab foreign data
         safeLocalStorage.setItem(`local_messages_${newId}`, JSON.stringify([]));
         safeLocalStorage.setItem(`local_messages_backup_${newId}`, JSON.stringify([]));
-        safeLocalStorage.setItem(`local_prompts_${newId}`, JSON.stringify([]));
-        safeLocalStorage.setItem(`local_prompts_backup_${newId}`, JSON.stringify([]));
         safeLocalStorage.setItem(`local_characters_${newId}`, JSON.stringify([]));
         safeLocalStorage.setItem(`local_characters_backup_${newId}`, JSON.stringify([]));
 
@@ -1482,7 +1398,6 @@ export default function App() {
 
         // Reset in-memory state cleanly for blank project
         setMessages([]);
-        setPrompts([]);
         setCharacters([]);
 
         setProjects(prev => [...prev, created]);
@@ -1500,8 +1415,6 @@ export default function App() {
         // Explicitly initialize local storage to empty arrays
         safeLocalStorage.setItem(`local_messages_${newId}`, JSON.stringify([]));
         safeLocalStorage.setItem(`local_messages_backup_${newId}`, JSON.stringify([]));
-        safeLocalStorage.setItem(`local_prompts_${newId}`, JSON.stringify([]));
-        safeLocalStorage.setItem(`local_prompts_backup_${newId}`, JSON.stringify([]));
         safeLocalStorage.setItem(`local_characters_${newId}`, JSON.stringify([]));
         safeLocalStorage.setItem(`local_characters_backup_${newId}`, JSON.stringify([]));
 
@@ -1510,7 +1423,6 @@ export default function App() {
 
         // Reset in-memory state cleanly for blank project
         setMessages([]);
-        setPrompts([]);
         setCharacters([]);
 
         setProjects(prev => {
@@ -1570,7 +1482,7 @@ export default function App() {
 
     if (user && targetId) {
       const docRef = doc(db, `users/${user.uid}/projects`, targetId);
-      setDoc(docRef, { [key]: normalizedVal }, { merge: true }).catch((err) => {
+      setDoc(docRef, cleanForFirestore({ [key]: normalizedVal }), { merge: true }).catch((err) => {
         console.warn("Firestore project value sync warning:", err);
       });
     }
@@ -1627,7 +1539,6 @@ export default function App() {
     
     // Clean up local storage items associated with this project
     safeLocalStorage.removeItem(`local_messages_${id}`);
-    safeLocalStorage.removeItem(`local_prompts_${id}`);
     safeLocalStorage.removeItem(`local_characters_${id}`);
 
     const updated = projects.filter(p => p.id !== id);
@@ -1656,6 +1567,11 @@ export default function App() {
     const updated = [...messages, injectedMsg];
     setMessages(updated);
 
+    if (isMobileLite) {
+      setMobileLiteTab("chat");
+      showToast("✨ Injected into Narration", "Assistant content added directly to active story chat.", "info");
+    }
+
     if (user && activeProjectId) {
       setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, injectedMsg.id), injectedMsg).catch((err) => {
         console.warn("Firestore save injected message failed:", err);
@@ -1669,13 +1585,25 @@ export default function App() {
     if (!activeProj) return;
 
     // Use active character ID if set, fallback to Sammy Chrome or first character
-    const defaultSpeakerId = activeProj.activeCharacterId || characters.find(c => c.role.toLowerCase().includes("protagonist") || c.name.toLowerCase().includes("sammy"))?.id || characters[0]?.id;
+    const defaultSpeakerId = activeProj.activeCharacterId || (characters || []).find(c => 
+      (c && typeof c.role === "string" && c.role.toLowerCase().includes("protagonist")) || 
+      (c && typeof c.name === "string" && c.name.toLowerCase().includes("sammy"))
+    )?.id || characters[0]?.id;
 
+    const userEstimatedTokens = Math.max(1, Math.round(text.length / 3.8) + ((attachments && attachments.length > 0) ? attachments.length * 260 : 0));
     const userMsg: Message = {
       id: `msg-user-${Date.now()}`,
       role: "user",
       content: text,
       timestamp: new Date().toISOString(),
+      tokensUsed: userEstimatedTokens,
+      tokenBreakdown: {
+        inputTokens: userEstimatedTokens,
+        retrievalTokens: 0,
+        thinkingTokens: 0,
+        outputTokens: 0,
+        totalTokens: userEstimatedTokens
+      },
       speakerIds: defaultSpeakerId ? [defaultSpeakerId] : [],
       attachments: attachments || []
     };
@@ -1715,6 +1643,7 @@ export default function App() {
         signal: controller.signal,
         body: JSON.stringify({
           messages: updatedMessages,
+          slidingContextTurns: activeProj.slidingContextTurns ?? 12,
           customInstructions: activeProj.customInstructions,
           thinkingLevel,
           creatorNames: activeProj.creatorNames,
@@ -1729,22 +1658,24 @@ export default function App() {
           storyModules: activeProj.storyModules,
           persistentContext: activeProj.persistentContext || "",
           plotOverview: activeProj.plotOverview || "",
-          activeSources: (activeProj.sources || []).filter((s: any) => s.isActive !== false).map((s: any) => ({
+          activeSources: (activeProj.sources || []).map((s: any) => ({
             id: s.id,
             name: s.name,
             type: s.type,
-            isActive: s.isActive,
             summary: s.summary,
             extra: s.extra,
             fileMimeType: s.fileMimeType || s.mimeType || s.extra?.fileMimeType || s.extra?.mimeType || (s.type === "image" || s.type === "photo" ? "image/png" : undefined),
             fileBase64: s.fileBase64 || s.url || s.extra?.fileBase64 || s.extra?.url || (s.content?.startsWith("data:") ? s.content : undefined),
             content: s.content ? (s.content.length > 20000 ? s.content.substring(0, 20000) + "..." : s.content) : ""
           })),
-          characters: characters || [],
+          characters: (characters || []).map((c: any) => ({
+            ...c,
+            portraitUrl: c.portraitUrl && c.portraitUrl.startsWith("data:") ? undefined : c.portraitUrl
+          })),
           notes: notes || [],
           googleToken: googleToken || ""
         }),
-        timeout: 120000
+        timeout: 240000
       });
 
       // Process database actions triggered by Gemini tools
@@ -1774,8 +1705,8 @@ export default function App() {
           if (action.action === "create") {
             const targetName = (args.name || "").trim().toLowerCase();
             const existingByName = characters.find(
-              c => (targetName && c.name.trim().toLowerCase() === targetName) ||
-                   (args.type === "pc" && (c.isPlayerCharacter || c.type === "pc"))
+              c => c && ((targetName && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === targetName) ||
+                   (args.type === "pc" && (c.isPlayerCharacter || c.type === "pc")))
             );
 
             if (existingByName) {
@@ -1823,15 +1754,15 @@ export default function App() {
             const targetId = (args.id || "").trim();
             const targetName = (args.name || "").trim().toLowerCase();
 
-            let existing = characters.find(c => c.id === targetId);
+            let existing = characters.find(c => c && c.id === targetId);
             if (!existing && targetName) {
-              existing = characters.find(c => c.name.trim().toLowerCase() === targetName);
+              existing = characters.find(c => c && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === targetName);
             }
             if (!existing && targetId) {
-              existing = characters.find(c => c.name.trim().toLowerCase() === targetId.toLowerCase());
+              existing = characters.find(c => c && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === targetId.toLowerCase());
             }
             if (!existing && (args.type === "pc" || targetId.toLowerCase().includes("pc") || targetName.includes("pc"))) {
-              existing = characters.find(c => c.isPlayerCharacter || c.type === "pc");
+              existing = characters.find(c => c && (c.isPlayerCharacter || c.type === "pc"));
             }
             if (!existing && (args.type === "pc" || characters.length === 1)) {
               existing = characters[0];
@@ -1887,7 +1818,7 @@ export default function App() {
           } else if (action.action === "delete") {
             const targetId = (args.id || "").trim();
             const targetName = (args.name || "").trim().toLowerCase();
-            const existing = characters.find(c => c.id === targetId || (targetName && c.name.toLowerCase() === targetName));
+            const existing = characters.find(c => c && (c.id === targetId || (targetName && c.name && typeof c.name === "string" && c.name.toLowerCase() === targetName)));
             if (existing) {
               await handleDeleteCharacter(existing.id);
               showToast("🗑️ Lore Entity Removed", `Deleted "${existing.name}" from lore database.`, "info");
@@ -1924,42 +1855,26 @@ export default function App() {
         });
       }
 
-      // Auto detect mentioned characters in Nyx's reply to place their portraits
       const replyText = data.text || "";
-      const detectedSpeakerIds: string[] = [];
-      (characters || []).forEach(char => {
-        if (!char.name) return;
-        try {
-          // Escape any special regex characters in the character's name to prevent syntax errors
-          const escapedName = char.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const regex = new RegExp(`\\b${escapedName}\\b`, 'i');
-          if (regex.test(replyText)) {
-            detectedSpeakerIds.push(char.id);
-          }
-        } catch (e) {
-          // Robust fallback to simple inclusion check
-          if (replyText.toLowerCase().includes(char.name.toLowerCase())) {
-            detectedSpeakerIds.push(char.id);
-          }
-        }
-      });
-
-      // If no characters match, but the text has "Nyx" or is DM, use Nyx character ID
-      if (detectedSpeakerIds.length === 0) {
-        const nyxChar = characters.find(c => c.name.toLowerCase().includes("nyx"));
-        if (nyxChar) {
-          detectedSpeakerIds.push(nyxChar.id);
-        }
-      }
-
+      const isAnomaly = Boolean(data.isTimelineAnomaly || replyText.includes("brief disturbance in the timeline") || replyText.includes("unexpected anomaly rippled"));
       const nyxMsg: Message = {
         id: `msg-nyx-${Date.now()}`,
         role: "nyx",
         content: replyText,
         timestamp: new Date().toISOString(),
         chainOfThought: data.chainOfThought,
-        tokensUsed: data.usage?.totalTokens || 2400,
-        speakerIds: detectedSpeakerIds
+        tokensUsed: data.tokenBreakdown?.totalTokens || data.usage?.totalTokens || 2400,
+        tokenBreakdown: data.tokenBreakdown || (data.usage ? {
+          inputTokens: data.usage.inputTokens,
+          retrievalTokens: data.usage.retrievalTokens || 0,
+          thinkingTokens: data.usage.thinkingTokens || 0,
+          outputTokens: data.usage.outputTokens,
+          totalTokens: data.usage.totalTokens
+        } : undefined),
+        speakerIds: [],
+        contextEntities: data.inContextEntities || [],
+        isTimelineAnomaly: isAnomaly,
+        retrySeconds: data.retrySeconds || (isAnomaly ? 20 : undefined)
       };
 
       setMessages(prev => [...prev, nyxMsg]);
@@ -2045,7 +1960,17 @@ export default function App() {
       }
     }
 
-    if (historyOfMessages.length === 0) return;
+    if (historyOfMessages.length === 0) {
+      historyOfMessages = [
+        {
+          id: `msg-seed-${Date.now()}`,
+          role: "user",
+          content: "Begin the campaign narrative scene.",
+          timestamp: new Date().toISOString(),
+          speakerIds: []
+        }
+      ];
+    }
 
     setIsGeneratingChat(true);
     const controller = new AbortController();
@@ -2058,6 +1983,7 @@ export default function App() {
         signal: controller.signal,
         body: JSON.stringify({
           messages: historyOfMessages,
+          slidingContextTurns: activeProj.slidingContextTurns ?? 12,
           customInstructions: activeProj.customInstructions,
           thinkingLevel,
           creatorNames: activeProj.creatorNames,
@@ -2072,22 +1998,24 @@ export default function App() {
           storyModules: activeProj.storyModules,
           persistentContext: activeProj.persistentContext || "",
           plotOverview: activeProj.plotOverview || "",
-          activeSources: (activeProj.sources || []).filter((s: any) => s.isActive !== false).map((s: any) => ({
+          activeSources: (activeProj.sources || []).map((s: any) => ({
             id: s.id,
             name: s.name,
             type: s.type,
-            isActive: s.isActive,
             summary: s.summary,
             extra: s.extra,
             fileMimeType: s.fileMimeType || s.mimeType || s.extra?.fileMimeType || s.extra?.mimeType || (s.type === "image" || s.type === "photo" ? "image/png" : undefined),
             fileBase64: s.fileBase64 || s.url || s.extra?.fileBase64 || s.extra?.url || (s.content?.startsWith("data:") ? s.content : undefined),
             content: s.content ? (s.content.length > 20000 ? s.content.substring(0, 20000) + "..." : s.content) : ""
           })),
-          characters: characters || [],
+          characters: (characters || []).map((c: any) => ({
+            ...c,
+            portraitUrl: c.portraitUrl && c.portraitUrl.startsWith("data:") ? undefined : c.portraitUrl
+          })),
           notes: notes || [],
           googleToken: googleToken || ""
         }),
-        timeout: 120000
+        timeout: 240000
       });
 
       if (data.queriedDocs && Array.isArray(data.queriedDocs)) {
@@ -2104,30 +2032,6 @@ export default function App() {
       }
 
       const replyText = data.text && data.text.trim() ? data.text : "[Nyx: Scene narration updated.]";
-      const detectedSpeakerIds: string[] = [];
-
-      (characters || []).forEach(char => {
-        if (!char.name) return;
-        try {
-          const escapedName = char.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const regex = new RegExp(`\\b${escapedName}\\b`, 'i');
-          if (regex.test(replyText)) {
-            detectedSpeakerIds.push(char.id);
-          }
-        } catch (e) {
-          if (replyText.toLowerCase().includes(char.name.toLowerCase())) {
-            detectedSpeakerIds.push(char.id);
-          }
-        }
-      });
-
-      if (detectedSpeakerIds.length === 0) {
-        const nyxChar = characters.find(c => c.name.toLowerCase().includes("nyx"));
-        if (nyxChar) {
-          detectedSpeakerIds.push(nyxChar.id);
-        }
-      }
-
       let updatedTargetMsg: Message | null = null;
       const insertIndex = historyOfMessages.length;
 
@@ -2142,33 +2046,51 @@ export default function App() {
               timestamp: msg.timestamp,
               chainOfThought: msg.chainOfThought,
               tokensUsed: msg.tokensUsed,
-              speakerIds: msg.speakerIds
+              tokenBreakdown: msg.tokenBreakdown,
+              speakerIds: msg.speakerIds || [],
+              contextEntities: msg.contextEntities
             };
 
             const currentVersions = msg.versions && msg.versions.length > 0 
               ? [...msg.versions] 
               : [originalVersion];
 
+            const resolvedBreakdown = data.tokenBreakdown || (data.usage ? {
+              inputTokens: data.usage.inputTokens,
+              retrievalTokens: data.usage.retrievalTokens || 0,
+              thinkingTokens: data.usage.thinkingTokens || 0,
+              outputTokens: data.usage.outputTokens,
+              totalTokens: data.usage.totalTokens
+            } : undefined);
+            const resolvedTokens = resolvedBreakdown?.totalTokens || data.usage?.totalTokens || 2400;
+
             const newVersion = {
               id: `ver-${Date.now()}`,
               content: replyText,
               timestamp: new Date().toISOString(),
               chainOfThought: data.chainOfThought,
-              tokensUsed: data.usage?.totalTokens || 2400,
-              speakerIds: detectedSpeakerIds
+              tokensUsed: resolvedTokens,
+              tokenBreakdown: resolvedBreakdown,
+              speakerIds: [],
+              contextEntities: data.inContextEntities || []
             };
 
             const updatedVersions = [...currentVersions, newVersion];
             const newActiveIndex = updatedVersions.length - 1;
+            const isAnomaly = Boolean(data.isTimelineAnomaly || replyText.includes("brief disturbance in the timeline") || replyText.includes("unexpected anomaly rippled"));
 
             const updatedMsg: Message = {
               ...msg,
               content: replyText,
               chainOfThought: data.chainOfThought,
-              tokensUsed: data.usage?.totalTokens || 2400,
-              speakerIds: detectedSpeakerIds,
+              tokensUsed: resolvedTokens,
+              tokenBreakdown: resolvedBreakdown,
+              speakerIds: [],
+              contextEntities: data.inContextEntities || [],
               versions: updatedVersions,
-              activeVersionIndex: newActiveIndex
+              activeVersionIndex: newActiveIndex,
+              isTimelineAnomaly: isAnomaly,
+              retrySeconds: data.retrySeconds || (isAnomaly ? 20 : undefined)
             };
             updatedTargetMsg = updatedMsg;
             return updatedMsg;
@@ -2180,14 +2102,28 @@ export default function App() {
           return nextList;
         } else {
           // Target not found or targetNyxMsgId was null: Append/insert brand new nyx message at insertIndex
+          const resolvedBreakdown = data.tokenBreakdown || (data.usage ? {
+            inputTokens: data.usage.inputTokens,
+            retrievalTokens: data.usage.retrievalTokens || 0,
+            thinkingTokens: data.usage.thinkingTokens || 0,
+            outputTokens: data.usage.outputTokens,
+            totalTokens: data.usage.totalTokens
+          } : undefined);
+          const resolvedTokens = resolvedBreakdown?.totalTokens || data.usage?.totalTokens || 2400;
+          const isAnomaly = Boolean(data.isTimelineAnomaly || replyText.includes("brief disturbance in the timeline") || replyText.includes("unexpected anomaly rippled"));
+
           const newNyxMsg: Message = {
             id: `nyx-${Date.now()}`,
             role: "nyx",
             content: replyText,
             timestamp: new Date().toISOString(),
             chainOfThought: data.chainOfThought,
-            tokensUsed: data.usage?.totalTokens || 2400,
-            speakerIds: detectedSpeakerIds
+            tokensUsed: resolvedTokens,
+            tokenBreakdown: resolvedBreakdown,
+            speakerIds: [],
+            contextEntities: data.inContextEntities || [],
+            isTimelineAnomaly: isAnomaly,
+            retrySeconds: data.retrySeconds || (isAnomaly ? 20 : undefined)
           };
           updatedTargetMsg = newNyxMsg;
           
@@ -2209,7 +2145,7 @@ export default function App() {
         return;
       }
       console.error(err);
-      alert(`Narrator generation failed: ${err.message || err}`);
+      showToast("Storyteller Error", `Narrator generation failed: ${err.message || err}`, "error");
     } finally {
       if (chatAbortControllerRef.current === controller) {
         chatAbortControllerRef.current = null;
@@ -2229,7 +2165,8 @@ export default function App() {
           content: ver.content,
           chainOfThought: ver.chainOfThought,
           tokensUsed: ver.tokensUsed,
-          speakerIds: ver.speakerIds
+          speakerIds: ver.speakerIds,
+          contextEntities: ver.contextEntities
         };
         // Save to firestore in background
         if (user && activeProjectId) {
@@ -2372,30 +2309,6 @@ export default function App() {
     const updatedSources = [newSource, ...existingSources.filter(s => s.id !== sourceId)];
     
     await handleSetProjectValue("sources", updatedSources);
-  };
-
-  // Prompt Vault controls
-  const handleAddPrompt = async (character: string, folder: string, title: string, text: string) => {
-    const newItem: Omit<PromptVaultItem, "id"> = {
-      characterName: character,
-      folder,
-      title,
-      promptText: text
-    };
-
-    if (user && activeProjectId) {
-      await addDoc(collection(db, `users/${user.uid}/projects/${activeProjectId}/prompts`), newItem);
-    } else {
-      const localItem: PromptVaultItem = { id: `prompt-${Date.now()}`, ...newItem };
-      setPrompts([...prompts, localItem]);
-    }
-  };
-
-  const handleDeletePrompt = async (id: string) => {
-    setPrompts(prompts.filter(p => p.id !== id));
-    if (user && activeProjectId) {
-      await deleteDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/prompts`, id));
-    }
   };
 
   // Image & Video Generations
@@ -2586,9 +2499,10 @@ export default function App() {
 
     // 1. Optimistically update local React state immediately so UI and tools have instant access
     setCharacters(prev => {
-      const exists = prev.some(c => c.id === localId || (c.name.trim().toLowerCase() === name.trim().toLowerCase() && c.type === defaultType));
+      const cleanName = typeof name === "string" ? name.trim().toLowerCase() : "";
+      const exists = prev.some(c => c && (c.id === localId || (cleanName && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === cleanName && c.type === defaultType)));
       if (exists) {
-        return prev.map(c => (c.id === localId || (c.name.trim().toLowerCase() === name.trim().toLowerCase() && c.type === defaultType)) ? { ...c, ...newItem } : c);
+        return prev.map(c => (c && (c.id === localId || (cleanName && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === cleanName && c.type === defaultType))) ? { ...c, ...newItem } : c);
       }
       return [...prev, newItem];
     });
@@ -2631,7 +2545,7 @@ export default function App() {
   const handleUpdateCharacter = async (id: string, updates: Partial<CharacterProfile>) => {
     // 1. Update React state immediately
     setCharacters(prev => prev.map(c => {
-      if (c.id === id || (updates.name && c.name.trim().toLowerCase() === updates.name.trim().toLowerCase())) {
+      if (c && (c.id === id || (updates.name && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === updates.name.trim().toLowerCase()))) {
         const mergedCustomFields = updates.customFields !== undefined 
           ? { ...(c.customFields || {}), ...updates.customFields }
           : c.customFields;
@@ -2660,35 +2574,27 @@ export default function App() {
     }
   };
 
-  const handleUpdateMessageSpeakers = async (messageId: string, speakerIds: string[]) => {
-    const updated = messages.map(m => m.id === messageId ? { ...m, speakerIds } : m);
-    setMessages(updated);
-
-    if (user && activeProjectId) {
-      try {
-        const docRef = doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, messageId);
-        setDoc(docRef, { speakerIds }, { merge: true }).catch(err => {
-          console.warn("Firestore update message speakers failed:", err);
-        });
-      } catch (err) {
-        console.warn("Firestore update message speakers error:", err);
-      }
-    }
-  };
-
   const [navigationTarget, setNavigationTarget] = useState<any>(null);
   const [isCinemaMode, setIsCinemaMode] = useState(false);
 
   const handleNavigateToItem = (target: any) => {
-    if (target?.targetTab) {
-      setActiveTab(target.targetTab);
+    if (isMobileLite) {
+      if (target?.targetTab === "workspace" || target?.targetTab === "editor" || target?.targetTab === "image") {
+        setMobileLiteTab("settings");
+      } else {
+        setMobileLiteTab("chat");
+      }
     } else {
-      setActiveTab("chat");
+      if (target?.targetTab) {
+        setActiveTab(target.targetTab);
+      } else {
+        setActiveTab("chat");
+      }
     }
     setNavigationTarget({ ...target, timestamp: Date.now() });
   };
 
-  const activeProject = projects.find(p => p.id === activeProjectId) || projects[0];
+  const activeProject = (projects && projects.length > 0 ? (projects.find(p => p && p.id === activeProjectId) || projects[0]) : null) || DEFAULT_INITIAL_PROJECT;
 
   // Dynamically update browser tab title based on open campaign/project
   useEffect(() => {
@@ -2726,383 +2632,568 @@ export default function App() {
           {!isCinemaMode && (
             <>
               {/* GLOBAL HEADER */}
-              <header className="border-b border-slate-800 bg-slate-900/60 backdrop-blur px-6 py-4 flex flex-col sm:flex-row justify-between items-center gap-4">
-            <div className="flex items-center gap-3">
-              <div className="relative">
-                <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-purple-600 to-pink-500 flex items-center justify-center font-bold text-white shadow shadow-purple-950">
-                  N
+              <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur px-3 sm:px-6 py-2.5 sm:py-3.5 flex flex-col gap-2 sm:gap-3">
+                {/* Row 1: Brand, Desktop Sync, Mode Switcher, and Auth */}
+                <div className="flex items-center justify-between gap-2 w-full">
+                  {/* Brand & Connection Status */}
+                  <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+                    <div className="relative">
+                      <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-full bg-gradient-to-tr from-purple-600 to-pink-500 flex items-center justify-center font-bold text-white shadow shadow-purple-950 text-xs sm:text-sm">
+                        N
+                      </div>
+                      {/* Dynamic Status dot */}
+                      <div
+                        className={`absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full border-2 border-slate-900 ${
+                          !isOnline
+                            ? "bg-red-500 animate-pulse"
+                            : isSyncingDesktop
+                            ? "bg-cyan-400 animate-ping"
+                            : user
+                            ? isConnectingEngine
+                              ? "bg-amber-500 animate-pulse"
+                              : "bg-emerald-500"
+                            : "bg-blue-400"
+                        }`}
+                        title={!isOnline ? "Offline" : user ? "Connected & Cloud Synced" : "Guest Mode"}
+                      />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-1.5">
+                        <h1 className="text-sm sm:text-base font-semibold tracking-tight text-slate-100">NYX</h1>
+                        <span className="text-[9px] font-mono px-1 py-0.2 bg-purple-950/70 border border-purple-800/40 text-purple-300 rounded">
+                          v2.4
+                        </span>
+                      </div>
+                      <p className="text-[9.5px] sm:text-[10px] text-slate-400 font-mono hidden xs:block truncate max-w-[180px] sm:max-w-none">
+                        DM Assistant & Novel Generator
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* System & Sync Controls */}
+                  <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                    {/* SYNC WITH DESKTOP BUTTON */}
+                    <button
+                      type="button"
+                      onClick={handleSyncWithDesktop}
+                      disabled={isSyncingDesktop || !isOnline}
+                      className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg text-xs font-mono font-medium transition-all cursor-pointer border ${
+                        isSyncingDesktop
+                          ? "bg-purple-950 text-purple-200 border-purple-500/60 shadow-sm"
+                          : user
+                          ? "bg-slate-950/90 hover:bg-purple-950/60 text-slate-300 hover:text-purple-200 border-slate-800 hover:border-purple-700/50 shadow-xs"
+                          : "bg-slate-950 text-slate-400 hover:text-slate-200 border-slate-800"
+                      }`}
+                      title="Sync with Desktop (Transfers latest stories, campaigns, notes & settings)"
+                    >
+                      <Cloud size={13} className={isSyncingDesktop ? "animate-pulse text-cyan-400" : "text-purple-400"} />
+                      <span className="hidden sm:inline">{isSyncingDesktop ? "Syncing..." : "Sync Desktop"}</span>
+                      <span className="sm:hidden">{isSyncingDesktop ? "..." : "Sync"}</span>
+                    </button>
+
+                    {/* LITE MOBILE / FULL STUDIO MODE TOGGLE */}
+                    <button
+                      type="button"
+                      onClick={toggleMobileLiteMode}
+                      className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg text-xs font-mono transition-all cursor-pointer border shrink-0 ${
+                        isMobileLite
+                          ? "bg-purple-900/90 hover:bg-purple-850 border-purple-500 text-purple-100 font-bold shadow-xs shadow-purple-950"
+                          : "bg-slate-950 hover:bg-slate-900 border-slate-800 text-slate-300 hover:text-white"
+                      }`}
+                      title={isMobileLite ? "Switch to Studio Mode (Multi-panel desktop layout)" : "Switch to Lite Mobile Mode (Narration, Assistant, World Settings)"}
+                    >
+                      {isMobileLite ? <Smartphone size={13} className="text-purple-300 shrink-0" /> : <Monitor size={13} className="text-slate-400 shrink-0" />}
+                      <span className="whitespace-nowrap">{isMobileLite ? "Lite" : "Studio"}</span>
+                    </button>
+
+                    {/* USER AUTH */}
+                    {user ? (
+                      <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                        <div className="hidden lg:block text-right">
+                          <p className="text-xs text-slate-300 font-semibold truncate max-w-[130px]">{user.displayName || user.email}</p>
+                          <p className="text-[9px] font-mono text-emerald-400">Desktop Synced</p>
+                        </div>
+
+                        {/* Drive Badge */}
+                        {googleToken ? (
+                          <span
+                            className="hidden md:inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono bg-blue-950/60 border border-blue-800/60 text-blue-300 shrink-0"
+                            title="Google Drive permissions granted and active"
+                          >
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" /> Drive
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={handleGoogleDriveSignIn}
+                            disabled={!isOnline}
+                            className="hidden md:inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono bg-blue-600 hover:bg-blue-700 text-white transition-all shadow-xs shrink-0 cursor-pointer"
+                            title="Connect Google Drive"
+                          >
+                            <FolderOpen size={11} /> Drive
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={handleLogout}
+                          disabled={!isOnline}
+                          className="p-1.5 sm:p-2 rounded-lg transition-colors border bg-slate-950 hover:bg-slate-900 text-slate-400 hover:text-red-400 border-slate-800 shrink-0 cursor-pointer"
+                          title="Sign Out"
+                          aria-label="Sign Out"
+                        >
+                          <LogOut size={13} />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={handleGoogleSignIn}
+                        disabled={!isOnline}
+                        className="text-xs font-semibold px-2.5 sm:px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors bg-purple-600 hover:bg-purple-700 text-white shadow-xs shrink-0 cursor-pointer"
+                      >
+                        <LogIn size={13} /> <span className="hidden xs:inline">Sign In</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
-                 {/* Dynamic Status dot */}
-                 <div className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-slate-900 ${
-                   !isOnline
-                     ? "bg-red-500 animate-pulse"
-                     : user 
-                       ? isConnectingEngine 
-                         ? "bg-amber-500 animate-pulse" 
-                         : "bg-green-500" 
-                       : "bg-blue-400"
-                 }`} />
-              </div>
-              <div>
-                <h1 className="text-md font-sans font-semibold tracking-tight text-slate-200">NYX</h1>
-                <p className="text-[10px] text-slate-400 font-mono">Real-Time DM Dashboard & Creative Novel Generator</p>
-              </div>
-            </div>
 
-            {/* MIDDLE SECTION: ACTIVE PROJECT SELECTOR */}
-            <div className="flex items-center gap-2 bg-slate-950/60 px-4 py-2 rounded-xl border border-slate-850">
-              <Globe size={14} className="text-purple-400 shrink-0" />
+                {/* Row 2: Active Campaign Selector and Fast Campaign Tools */}
+                <div className="flex items-center gap-1.5 sm:gap-2 bg-slate-950/80 px-2.5 sm:px-3 py-1.5 rounded-xl border border-slate-800/80 w-full overflow-hidden">
+                  <Globe size={13} className="text-purple-400 shrink-0" />
 
-              {isEditingTitle ? (
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handleSaveTitle();
-                  }}
-                  className="flex items-center gap-1.5"
-                >
-                  <input
-                    type="text"
-                    value={editingTitleText}
-                    onChange={(e) => setEditingTitleText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
+                  {isEditingTitle ? (
+                    <form
+                      onSubmit={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
                         handleSaveTitle();
-                      } else if (e.key === "Escape") {
-                        e.preventDefault();
-                        setIsEditingTitle(false);
-                      }
-                    }}
-                    autoFocus
-                    className="bg-slate-900 border border-purple-500 rounded-lg px-2.5 py-1 text-xs text-slate-100 outline-none w-44 sm:w-56 font-semibold shadow-inner focus:border-purple-400"
-                    placeholder="Campaign Name..."
-                  />
-                  <button
-                    type="submit"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      handleSaveTitle();
-                    }}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      handleSaveTitle();
-                    }}
-                    className="text-emerald-400 hover:text-emerald-300 bg-emerald-950/60 hover:bg-emerald-900/80 border border-emerald-700/60 p-1.5 rounded-lg transition-colors cursor-pointer flex items-center justify-center shrink-0 shadow-sm"
-                    title="Confirm Name Change (Enter)"
-                    aria-label="Confirm Name Change"
-                  >
-                    <Check size={14} className="stroke-[2.5]" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      setIsEditingTitle(false);
-                    }}
-                    className="text-slate-400 hover:text-slate-200 bg-slate-900 hover:bg-slate-800 border border-slate-800 p-1.5 rounded-lg transition-colors cursor-pointer flex items-center justify-center shrink-0"
-                    title="Cancel (Esc)"
-                    aria-label="Cancel"
-                  >
-                    <X size={14} />
-                  </button>
-                </form>
-              ) : (
-                <div className="flex items-center gap-1.5">
-                  <select
-                    value={activeProjectId || ""}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (val === "new" || val === "") {
+                      }}
+                      className="flex-1 flex items-center gap-1.5 min-w-0"
+                    >
+                      <input
+                        type="text"
+                        value={editingTitleText}
+                        onChange={(e) => setEditingTitleText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            handleSaveTitle();
+                          } else if (e.key === "Escape") {
+                            e.preventDefault();
+                            setIsEditingTitle(false);
+                          }
+                        }}
+                        autoFocus
+                        className="bg-slate-900 border border-purple-500 rounded-lg px-2 py-0.5 text-xs text-slate-100 outline-none flex-1 font-semibold shadow-inner focus:border-purple-400 min-w-0"
+                        placeholder="Campaign Name..."
+                      />
+                      <button
+                        type="submit"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          handleSaveTitle();
+                        }}
+                        className="text-emerald-400 hover:text-emerald-300 bg-emerald-950/60 hover:bg-emerald-900/80 border border-emerald-700/60 p-1 rounded-lg transition-colors cursor-pointer flex items-center justify-center shrink-0 shadow-xs"
+                        title="Confirm Name Change (Enter)"
+                        aria-label="Confirm Name Change"
+                      >
+                        <Check size={13} className="stroke-[2.5]" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setIsEditingTitle(false);
+                        }}
+                        className="text-slate-400 hover:text-slate-200 bg-slate-900 hover:bg-slate-800 border border-slate-800 p-1 rounded-lg transition-colors cursor-pointer flex items-center justify-center shrink-0"
+                        title="Cancel (Esc)"
+                        aria-label="Cancel"
+                      >
+                        <X size={13} />
+                      </button>
+                    </form>
+                  ) : (
+                    <div className="flex-1 flex items-center gap-1.5 min-w-0">
+                      <select
+                        value={activeProjectId || ""}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (val === "new" || val === "") {
+                            setNewProjName("");
+                            setNewProjSetting("");
+                            setNewProjNickname("");
+                            setShowNewProjModal(true);
+                          } else if (val === "recover-shima") {
+                            handleRestoreOrCreateCampaign("Shima");
+                          } else if (val === "rescan-all") {
+                            handleDeepScanAndRecover();
+                          } else if (val === "sync-cloud") {
+                            handleSyncWithDesktop();
+                          } else if (val) {
+                            setActiveProjectId(val);
+                          }
+                        }}
+                        className="bg-transparent text-xs font-semibold text-slate-300 outline-none cursor-pointer flex-1 min-w-0 truncate"
+                      >
+                        {projects.length === 0 ? (
+                          <option value="" className="bg-slate-950 text-slate-300">
+                            Nyx Roleplay Campaign
+                          </option>
+                        ) : (
+                          <>
+                            {projects.map(p => {
+                              const displayName = p.name?.trim() || p.setting?.trim() || "Nyx Roleplay Campaign";
+                              return (
+                                <option key={p.id} value={p.id} className="bg-slate-950 text-slate-300">
+                                  {displayName}
+                                </option>
+                              );
+                            })}
+                            <option value="new" className="bg-slate-950 text-purple-400 font-semibold">
+                              + Create New Campaign...
+                            </option>
+                            <option value="sync-cloud" className="bg-emerald-950 text-emerald-300 font-semibold">
+                              ☁️ Sync All Campaigns with Desktop ({projects.length})
+                            </option>
+                            {!projects.some(p => p.name.toLowerCase().includes("shima")) && (
+                              <option value="recover-shima" className="bg-purple-950 text-purple-300 font-semibold">
+                                🌟 Restore & Open "Shima"
+                              </option>
+                            )}
+                            <option value="rescan-all" className="bg-slate-950 text-cyan-400 font-mono text-[11px]">
+                              🔍 Scan & Recover Missing Campaigns
+                            </option>
+                          </>
+                        )}
+                      </select>
+
+                      {activeProject && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingTitleText(activeProject.name?.trim() || "Nyx Roleplay Campaign");
+                            setIsEditingTitle(true);
+                          }}
+                          className="text-slate-400 hover:text-purple-300 p-1 rounded transition-colors shrink-0 cursor-pointer"
+                          title="Rename Active Campaign"
+                        >
+                          <Edit3 size={12} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Campaign Action Buttons */}
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => {
                         setNewProjName("");
                         setNewProjSetting("");
                         setNewProjNickname("");
                         setShowNewProjModal(true);
-                      } else if (val === "recover-shima") {
-                        handleRestoreOrCreateCampaign("Shima");
-                      } else if (val === "rescan-all") {
-                        handleDeepScanAndRecover();
-                      } else if (val === "sync-cloud") {
-                        if (user) {
-                          syncLocalDataToFirestore(user, true);
-                        } else {
-                          handleGoogleSignIn();
-                        }
-                      } else if (val) {
-                        setActiveProjectId(val);
-                      }
-                    }}
-                    className="bg-transparent text-xs font-semibold text-slate-300 outline-none cursor-pointer max-w-[180px] sm:max-w-[260px] truncate"
-                  >
-                    {projects.length === 0 ? (
-                      <option value="" className="bg-slate-950 text-slate-300">
-                        Nyx Roleplay Campaign
-                      </option>
-                    ) : (
-                      <>
-                        {projects.map(p => {
-                          const displayName = p.name?.trim() || p.setting?.trim() || "Nyx Roleplay Campaign";
-                          return (
-                            <option key={p.id} value={p.id} className="bg-slate-950 text-slate-300">
-                              {displayName}
-                            </option>
-                          );
-                        })}
-                        <option value="new" className="bg-slate-950 text-purple-400 font-semibold">
-                          + Create Project...
-                        </option>
-                        {user ? (
-                          <option value="sync-cloud" className="bg-emerald-950 text-emerald-300 font-semibold">
-                            ☁️ Push All Local Campaigns to Cloud ({projects.length})
-                          </option>
-                        ) : (
-                          <option value="sync-cloud" className="bg-emerald-950 text-emerald-300 font-semibold">
-                            🔑 Sign In to Sync All Campaigns Online
-                          </option>
-                        )}
-                        {!projects.some(p => p.name.toLowerCase().includes("shima")) && (
-                          <option value="recover-shima" className="bg-purple-950 text-purple-300 font-semibold">
-                            🌟 Restore & Open "Shima"
-                          </option>
-                        )}
-                        <option value="rescan-all" className="bg-slate-950 text-cyan-400 font-mono text-[11px]">
-                          🔍 Scan & Recover Missing Campaigns
-                        </option>
-                      </>
-                    )}
-                  </select>
+                      }}
+                      className="p-1 text-purple-400 hover:text-purple-300 hover:bg-purple-950/60 rounded transition-colors cursor-pointer"
+                      title="Create New Campaign"
+                    >
+                      <Plus size={14} />
+                    </button>
 
-                  {activeProject && (
                     <button
                       type="button"
-                      onClick={() => {
-                        setEditingTitleText(activeProject.name?.trim() || "Nyx Roleplay Campaign");
-                        setIsEditingTitle(true);
-                      }}
-                      className="text-slate-400 hover:text-purple-300 p-1 rounded transition-colors shrink-0"
-                      title="Rename Active Project"
+                      onClick={() => setShowStoryArchiveModal(true)}
+                      className="flex items-center gap-1 px-1.5 sm:px-2 py-0.5 rounded-md text-[10px] font-mono bg-purple-950/60 hover:bg-purple-900/80 border border-purple-800/60 text-purple-300 transition-colors shadow-xs cursor-pointer"
+                      title="Browse and restore saved story transcripts and campaign logs"
                     >
-                      <Edit3 size={13} />
+                      <BookOpen size={11} className="text-purple-400 shrink-0" />
+                      <span className="hidden sm:inline">Archives</span>
                     </button>
-                  )}
-                </div>
-              )}
 
-              {activeProjectId && (
-                <button
-                  onClick={() => setConfirmDeleteProjId(activeProjectId)}
-                  className="text-red-400 hover:text-red-300 p-0.5 rounded transition-colors ml-1 shrink-0"
-                  title="Delete Active Project"
-                >
-                  <Trash2 size={13} />
-                </button>
-              )}
-              <button
-                onClick={() => {
-                  setNewProjName("");
-                  setNewProjSetting("");
-                  setNewProjNickname("");
-                  setShowNewProjModal(true);
-                }}
-                className="text-purple-400 hover:text-purple-300 p-0.5 rounded transition-colors ml-0.5 shrink-0"
-                title="New Project"
-              >
-                <Plus size={15} />
-              </button>
-
-              <button
-                onClick={() => setShowStoryArchiveModal(true)}
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-mono bg-purple-950/60 hover:bg-purple-900/80 border border-purple-800/60 text-purple-300 transition-colors shadow-sm cursor-pointer ml-1"
-                title="Browse and restore saved story transcripts and campaign logs"
-              >
-                <BookOpen size={11} className="text-purple-400" />
-                <span className="hidden sm:inline">Archives</span>
-              </button>
-            </div>
-
-            {/* USER AUTH CONTROLS */}
-            <div className="flex items-center gap-3">
-              {user ? (
-                <div className="flex items-center gap-2.5">
-                  <div className="hidden md:block text-right">
-                    <p className="text-xs text-slate-300 font-semibold">{user.displayName || user.email}</p>
-                    <p className={`text-[9px] font-mono ${!isOnline ? "text-red-400 font-bold" : isConnectingEngine ? "text-amber-400 animate-pulse" : "text-green-400"}`}>
-                      {!isOnline ? "Offline (Local Sandbox)" : isConnectingEngine ? "Connecting Engine..." : "Cloud Sync Connected"}
-                    </p>
+                    {activeProjectId && (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteProjId(activeProjectId)}
+                        className="p-1 text-slate-500 hover:text-red-400 hover:bg-red-950/30 rounded transition-colors cursor-pointer"
+                        title="Delete Active Campaign"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    )}
                   </div>
-
-                  {/* Google Drive Authorization Badge / Connect Button */}
-                  {googleToken ? (
-                    <span
-                      className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-mono bg-blue-950/60 border border-blue-800/60 text-blue-300 shrink-0"
-                      title="Google Drive permissions granted and active"
-                    >
-                      <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" /> Drive Connected
-                    </span>
-                  ) : (
-                    <button
-                      onClick={handleGoogleDriveSignIn}
-                      disabled={!isOnline}
-                      className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-mono bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white transition-all shadow shadow-blue-950 shrink-0 cursor-pointer"
-                      title="Authorize Google Drive access for dynamic document sync"
-                    >
-                      <FolderOpen size={11} /> Connect Drive
-                    </button>
-                  )}
-
-                  <button
-                    onClick={handleLogout}
-                    disabled={!isOnline}
-                    className={`p-2 rounded-lg transition-colors border ${!isOnline ? "bg-slate-900 border-slate-850 text-slate-600 cursor-not-allowed" : "bg-slate-850 hover:bg-slate-800 text-slate-400 hover:text-red-400 border-slate-800"}`}
-                    title={!isOnline ? "Unavailable Offline" : "Logout"}
-                  >
-                    <LogOut size={14} />
-                  </button>
                 </div>
+              </header>
+
+              {/* OFFLINE STATUS BANNER */}
+              {!isOnline && (
+                <div className="bg-amber-500/10 border-b border-amber-500/20 px-4 sm:px-6 py-2 text-xs flex items-center justify-between gap-4 text-amber-200">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-2 w-2 relative">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+                    </span>
+                    <span>
+                      <strong>Offline Sandbox:</strong> Offline mode is active. Changes to campaigns, characters, and settings are preserved in local browser storage.
+                    </span>
+                  </div>
+                  <div className="text-[10px] bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded font-mono uppercase text-amber-300 shrink-0">
+                    Offline
+                  </div>
+                </div>
+              )}
+
+              {/* LOCAL STORAGE BLOCKED WARNING BANNER */}
+              {!safeLocalStorage.isAvailable() && (
+                <div className="bg-red-500/10 border-b border-red-500/20 px-4 sm:px-6 py-2 text-xs flex flex-col md:flex-row items-center justify-between gap-3 text-red-200">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-2 w-2 relative">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
+                    </span>
+                    <span>
+                      <strong>⚠️ Browser Storage Restricted:</strong> Storage blocked inside preview. Sign in or open in a new tab to preserve your progress across sessions.
+                    </span>
+                  </div>
+                  <a
+                    href={typeof window !== "undefined" ? window.location.href : "#"}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[10px] bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 px-2.5 py-1 rounded font-sans font-semibold text-red-100 transition-all uppercase tracking-wider shrink-0 flex items-center gap-1"
+                  >
+                    🚀 Open in New Tab
+                  </a>
+                </div>
+              )}
+
+              {/* SUB HEADER: GLASS NAV TABS */}
+              {isMobileLite ? (
+                <nav className="px-3 py-2 border-b border-slate-800/80 bg-slate-950 flex items-center justify-between gap-1 select-none">
+                  <div className="flex items-center gap-1.5 w-full">
+                    <button
+                      type="button"
+                      onClick={() => setMobileLiteTab("chat")}
+                      className={`relative flex-1 py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer min-h-[42px] ${
+                        mobileLiteTab === "chat"
+                          ? "text-purple-200 bg-purple-950/70 border border-purple-600/60 shadow-sm shadow-purple-950/50"
+                          : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
+                      }`}
+                    >
+                      <Sparkles size={14} className={mobileLiteTab === "chat" ? "text-purple-400 shrink-0" : "text-slate-500 shrink-0"} />
+                      <span className="truncate">Narration</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setMobileLiteTab("assistant")}
+                      className={`relative flex-1 py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer min-h-[42px] ${
+                        mobileLiteTab === "assistant"
+                          ? "text-purple-200 bg-purple-950/70 border border-purple-600/60 shadow-sm shadow-purple-950/50"
+                          : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
+                      }`}
+                    >
+                      <Sparkles size={14} className={mobileLiteTab === "assistant" ? "text-purple-400 shrink-0" : "text-slate-500 shrink-0"} />
+                      <span className="truncate">Assistant</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setMobileLiteTab("settings")}
+                      className={`relative flex-1 py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer min-h-[42px] ${
+                        mobileLiteTab === "settings"
+                          ? "text-purple-200 bg-purple-950/70 border border-purple-600/60 shadow-sm shadow-purple-950/50"
+                          : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
+                      }`}
+                    >
+                      <Globe size={14} className={mobileLiteTab === "settings" ? "text-purple-400 shrink-0" : "text-slate-500 shrink-0"} />
+                      <span className="truncate sm:hidden">World</span>
+                      <span className="truncate hidden sm:inline">World Settings</span>
+                    </button>
+                  </div>
+                </nav>
               ) : (
-                <button
-                  onClick={handleGoogleSignIn}
-                  disabled={!isOnline}
-                  className={`text-xs font-semibold px-4 py-2 rounded-xl flex items-center gap-1.5 transition-colors ${!isOnline ? "bg-slate-900/50 border border-slate-850 text-slate-500 cursor-not-allowed" : "bg-purple-600 hover:bg-purple-700 active:bg-purple-800 text-white shadow-lg shadow-purple-900/10"}`}
-                >
-                  <LogIn size={13} /> {!isOnline ? "Offline (Guest Mode)" : "Cloud Sync (Google)"}
-                </button>
-              )}
-            </div>
-          </header>
-
-          {/* OFFLINE STATUS BANNER */}
-          {!isOnline && (
-            <div className="bg-amber-500/10 border-b border-amber-500/20 px-6 py-2.5 text-xs flex items-center justify-between gap-4 text-amber-200">
-              <div className="flex items-center gap-2">
-                <span className="flex h-2 w-2 relative">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
-                </span>
-                <span>
-                  <strong>Offline Sandbox Mode:</strong> Real-time cloud sync is paused, and the AI Storytelling engine is resting. All local modifications to campaigns, characters, notes, and drafts are safely stored in your browser's persistent cache.
-                </span>
-              </div>
-              <div className="text-[10px] bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 rounded font-mono uppercase text-amber-300 shrink-0">
-                Offline Cache Active
-              </div>
-            </div>
-          )}
-
-          {/* LOCAL STORAGE BLOCKED WARNING BANNER */}
-          {!safeLocalStorage.isAvailable() && (
-            <div className="bg-red-500/10 border-b border-red-500/20 px-6 py-2.5 text-xs flex flex-col md:flex-row items-center justify-between gap-4 text-red-200">
-              <div className="flex items-center gap-2">
-                <span className="flex h-2 w-2 relative">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
-                </span>
-                <span>
-                  <strong>⚠️ Browser Storage Blocked (IFrame Restricted):</strong> Your browser is restricting third-party storage access inside this preview window. Your campaigns and progress are running in-memory and <strong>will be lost on page reload</strong>.
-                </span>
-              </div>
-              <div className="flex items-center gap-3">
-                <a
-                  href={typeof window !== "undefined" ? window.location.href : "#"}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-[10px] bg-red-500/20 hover:bg-red-500/30 active:bg-red-500/40 border border-red-500/40 px-3 py-1 rounded font-sans font-semibold text-red-100 transition-all uppercase tracking-wider shrink-0 flex items-center gap-1"
-                >
-                  🚀 Open in New Tab to Fix
-                </a>
-                {!user && (
-                  <span className="text-[10px] text-red-400/80 font-mono italic">
-                    (or log in for Cloud Sync)
-                  </span>
+            <nav className="px-6 py-3 border-b border-slate-800/60 bg-slate-950 flex gap-1.5 overflow-x-auto relative">
+              <button
+                onClick={() => setActiveTab("chat")}
+                className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
+                  activeTab === "chat" 
+                    ? "text-purple-300" 
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {activeTab === "chat" && (
+                  <motion.div
+                    layoutId="activeMainTabPill"
+                    className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-purple-950/20 -z-10"
+                    transition={{ type: "spring", stiffness: 450, damping: 35 }}
+                  />
                 )}
-              </div>
-            </div>
+                <Sparkles size={13} className={activeTab === "chat" ? "text-purple-400" : ""} /> Active Adventure
+              </button>
+              <button
+                onClick={() => setActiveTab("editor")}
+                className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
+                  activeTab === "editor" 
+                    ? "text-emerald-300" 
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {activeTab === "editor" && (
+                  <motion.div
+                    layoutId="activeMainTabPill"
+                    className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-emerald-950/20 -z-10"
+                    transition={{ type: "spring", stiffness: 450, damping: 35 }}
+                  />
+                )}
+                <Layers size={13} className={activeTab === "editor" ? "text-emerald-400" : ""} /> Narrative Editing
+              </button>
+              <button
+                onClick={() => setActiveTab("image")}
+                className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
+                  activeTab === "image" 
+                    ? "text-pink-300" 
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {activeTab === "image" && (
+                  <motion.div
+                    layoutId="activeMainTabPill"
+                    className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-pink-950/20 -z-10"
+                    transition={{ type: "spring", stiffness: 450, damping: 35 }}
+                  />
+                )}
+                <ImageIcon size={13} className={activeTab === "image" ? "text-pink-400" : ""} /> Imaging & Video
+              </button>
+              <button
+                onClick={() => setActiveTab("workspace")}
+                className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
+                  activeTab === "workspace" 
+                    ? "text-blue-300" 
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {activeTab === "workspace" && (
+                  <motion.div
+                    layoutId="activeMainTabPill"
+                    className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-blue-950/20 -z-10"
+                    transition={{ type: "spring", stiffness: 450, damping: 35 }}
+                  />
+                )}
+                <FileText size={13} className={activeTab === "workspace" ? "text-blue-400" : ""} /> Workspace Sync
+              </button>
+            </nav>
           )}
-
-          {/* SUB HEADER: GLASS NAV TABS */}
-          <nav className="px-6 py-3 border-b border-slate-800/60 bg-slate-950 flex gap-1.5 overflow-x-auto relative">
-            <button
-              onClick={() => setActiveTab("chat")}
-              className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
-                activeTab === "chat" 
-                  ? "text-purple-300" 
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              {activeTab === "chat" && (
-                <motion.div
-                  layoutId="activeMainTabPill"
-                  className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-purple-950/20 -z-10"
-                  transition={{ type: "spring", stiffness: 450, damping: 35 }}
-                />
-              )}
-              <Sparkles size={13} className={activeTab === "chat" ? "text-purple-400" : ""} /> Active Adventure
-            </button>
-            <button
-              onClick={() => setActiveTab("editor")}
-              className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
-                activeTab === "editor" 
-                  ? "text-emerald-300" 
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              {activeTab === "editor" && (
-                <motion.div
-                  layoutId="activeMainTabPill"
-                  className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-emerald-950/20 -z-10"
-                  transition={{ type: "spring", stiffness: 450, damping: 35 }}
-                />
-              )}
-              <Layers size={13} className={activeTab === "editor" ? "text-emerald-400" : ""} /> Narrative Editing
-            </button>
-            <button
-              onClick={() => setActiveTab("image")}
-              className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
-                activeTab === "image" 
-                  ? "text-pink-300" 
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              {activeTab === "image" && (
-                <motion.div
-                  layoutId="activeMainTabPill"
-                  className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-pink-950/20 -z-10"
-                  transition={{ type: "spring", stiffness: 450, damping: 35 }}
-                />
-              )}
-              <ImageIcon size={13} className={activeTab === "image" ? "text-pink-400" : ""} /> Imaging & Video
-            </button>
-            <button
-              onClick={() => setActiveTab("workspace")}
-              className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
-                activeTab === "workspace" 
-                  ? "text-blue-300" 
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              {activeTab === "workspace" && (
-                <motion.div
-                  layoutId="activeMainTabPill"
-                  className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-blue-950/20 -z-10"
-                  transition={{ type: "spring", stiffness: 450, damping: 35 }}
-                />
-              )}
-              <FileText size={13} className={activeTab === "workspace" ? "text-blue-400" : ""} /> Workspace Sync
-            </button>
-          </nav>
             </>
           )}
 
           {/* MAIN LAYOUT WRAPPER */}
-          <div className="flex-1 flex overflow-hidden relative">
-            <main className={`flex-1 min-w-0 overflow-hidden transition-all duration-300 ${isCinemaMode ? "p-0" : "p-2 sm:p-3 md:p-4"}`}>
+          <div className="flex-1 flex min-h-0 h-full overflow-hidden relative">
+            <main className={`flex-1 min-w-0 min-h-0 h-full flex flex-col overflow-hidden transition-all duration-300 ${isCinemaMode ? "p-0" : "p-2 sm:p-3 md:p-4"}`}>
               
               {activeProject ? (
-                <div className="h-full relative overflow-hidden">
+                <div className="h-full w-full min-h-0 flex-1 flex flex-col relative overflow-hidden">
+                  {isMobileLite ? (
+                    <AnimatePresence mode="wait">
+                      {mobileLiteTab === "chat" && (
+                        <motion.div
+                          key="mobile-lite-chat"
+                          initial={{ opacity: 0, y: 4 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -4 }}
+                          transition={{ duration: 0.15, ease: "easeOut" }}
+                          className="h-full w-full"
+                        >
+                          <AdventureChat
+                            project={activeProject}
+                            messages={messages}
+                            characters={characters}
+                            onSendMessage={handleSendMessage}
+                            onRegenerateResponse={handleRegenerateResponse}
+                            onSelectMessageVersion={handleSelectMessageVersion}
+                            onEditMessage={handleEditMessage}
+                            onDeleteMessage={handleDeleteMessage}
+                            onUpdateNickname={(name) => handleSetProjectValue("userNickname", name)}
+                            isGenerating={isGeneratingChat}
+                            onStopGeneration={handleStopChatGeneration}
+                            onClearChat={handleClearChat}
+                            onSetProjectValue={handleSetProjectValue}
+                            onAddCharacter={handleAddCharacter}
+                            onDeleteCharacter={handleDeleteCharacter}
+                            onUpdateCharacter={handleUpdateCharacter}
+                            gallery={gallery}
+                            googleToken={googleToken}
+                            onGoogleSignIn={handleGoogleDriveSignIn}
+                            onClearGoogleToken={handleClearGoogleToken}
+                            onShowToast={showToast}
+                            setActiveTab={setActiveTab}
+                            navigationTarget={navigationTarget}
+                            isCinemaMode={isCinemaMode}
+                            onToggleCinemaMode={() => setIsCinemaMode(prev => !prev)}
+                            onOpenStoryArchives={() => setShowStoryArchiveModal(true)}
+                            isMobileLite={isMobileLite}
+                          />
+                        </motion.div>
+                      )}
+
+                      {mobileLiteTab === "assistant" && (
+                        <motion.div
+                          key="mobile-lite-assistant"
+                          initial={{ opacity: 0, y: 4 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -4 }}
+                          transition={{ duration: 0.15, ease: "easeOut" }}
+                          className="h-full w-full rounded-xl border border-slate-850 overflow-hidden bg-slate-950"
+                        >
+                          <StudioAssistantSidebar
+                            projects={projects}
+                            activeProject={activeProject}
+                            messages={messages}
+                            characters={characters}
+                            notes={notes}
+                            tasks={tasks}
+                            onSetProjectValue={handleSetProjectValue}
+                            onNavigateToItem={handleNavigateToItem}
+                            onAddCharacter={handleAddCharacter}
+                            onDeleteCharacter={handleDeleteCharacter}
+                            onUpdateCharacter={handleUpdateCharacter}
+                            onAddNote={handleAddNote}
+                            onDeleteNote={handleDeleteNote}
+                            onAddTask={handleAddTask}
+                            onToggleTask={handleToggleTask}
+                            onDeleteTask={handleDeleteTask}
+                            onInjectMessageToMainChat={handleInjectMessageToMainChat}
+                            onEditMessage={handleEditMessage}
+                            onDeleteMessage={handleDeleteMessage}
+                            onShowToast={showToast}
+                            googleToken={googleToken}
+                            onGoogleSignIn={handleGoogleDriveSignIn}
+                            embedded={true}
+                          />
+                        </motion.div>
+                      )}
+
+                      {mobileLiteTab === "settings" && (
+                        <motion.div
+                          key="mobile-lite-settings"
+                          initial={{ opacity: 0, y: 4 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -4 }}
+                          transition={{ duration: 0.15, ease: "easeOut" }}
+                          className="h-full w-full"
+                        >
+                          <MobileWorldSettings
+                            project={activeProject}
+                            onSetProjectValue={handleSetProjectValue}
+                            onUpdateNickname={(name) => handleSetProjectValue("userNickname", name)}
+                            onShowToast={showToast}
+                            onSwitchToNarration={() => setMobileLiteTab("chat")}
+                            onConsultAssistant={() => setMobileLiteTab("assistant")}
+                          />
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  ) : (
                   <AnimatePresence mode="wait">
                     {activeTab === "chat" && (
                       <motion.div
@@ -3111,7 +3202,7 @@ export default function App() {
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -4 }}
                         transition={{ duration: 0.18, ease: "easeOut" }}
-                        className="h-full w-full"
+                        className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
                       >
                         <AdventureChat
                           project={activeProject}
@@ -3130,7 +3221,6 @@ export default function App() {
                           onAddCharacter={handleAddCharacter}
                           onDeleteCharacter={handleDeleteCharacter}
                           onUpdateCharacter={handleUpdateCharacter}
-                          onUpdateMessageSpeakers={handleUpdateMessageSpeakers}
                           gallery={gallery}
                           googleToken={googleToken}
                           onGoogleSignIn={handleGoogleDriveSignIn}
@@ -3152,7 +3242,7 @@ export default function App() {
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -4 }}
                         transition={{ duration: 0.18, ease: "easeOut" }}
-                        className="h-full w-full"
+                        className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
                       >
                         <NarrativeSuite
                           chatTranscript={messages.map(m => `[${m.role}] ${m.content}`).join("\n\n")}
@@ -3180,7 +3270,7 @@ export default function App() {
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -4 }}
                         transition={{ duration: 0.18, ease: "easeOut" }}
-                        className="h-full w-full"
+                        className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
                       >
                         <ImageVideoSuite
                           gallery={gallery}
@@ -3205,7 +3295,7 @@ export default function App() {
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -4 }}
                         transition={{ duration: 0.18, ease: "easeOut" }}
-                        className="h-full w-full"
+                        className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
                       >
                         <WorkspaceSync
                           notes={notes}
@@ -3231,6 +3321,7 @@ export default function App() {
                       </motion.div>
                     )}
                   </AnimatePresence>
+                  )}
                 </div>
           ) : (
             <div className="h-full flex flex-col items-center justify-center max-w-xl mx-auto text-center px-4 py-12">
@@ -3258,7 +3349,7 @@ export default function App() {
 
         </main>
 
-        {!isCinemaMode && activeProject && (
+        {!isCinemaMode && !isMobileLite && activeProject && (
           <StudioAssistantSidebar
             projects={projects}
             activeProject={activeProject}
@@ -3277,11 +3368,11 @@ export default function App() {
             onToggleTask={handleToggleTask}
             onDeleteTask={handleDeleteTask}
             onInjectMessageToMainChat={handleInjectMessageToMainChat}
+            onEditMessage={handleEditMessage}
+            onDeleteMessage={handleDeleteMessage}
             onShowToast={showToast}
             googleToken={googleToken}
             onGoogleSignIn={handleGoogleDriveSignIn}
-            prompts={prompts}
-            onAddPrompt={handleAddPrompt}
           />
         )}
       </div>

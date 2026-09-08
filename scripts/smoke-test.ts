@@ -123,7 +123,7 @@ async function runComprehensiveSmokeTest() {
       characters,
       customRules: "Write in vivid, visceral prose. Strictly honor player autonomy and never speak for Sylas Vance. Describe environmental destruction and Vespera's flanking action.",
       slidingContextTurns: 12,
-      model: "gemini-3.7-flash"
+      model: "gemini-flash-latest"
     };
 
     console.log("\n   [Invoking Narrator /api/chat with 4-Tier Context payload...]");

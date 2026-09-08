@@ -42,7 +42,7 @@ import { GooglePickerButton, PickedGoogleFile } from "./GooglePickerButton";
 import { safeLocalStorage } from "../App";
 import ChatMessageMarkdown from "./ChatMessageMarkdown";
 import { safeFetchJson } from "../utils/apiClient";
-import { RelationshipTrack, PromptVaultItem, LoreSource, CharacterProfile } from "../types";
+import { RelationshipTrack, LoreSource, CharacterProfile } from "../types";
 
 export interface AssistantAttachment {
   id?: string;
@@ -79,7 +79,6 @@ export interface StudioAssistantSidebarProps {
   characters: any[];
   notes: any[];
   tasks: any[];
-  prompts?: PromptVaultItem[];
   onSetProjectValue: (key: string, value: any) => Promise<void> | void;
   onNavigateToItem?: (target: {
     targetTab?: "chat" | "editor" | "image" | "workspace";
@@ -111,11 +110,14 @@ export interface StudioAssistantSidebarProps {
   onAddTask: (text: string) => Promise<void> | void;
   onToggleTask: (id: string) => Promise<void> | void;
   onDeleteTask: (id: string) => Promise<void> | void;
-  onAddPrompt?: (character: string, folder: string, title: string, text: string) => Promise<void> | void;
   onInjectMessageToMainChat?: (text: string, role: "user" | "model", speakerIds?: string[]) => Promise<void> | void;
+  onEditMessage?: (id: string, newContent: string) => Promise<void> | void;
+  onDeleteMessage?: (id: string) => Promise<void> | void;
   onShowToast: (title: string, description: string, type: "success" | "info" | "warning" | "error") => void;
   googleToken?: string | null;
   onGoogleSignIn?: () => void;
+  embedded?: boolean;
+  onClose?: () => void;
 }
 
 const STORAGE_KEY_PREFIX = "adventure_assistant_chat_v4_";
@@ -127,7 +129,6 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
   characters = [],
   notes = [],
   tasks = [],
-  prompts = [],
   onSetProjectValue,
   onNavigateToItem,
   onAddCharacter,
@@ -138,11 +139,14 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
   onAddTask,
   onToggleTask,
   onDeleteTask,
-  onAddPrompt,
   onInjectMessageToMainChat,
+  onEditMessage,
+  onDeleteMessage,
   onShowToast,
   googleToken,
-  onGoogleSignIn
+  onGoogleSignIn,
+  embedded = false,
+  onClose
 }) => {
   const [isOpen, setIsOpen] = useState<boolean>(() => {
     try {
@@ -496,6 +500,7 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
             else if (args.stAdventureModule !== undefined) { targetKey = "stAdventureModule"; targetVal = args.stAdventureModule; }
             else if (args.pacing !== undefined) { targetKey = "pacing"; targetVal = args.pacing; }
             else if (args.emotionalTone !== undefined) { targetKey = "emotionalTone"; targetVal = args.emotionalTone; }
+            else if (args.mood !== undefined) { targetKey = "emotionalTone"; targetVal = args.mood; }
             else if (args.name !== undefined && typeof args.name === "string" && !args.role && !args.description) { targetKey = "name"; targetVal = args.name; }
           }
 
@@ -530,10 +535,29 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
               targetKey = "stAdventureModule";
             } else if (kNorm === "pacing") {
               targetKey = "pacing";
-            } else if (kNorm === "tone" || kNorm === "emotionaltone") {
+            } else if (kNorm === "tone" || kNorm === "emotionaltone" || kNorm === "mood" || kNorm === "storymood" || kNorm === "atmosphere") {
               targetKey = "emotionalTone";
             } else if (kNorm === "perspective" || kNorm === "narrativeperspective") {
               targetKey = "narrativePerspective";
+            } else if (
+              kNorm === "adventurelogtitle" ||
+              kNorm === "adventurelog" ||
+              kNorm === "logtitle" ||
+              kNorm === "narrativetitle" ||
+              kNorm === "narrativelogtitle" ||
+              kNorm === "adventuretitle"
+            ) {
+              targetKey = "adventureLogTitle";
+            } else if (
+              kNorm === "turnheader" ||
+              kNorm === "turnheadertemplate" ||
+              kNorm === "turnhead" ||
+              kNorm === "posttitle" ||
+              kNorm === "turntitle" ||
+              kNorm === "episodeheader" ||
+              kNorm === "postheader"
+            ) {
+              targetKey = "turnHeader";
             } else if (kNorm === "title" || kNorm === "campaignname" || kNorm === "projectname" || kNorm === "name") {
               targetKey = "name";
             }
@@ -1008,6 +1032,38 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
           }
         }
 
+        // 6b. UPDATE LORE SOURCE
+        else if (name === "update_lore_source") {
+          const targetIdOrName = args.id || args.name;
+          if (targetIdOrName && activeProject) {
+            const existingSources = Array.isArray(activeProject.sources) ? activeProject.sources : [];
+            const matched = existingSources.find(s => s.id === targetIdOrName || s.name.toLowerCase().trim() === targetIdOrName.toLowerCase().trim());
+            if (matched) {
+              const updatedSources = existingSources.map(s => {
+                if (s.id === matched.id) {
+                  return {
+                    ...s,
+                    name: args.name?.trim() || s.name,
+                    category: args.category || s.category,
+                    content: args.content !== undefined ? args.content : s.content,
+                    summary: args.summary !== undefined ? args.summary : s.summary,
+                    isActive: true
+                  };
+                }
+                return s;
+              });
+              await onSetProjectValue("sources", updatedSources);
+              executed.push({
+                name: `Updated Grounding Source: ${args.name || matched.name}`,
+                description: (args.summary || matched.summary || "Grounding document updated.").slice(0, 120),
+                targetTab: "workspace",
+                subType: "sources",
+                targetId: matched.id
+              });
+            }
+          }
+        }
+
         // 6c. DELETE LORE SOURCE
         else if (name === "delete_lore_source") {
           const targetIdOrName = args.id || args.name;
@@ -1103,19 +1159,113 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
           }
         }
 
-        // 11. ADD PROMPT TO VAULT
-        else if (name === "add_prompt_vault_item") {
-          const char = args.characterName || "General";
-          const folder = args.folder || "Main Cast";
-          const title = args.title || "Preset Prompt";
-          const promptText = args.promptText || "";
-          if (title && promptText && onAddPrompt) {
-            await onAddPrompt(char, folder, title, promptText);
+        // 12. EDIT NARRATIVE LOG / MESSAGE ENTRY
+        else if (
+          name === "edit_narrative_log" ||
+          name === "edit_narrative_entry" ||
+          name === "edit_message" ||
+          name === "update_message" ||
+          name === "rewrite_narrative_turn" ||
+          name === "rewrite_message"
+        ) {
+          const targetId = args.id || args.messageId;
+          const newContent = args.newContent !== undefined ? args.newContent : args.content !== undefined ? args.content : args.text;
+          const searchSnippet = args.searchSnippet || args.snippet || args.match;
+
+          if (newContent !== undefined && onEditMessage && narrativeMessages.length > 0) {
+            let matchedMessage: any = null;
+
+            if (targetId && targetId !== "latest" && targetId !== "last") {
+              matchedMessage = narrativeMessages.find(m => m.id === targetId);
+            }
+
+            if (!matchedMessage && searchSnippet) {
+              const snippetLower = String(searchSnippet).toLowerCase().trim();
+              matchedMessage = [...narrativeMessages].reverse().find(m => 
+                (m.content || "").toLowerCase().includes(snippetLower)
+              );
+            }
+
+            if (!matchedMessage) {
+              // Target the latest assistant/model turn or the very last message in narrative
+              const modelMsgs = narrativeMessages.filter(m => m.role === "model" || m.role === "nyx");
+              matchedMessage = modelMsgs.length > 0 ? modelMsgs[modelMsgs.length - 1] : narrativeMessages[narrativeMessages.length - 1];
+            }
+
+            if (matchedMessage) {
+              await Promise.race([
+                onEditMessage(matchedMessage.id, String(newContent)),
+                new Promise(res => setTimeout(res, 2500))
+              ]);
+              executed.push({
+                name: `Edited Narrative Log Turn`,
+                description: String(newContent).slice(0, 140) + (String(newContent).length > 140 ? "..." : ""),
+                targetTab: "chat",
+                subType: "main_chat",
+                targetId: matchedMessage.id
+              });
+            }
+          }
+        }
+
+        // 13. DELETE NARRATIVE ENTRY
+        else if (
+          name === "delete_narrative_entry" ||
+          name === "delete_narrative_log" ||
+          name === "delete_message" ||
+          name === "remove_message"
+        ) {
+          const targetId = args.id || args.messageId;
+          const searchSnippet = args.searchSnippet || args.snippet || args.match;
+
+          if (onDeleteMessage && narrativeMessages.length > 0) {
+            let matchedMessage: any = null;
+            if (targetId && targetId !== "latest" && targetId !== "last") {
+              matchedMessage = narrativeMessages.find(m => m.id === targetId);
+            }
+            if (!matchedMessage && searchSnippet) {
+              const snippetLower = String(searchSnippet).toLowerCase().trim();
+              matchedMessage = [...narrativeMessages].reverse().find(m => 
+                (m.content || "").toLowerCase().includes(snippetLower)
+              );
+            }
+            if (!matchedMessage) {
+              matchedMessage = narrativeMessages[narrativeMessages.length - 1];
+            }
+
+            if (matchedMessage) {
+              await Promise.race([
+                onDeleteMessage(matchedMessage.id),
+                new Promise(res => setTimeout(res, 2500))
+              ]);
+              executed.push({
+                name: `Deleted Narrative Log Turn`,
+                description: (matchedMessage.content || "").slice(0, 100) + "...",
+                targetTab: "chat",
+                subType: "main_chat"
+              });
+            }
+          }
+        }
+
+        // 14. UPDATE ADVENTURE LOG TITLE
+        else if (
+          name === "update_adventure_log_title" ||
+          name === "set_adventure_log_title" ||
+          name === "rename_adventure_log" ||
+          name === "edit_adventure_log_title"
+        ) {
+          const title = (args.title || args.name || args.adventureLogTitle || "").trim();
+          if (title) {
+            await Promise.race([
+              onSetProjectValue("adventureLogTitle", title),
+              new Promise(res => setTimeout(res, 2500))
+            ]);
             executed.push({
-              name: `Saved Prompt: ${title}`,
-              description: promptText.slice(0, 120) + (promptText.length > 120 ? "..." : ""),
-              targetTab: "image",
-              subType: "vault"
+              name: `Renamed Adventure Log`,
+              description: `Set log title to "${title}"`,
+              targetTab: "chat",
+              subType: "main_chat"
             });
           }
         }
@@ -1160,8 +1310,8 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
     try {
       const recentNarrativeSnippet = (narrativeMessages || [])
         .slice(-25)
-        .map((m: any) => `${m.role === "model" || m.role === "nyx" ? "DM (Nyx)" : "Player"}: ${m.content}`)
-        .join("\n");
+        .map((m: any) => `[Turn ID: ${m.id}] [${m.role === "model" || m.role === "nyx" ? "DM (Nyx)" : "Player"}]: ${m.content}`)
+        .join("\n\n");
 
       // Sanitize sources to avoid sending megabytes of background base64 data over fetch, while providing rich document text
       const sanitizedSources = (activeProject?.sources || []).slice(0, 25).map((s: any) => ({
@@ -1501,75 +1651,41 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
       icon: CheckSquare
     },
     {
-      label: "📌 Create Keep Note",
-      prompt: "Create a detailed Keep Note outlining secret world lore, hidden factions, or ancient artifacts for the party to uncover.",
+      label: "📜 Add Grounding Lore",
+      prompt: "Create a new grounding lore source in our campaign codex detailing secret world lore, hidden factions, or ancient artifacts.",
       icon: FileText
     }
   ];
 
-  return (
-    <>
-      {/* FLOATING BACKDROP (ONLY IN UNPINNED / FLOATING OVERLAY MODE ON SMALL SCREENS / WHEN OPEN) */}
-      {isOpen && !isDocked && (
-        <div 
-          onClick={() => setIsOpen(false)}
-          className="fixed inset-0 bg-black/40 z-40 backdrop-blur-[1.5px] transition-opacity duration-200 lg:hidden"
-          title="Click to close floating assistant"
-        />
-      )}
-
-      <aside 
-        className={`transition-all duration-300 ease-in-out flex flex-col h-full ${
-          isOpen 
-            ? isDocked 
-              ? "relative z-30 w-[390px] sm:w-[420px] lg:w-[450px] shrink-0 border-l border-slate-800/80 bg-slate-950/95 backdrop-blur-md shadow-lg" 
-              : "fixed right-0 top-0 bottom-0 z-50 w-[390px] sm:w-[420px] lg:w-[450px] border-l border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/60 animate-in slide-in-from-right duration-200"
-            : "w-0 overflow-hidden border-none"
-        }`}
-      >
-        {/* TOGGLE TAB HANDLE (WHEN CLOSED) */}
-        {!isOpen && (
-          <button
-            type="button"
-            onClick={() => setIsOpen(true)}
-            className="fixed right-0 top-20 z-50 bg-slate-900 hover:bg-purple-900/90 text-purple-300 hover:text-white px-2 py-3 rounded-l-xl border-y border-l border-purple-600/40 shadow-xl flex flex-col items-center gap-1 transition-all cursor-pointer group"
-            title="Open Studio Assistant (Nyx)"
-          >
-            <Sparkles size={16} className="text-purple-400 group-hover:rotate-12 transition-transform" />
-            <span className="text-[10px] font-mono font-bold writing-mode-vertical tracking-wider uppercase text-purple-300">
-              Assistant
+  const assistantContent = (
+    <div className="flex flex-col h-full w-full overflow-hidden select-text bg-slate-950/95">
+      {/* HEADER (Dirac Minimalism) */}
+      <div className="flex items-center justify-between px-3.5 py-2.5 bg-slate-900/90 border-b border-slate-800/80 shrink-0 select-none">
+        <div className="flex items-center gap-2.5">
+          <div className="relative">
+            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-purple-600 to-indigo-700 flex items-center justify-center text-white shadow-md shadow-purple-950/50">
+              <Sparkles size={15} />
+            </div>
+            <span className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-500 border border-slate-900 ring-1 ring-emerald-500/40 animate-pulse" />
+          </div>
+          <div className="flex flex-col">
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-bold text-slate-100 tracking-wide font-mono">NYX ASSISTANT</span>
+              <span className={`text-[9px] font-mono px-1.5 py-0.2 rounded border ${
+                embedded
+                  ? "bg-purple-950/90 text-purple-300 border-purple-800/60 font-semibold"
+                  : isDocked 
+                    ? "bg-purple-950/90 text-purple-300 border-purple-800/60 font-semibold" 
+                    : "bg-slate-900 text-slate-400 border-slate-800"
+              }`}>
+                {embedded ? "CO-PILOT" : isDocked ? "PINNED" : "OVERLAY"}
+              </span>
+            </div>
+            <span className="text-[10.5px] text-slate-400 truncate max-w-[170px]">
+              {activeProject?.name || "Active Campaign"}
             </span>
-            <ChevronLeft size={14} className="text-slate-400 group-hover:text-white" />
-          </button>
-        )}
-
-        {isOpen && (
-          <div className="flex flex-col h-full w-full overflow-hidden select-text">
-            {/* HEADER (Dirac Minimalism) */}
-            <div className="flex items-center justify-between px-3.5 py-2.5 bg-slate-900/90 border-b border-slate-800/80 shrink-0 select-none">
-              <div className="flex items-center gap-2.5">
-                <div className="relative">
-                  <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-purple-600 to-indigo-700 flex items-center justify-center text-white shadow-md shadow-purple-950/50">
-                    <Sparkles size={15} />
-                  </div>
-                  <span className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-500 border border-slate-900 ring-1 ring-emerald-500/40 animate-pulse" />
-                </div>
-                <div className="flex flex-col">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-bold text-slate-100 tracking-wide font-mono">NYX ASSISTANT</span>
-                    <span className={`text-[9px] font-mono px-1.5 py-0.2 rounded border ${
-                      isDocked 
-                        ? "bg-purple-950/90 text-purple-300 border-purple-800/60 font-semibold" 
-                        : "bg-slate-900 text-slate-400 border-slate-800"
-                    }`}>
-                      {isDocked ? "PINNED" : "OVERLAY"}
-                    </span>
-                  </div>
-                  <span className="text-[10.5px] text-slate-400 truncate max-w-[170px]">
-                    {activeProject?.name || "Active Campaign"}
-                  </span>
-                </div>
-              </div>
+          </div>
+        </div>
 
               {/* HEADER ACTIONS */}
               <div className="flex items-center gap-1 text-slate-400">
@@ -1612,29 +1728,31 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
                   <SlidersHorizontal size={14} />
                 </button>
 
-                {/* PIN / DOCK TOGGLE BUTTON */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    const nextDocked = !isDocked;
-                    setIsDocked(nextDocked);
-                    onShowToast(
-                      nextDocked ? "Assistant Pinned & Docked" : "Assistant Floating Overlay",
-                      nextDocked 
-                        ? "UI is locked and moved to the left to make room for the assistant." 
-                        : "Assistant is now floating over top of the UI.",
-                      "info"
-                    );
-                  }}
-                  className={`p-1.5 rounded-lg transition-all cursor-pointer ${
-                    isDocked 
-                      ? "bg-purple-950 text-purple-300 border border-purple-600/50 shadow-sm shadow-purple-950/40" 
-                      : "hover:bg-slate-800 hover:text-slate-200 text-slate-400"
-                  }`}
-                  title={isDocked ? "Unpin (Float over top of UI as overlay)" : "Pin & Dock (Move UI to left and lock)"}
-                >
-                  <Pin size={13} className={isDocked ? "rotate-45 text-purple-400 fill-purple-400/40" : ""} />
-                </button>
+                {/* PIN / DOCK TOGGLE BUTTON (HIDDEN IN EMBEDDED MODE) */}
+                {!embedded && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextDocked = !isDocked;
+                      setIsDocked(nextDocked);
+                      onShowToast(
+                        nextDocked ? "Assistant Pinned & Docked" : "Assistant Floating Overlay",
+                        nextDocked 
+                          ? "UI is locked and moved to the left to make room for the assistant." 
+                          : "Assistant is now floating over top of the UI.",
+                        "info"
+                      );
+                    }}
+                    className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                      isDocked 
+                        ? "bg-purple-950 text-purple-300 border border-purple-600/50 shadow-sm shadow-purple-950/40" 
+                        : "hover:bg-slate-800 hover:text-slate-200 text-slate-400"
+                    }`}
+                    title={isDocked ? "Unpin (Float over top of UI as overlay)" : "Pin & Dock (Move UI to left and lock)"}
+                  >
+                    <Pin size={13} className={isDocked ? "rotate-45 text-purple-400 fill-purple-400/40" : ""} />
+                  </button>
+                )}
 
                 <button
                   type="button"
@@ -1645,14 +1763,27 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
                   <RefreshCw size={13} />
                 </button>
 
-                <button
-                  type="button"
-                  onClick={() => setIsOpen(false)}
-                  className="p-1.5 rounded-lg hover:bg-slate-800 hover:text-slate-200 transition-colors cursor-pointer ml-0.5"
-                  title="Collapse Sidebar"
-                >
-                  <ChevronRight size={15} />
-                </button>
+                {!embedded && (
+                  <button
+                    type="button"
+                    onClick={() => setIsOpen(false)}
+                    className="p-1.5 rounded-lg hover:bg-slate-800 hover:text-slate-200 transition-colors cursor-pointer ml-0.5"
+                    title="Collapse Sidebar"
+                  >
+                    <ChevronRight size={15} />
+                  </button>
+                )}
+
+                {embedded && onClose && (
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="p-1.5 rounded-lg hover:bg-slate-800 hover:text-slate-200 transition-colors cursor-pointer ml-0.5"
+                    title="Close Assistant"
+                  >
+                    <X size={15} />
+                  </button>
+                )}
               </div>
             </div>
 
@@ -1680,12 +1811,12 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
 
             <button
               type="button"
-              onClick={() => onNavigateToItem && onNavigateToItem({ targetTab: "workspace", subType: "keep" })}
+              onClick={() => onNavigateToItem && onNavigateToItem({ targetTab: "workspace", subType: "sources" })}
               className="flex items-center justify-center gap-1 py-1 rounded bg-slate-900/60 hover:bg-slate-850 text-slate-300 transition-colors cursor-pointer"
-              title="Keep Notes"
+              title="Lore Sources & Grounding Transcripts"
             >
               <FileText size={11} className="text-amber-400" />
-              <span>{notes.length} Notes</span>
+              <span>{(activeProject?.sources || []).length} Sources</span>
             </button>
 
             <button
@@ -1888,9 +2019,7 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
 
                     {/* MESSAGE TOOLBAR (HOVER) */}
                     <div 
-                      className={`absolute top-1.5 ${
-                        isUser ? "-left-14" : "-right-14"
-                      } opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5 bg-slate-900/90 border border-slate-800 rounded-lg p-0.5 shadow-md`}
+                      className="absolute top-1.5 right-1.5 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5 bg-slate-950/90 border border-slate-800/90 rounded-md p-0.5 shadow-lg backdrop-blur-sm z-10"
                     >
                       <button
                         type="button"
@@ -2182,7 +2311,7 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
                       )}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center justify-between">
-                          <span className="text-xs font-medium text-slate-200">Model Inference (3.7 Flash)</span>
+                          <span className="text-xs font-medium text-slate-200">Model Inference (Flash-Latest)</span>
                           <span className={`text-[9.5px] font-mono px-1.5 py-0.2 rounded ${
                             diagnosticResults?.checks?.modelConnectivity?.status === "ok" ? "bg-emerald-950 text-emerald-300 border border-emerald-800/40" : "bg-rose-950 text-rose-300 border border-rose-800/40"
                           }`}>
@@ -2418,7 +2547,7 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
                   <h4 className="text-xs font-semibold text-slate-100">Reset Assistant History?</h4>
                 </div>
                 <p className="text-[11.5px] text-slate-400 leading-relaxed">
-                  This only clears Nyx's conversational memory for this campaign. Your characters, settings, keep notes, and documents remain untouched.
+                  This only clears Nyx's conversational memory for this campaign. Your characters, settings, lore sources, and documents remain untouched.
                 </p>
                 <div className="flex items-center justify-end gap-2 pt-1">
                   <button
@@ -2441,7 +2570,49 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
           )}
 
         </div>
+  );
+
+  if (embedded) {
+    return assistantContent;
+  }
+
+  return (
+    <>
+      {/* FLOATING BACKDROP (ONLY IN UNPINNED / FLOATING OVERLAY MODE ON SMALL SCREENS / WHEN OPEN) */}
+      {isOpen && !isDocked && (
+        <div 
+          onClick={() => setIsOpen(false)}
+          className="fixed inset-0 bg-black/40 z-40 backdrop-blur-[1.5px] transition-opacity duration-200 lg:hidden"
+          title="Click to close floating assistant"
+        />
       )}
+
+      <aside 
+        className={`transition-all duration-300 ease-in-out flex flex-col h-full ${
+          isOpen 
+            ? isDocked 
+              ? "relative z-30 w-[390px] sm:w-[420px] lg:w-[450px] shrink-0 border-l border-slate-800/80 bg-slate-950/95 backdrop-blur-md shadow-lg" 
+              : "fixed right-0 top-0 bottom-0 z-50 w-[390px] sm:w-[420px] lg:w-[450px] border-l border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/60 animate-in slide-in-from-right duration-200"
+            : "w-0 overflow-hidden border-none"
+        }`}
+      >
+        {/* TOGGLE TAB HANDLE (WHEN CLOSED) */}
+        {!isOpen && (
+          <button
+            type="button"
+            onClick={() => setIsOpen(true)}
+            className="fixed right-0 top-20 z-50 bg-slate-900 hover:bg-purple-900/90 text-purple-300 hover:text-white px-2 py-3 rounded-l-xl border-y border-l border-purple-600/40 shadow-xl flex flex-col items-center gap-1 transition-all cursor-pointer group"
+            title="Open Studio Assistant (Nyx)"
+          >
+            <Sparkles size={16} className="text-purple-400 group-hover:rotate-12 transition-transform" />
+            <span className="text-[10px] font-mono font-bold writing-mode-vertical tracking-wider uppercase text-purple-300">
+              Assistant
+            </span>
+            <ChevronLeft size={14} className="text-slate-400 group-hover:text-white" />
+          </button>
+        )}
+
+        {isOpen && assistantContent}
       </aside>
     </>
   );

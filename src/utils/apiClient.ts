@@ -11,7 +11,7 @@ export async function safeFetchJson<T = any>(
   resource: string,
   options: SafeFetchOptions = {}
 ): Promise<T> {
-  const { timeout = 120000, signal: userSignal, ...fetchOptions } = options;
+  const { timeout = 240000, signal: userSignal, ...fetchOptions } = options;
 
   let attempts = 0;
   const maxAttempts = 2;

@@ -1,5 +1,5 @@
 import { db } from "./index.ts";
-import { projects, characters, messages, loreSources, promptVault } from "./schema.ts";
+import { projects, characters, messages, loreSources } from "./schema.ts";
 import { eq, and } from "drizzle-orm";
 
 export async function getUserProjects(userUid: string) {
