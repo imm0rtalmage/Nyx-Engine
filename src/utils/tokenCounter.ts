@@ -49,6 +49,8 @@ export function resolveTokenBreakdown(
   const contextCount = Array.isArray(msg.contextEntities) ? msg.contextEntities.length : 0;
   if (contextCount > 0) {
     retrieval = Math.min(Math.round(total * 0.35), Math.max(120, contextCount * 140));
+  } else if (characters && characters.length > 0) {
+    retrieval = Math.min(Math.round(total * 0.2), Math.max(80, Math.min(characters.length, 3) * 110));
   }
 
   // Ensure output + thinking do not exceed total

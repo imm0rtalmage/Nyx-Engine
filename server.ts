@@ -7,8 +7,6 @@ import { requireAuth, AuthRequest } from "./src/middleware/auth.ts";
 import { getOrCreateUser } from "./src/db/users.ts";
 import { getUserProjects, upsertProject } from "./src/db/projects.ts";
 import {
-  findAuthorProfile,
-  generateAuthorStyleBlueprint,
   detectAuthorRemindersAndDrift,
   buildAuthorSystemInstruction,
   buildContextFrontierAuthorAnchor
@@ -295,7 +293,7 @@ async function generateContentWithRetry(
           break;
         }
 
-        const isTransient = isTransientError(err);
+        const isTransient = isTransientError(err) || isHighDemand;
         // If it's a transient error (e.g. 503 momentary demand spike, network reset) and we have remaining attempts in this stage
         if (isTransient && attempt < currentStage.maxAttempts - 1) {
           let customDelay = delay;
@@ -638,7 +636,7 @@ function extractRelevantSourceExcerpts(
   );
 
   for (const src of sources) {
-    const { textContent, mimeType } = getResolvedSourceContent(src);
+    const { textContent } = getResolvedSourceContent(src);
     if (!textContent || textContent.length < 10) continue;
 
     const srcType = src.type || "doc";
@@ -1304,7 +1302,7 @@ app.post("/api/chat", async (req, res) => {
       messages, 
       slidingContextTurns,
       customInstructions = "", 
-      thinkingLevel = "Medium", 
+      thinkingLevel = "Low", 
       creatorNames = "", 
       setting = "", 
       ragSummary = "", 
@@ -1319,7 +1317,6 @@ app.post("/api/chat", async (req, res) => {
       plotOverview = "",
       activeSources = [],
       characters = [],
-      notes = [],
       googleToken = ""
     } = req.body;
 
@@ -1660,40 +1657,48 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
       const textContent = m.content || m.text || "";
       parts.push({ text: textContent });
 
-      // Keep full binary attachments only for recent turns (last 4 turns) to avoid megabyte payload bloat
-      const isRecentMessage = idx >= totalMsgCount - 4;
+      // Enforce sliding window attachment pruning: only inject full attachments on the latest turn
+      const isLatestTurn = idx === totalMsgCount - 1;
 
       if (m.attachments && Array.isArray(m.attachments)) {
         for (const att of m.attachments) {
           if (att.type === "image") {
-            if (isRecentMessage) {
+            if (isLatestTurn) {
               const part = await getImageUrlAsPart(att.url, att.name);
               if (part) {
                 parts.push({ text: `\n[Attached image file: "${att.name}"]` });
                 parts.push(part);
+              } else {
+                parts.push({ text: `\n[Reference image: "${att.name}"]` });
               }
             } else {
-              parts.push({ text: `\n[Attached image file: "${att.name}"]` });
+              parts.push({ text: `\n[Reference image: "${att.name}"]` });
             }
           } else if (att.type === "document") {
-            let docText = "";
-            if (att.url && att.url.startsWith("data:")) {
-              const match = att.url.match(/^data:([^;]+);base64,(.*)$/);
-              if (match) {
-                try {
-                  const buffer = Buffer.from(match[2], 'base64');
-                  docText = buffer.toString('utf-8');
-                } catch (e) {
-                  docText = "[Attached document text/binary data]";
+            if (isLatestTurn) {
+              let docText = "";
+              if (att.url && att.url.startsWith("data:")) {
+                const match = att.url.match(/^data:([^;]+);base64,(.*)$/);
+                if (match) {
+                  try {
+                    const buffer = Buffer.from(match[2], 'base64');
+                    docText = buffer.toString('utf-8');
+                  } catch (e) {
+                    docText = "[Attached document text/binary data]";
+                  }
                 }
+              } else {
+                docText = att.content || "";
+              }
+              if (docText) {
+                parts.push({
+                  text: `\n\n[CONTENTS OF ATTACHED FILE "${att.name}":]\n${docText}\n[END OF FILE "${att.name}"]\n`
+                });
+              } else {
+                parts.push({ text: `\n[Reference file: "${att.name}"]` });
               }
             } else {
-              docText = att.content || "";
-            }
-            if (docText) {
-              parts.push({
-                text: `\n\n[CONTENTS OF ATTACHED FILE "${att.name}":]\n${docText}\n[END OF FILE "${att.name}"]\n`
-              });
+              parts.push({ text: `\n[Reference file: "${att.name}"]` });
             }
           }
         }
@@ -1811,12 +1816,12 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
         };
 
         // Map thinkingLevel to ThinkingLevel configuration for gemini-flash-latest
-        if (thinkingLevel === "Low" || thinkingLevel === "Minimal") {
-          configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
-        } else if (thinkingLevel === "High") {
+        if (thinkingLevel === "High") {
           configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.HIGH };
-        } else {
+        } else if (thinkingLevel === "Medium") {
           configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.MEDIUM };
+        } else {
+          configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
         }
 
         let currentContents = [...contents];
@@ -2234,14 +2239,14 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
     }
 
     // Determine recommended thinking level for next turn
-    let nextThinkingLevel = "Medium";
+    let nextThinkingLevel = "Low";
     const textLower = textResponse.toLowerCase() + " " + (messages[messages.length - 1]?.content || "").toLowerCase();
-    if (textLower.match(/(combat|fight|hack|climax|puzzle|reveal|twist|complex|physics)/)) {
+    if (textLower.match(/(climax|puzzle|complex physics|chronicle breakdown|reconcile|continuity audit)/)) {
       nextThinkingLevel = "High";
-    } else if (textLower.match(/(talk|chat|walk|look|idle|rest|easy|simple)/)) {
-      nextThinkingLevel = "Low";
-    } else {
+    } else if (textLower.match(/(combat|fight|hack|tactical encounter|reveal|ambush)/)) {
       nextThinkingLevel = "Medium";
+    } else {
+      nextThinkingLevel = "Low";
     }
 
     // Deduplicate loreActions before returning
@@ -2324,39 +2329,87 @@ Ensure you stay strictly in setting, recalibrating yourself based on the style g
   }
 });
 
-// 2. Nano Banana 2 Image Generation / Edit Endpoint
+// 2. Modernized Image Generation / Edit Endpoint with gemini-3.1-flash-image & gemini-3.1-flash-lite-image
 app.post("/api/image", async (req, res) => {
   try {
-    const { prompt, referenceImages = [], aspectRatio = "1:1", seed = 42, isEdit = false } = req.body;
+    const { prompt, references = [], referenceImages = [], aspectRatio = "1:1", seed = 42 } = req.body;
     const ai = getGeminiClient();
-    const isMock = process.env.GEMINI_API_KEY ? false : true;
+    const isMock = !process.env.GEMINI_API_KEY;
 
-    // For edit prompts or standard creation, we call ai.models.generateImages
     let imageBase64 = "";
+    const allRefs = (Array.isArray(references) && references.length > 0 ? references : referenceImages) as string[];
 
     if (isMock) {
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      // Provide a simulated landscape/portrait/square abstract digital painting depending on prompt
-      // We will generate a solid abstract grid or placeholder representation
-      imageBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="; // mock 1x1 png pixel
+      await new Promise(resolve => setTimeout(resolve, 800));
+      // Safe high-contrast fallback vector representation for sandbox mode without API keys
+      const encodedSvg = encodeURIComponent(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">` +
+        `<rect width="100%" height="100%" fill="#090d16"/>` +
+        `<circle cx="256" cy="256" r="160" fill="none" stroke="#6366f1" stroke-width="2" stroke-dasharray="8 6" opacity="0.6"/>` +
+        `<circle cx="256" cy="256" r="120" fill="#1e1b4b" stroke="#818cf8" stroke-width="1.5"/>` +
+        `<path d="M256 160 L266 236 L342 246 L266 256 L256 332 L246 256 L170 246 L246 236 Z" fill="#c084fc"/>` +
+        `<text x="256" y="380" font-family="system-ui, sans-serif" font-size="14" font-weight="600" fill="#a5b4fc" text-anchor="middle" letter-spacing="1">CAMPAIGN ARTWORK</text>` +
+        `<text x="256" y="405" font-family="system-ui, sans-serif" font-size="11" fill="#64748b" text-anchor="middle">${aspectRatio || "1:1"}</text>` +
+        `</svg>`
+      );
+      imageBase64 = `data:image/svg+xml;utf8,${encodedSvg}`;
     } else {
-      try {
-        const response = await ai.models.generateImages({
-          model: "imagen-3.0-generate-002",
-          prompt: prompt,
-          config: {
-            numberOfImages: 1,
-            outputMimeType: "image/jpeg",
-            aspectRatio: aspectRatio, // '1:1', '3:4', '4:3', '16:9', '9:16'
-          }
-        });
+      // Build multimodal contents: reference images + instruction prompt
+      const contentParts: any[] = [];
 
-        if (response.generatedImages && response.generatedImages[0]) {
-          imageBase64 = response.generatedImages[0].image.imageBytes;
+      for (const ref of allRefs) {
+        if (typeof ref === "string" && ref.startsWith("data:")) {
+          const mimeMatch = ref.match(/^data:([^;]+);base64,/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
+          const data = ref.replace(/^data:[^;]+;base64,/, "");
+          contentParts.push({
+            inlineData: {
+              data,
+              mimeType
+            }
+          });
         }
-      } catch (err: any) {
-        safeError("Image generation error:", err);
-        imageBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      }
+
+      contentParts.push({ text: prompt });
+
+      // Primary model: gemini-3.1-flash-image; fallback: gemini-3.1-flash-lite-image
+      const imageModels = ["gemini-3.1-flash-image", "gemini-3.1-flash-lite-image"];
+      let generationSuccess = false;
+
+      for (const imgModel of imageModels) {
+        try {
+          const response = await ai.models.generateContent({
+            model: imgModel,
+            contents: {
+              parts: contentParts
+            },
+            config: {
+              imageConfig: {
+                aspectRatio: (aspectRatio === "9:16" || aspectRatio === "16:9" || aspectRatio === "3:4" || aspectRatio === "4:3") ? aspectRatio : "1:1"
+              }
+            }
+          });
+
+          if (response.candidates && response.candidates[0]?.content?.parts) {
+            for (const part of response.candidates[0].content.parts) {
+              if (part.inlineData?.data) {
+                const mime = part.inlineData.mimeType || "image/png";
+                imageBase64 = `data:${mime};base64,${part.inlineData.data}`;
+                generationSuccess = true;
+                break;
+              }
+            }
+          }
+
+          if (generationSuccess) break;
+        } catch (mErr: any) {
+          safeWarn(`Image generation failed on model ${imgModel}: ${mErr.message || mErr}`);
+        }
+      }
+
+      if (!generationSuccess && !imageBase64) {
+        throw new Error("Unable to synthesize image. The model did not return image data.");
       }
     }
 
@@ -2481,26 +2534,75 @@ Return JSON with keys:
   }
 });
 
-// 4. Video Suite Endpoint using Veo (veo-3.1-fast-generate-preview)
+// 4. Video Suite Endpoint using Veo (veo-3.1-lite-generate-preview)
 app.post("/api/video", async (req, res) => {
   try {
     const { prompt, baseImage = "", aspectRatio = "16:9" } = req.body;
-    const isMock = process.env.GEMINI_API_KEY ? false : true;
+    const ai = getGeminiClient();
 
-    // Simulate Veo generation since video compilation takes longer or might need a fallback
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(400).json({
+        error: "A valid GEMINI_API_KEY is required to generate cinematic video with Veo."
+      });
+    }
 
-    // Return a beautiful mocked loop/animation reference
+    const videoConfig: any = {
+      numberOfVideos: 1,
+      resolution: "720p",
+      aspectRatio: aspectRatio === "9:16" ? "9:16" : "16:9"
+    };
+
+    const videoPayload: any = {
+      model: "veo-3.1-lite-generate-preview",
+      prompt: prompt || "Cinematic fantasy roleplay scene",
+      config: videoConfig
+    };
+
+    if (baseImage && typeof baseImage === "string") {
+      const cleanBase64 = baseImage.replace(/^data:[^;]+;base64,/, "");
+      videoPayload.image = {
+        imageBytes: cleanBase64
+      };
+    }
+
+    let operation = await ai.models.generateVideos(videoPayload);
+
+    // Poll for operation completion (max ~60s in HTTP request)
+    let pollCount = 0;
+    while (!operation.done && pollCount < 10) {
+      await new Promise(r => setTimeout(r, 6000));
+      pollCount++;
+      operation = await ai.operations.getVideosOperation({ operation });
+    }
+
+    const videoUri = operation.response?.generatedVideos?.[0]?.video?.uri;
+
+    if (!videoUri && !operation.done) {
+      return res.status(202).json({
+        success: false,
+        pending: true,
+        operationName: operation.name,
+        message: "Veo video generation is still processing. Please check back shortly."
+      });
+    }
+
+    if (!videoUri) {
+      throw new Error("Veo generation finished but did not return a video link.");
+    }
+
     res.json({
       success: true,
-      videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", // public sample video for sandbox testing
-      prompt: prompt,
+      videoUrl: videoUri,
+      prompt,
       aspectRatio,
       tokensUsed: 45000,
       timestamp: new Date().toISOString()
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    safeError("Veo video generation error:", err);
+    res.status(500).json({
+      error: err.message || "Failed to generate video with Veo."
+    });
   }
 });
 
@@ -3408,7 +3510,7 @@ Output ONLY valid JSON. No markdown code blocks, no trailing commentary.`;
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
         responseMimeType: "application/json",
-        thinkingConfig: { thinkingBudget: 0 }
+        thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
       }
     }, 1, 400, 30000);
 
@@ -3633,10 +3735,6 @@ app.post("/api/workspace-assistant", async (req, res) => {
       }
     }
 
-    function appStateContextLength(arr: any) {
-      return (arr && arr.length) ? arr.length : 0;
-    }
-
     // Extract latest user query text for dynamic profile-first semantic RAG scoring
     const latestUserTurnObj = (messages || []).filter((m: any) => m.role === "user").pop();
     const latestUserQueryText = latestUserTurnObj?.content || "";
@@ -3743,7 +3841,10 @@ ${charactersDetail || "No characters registered yet."}
 ${sourcesOverview || "No lore sources attached."}
 
 --- ACTIVE OBJECTIVES (${(appContext.tasks || []).length} registered) ---
-${tasksDetail || "No active objectives."}${narrativeSnippet}
+${tasksDetail || "No active objectives."}
+
+--- ACTIVE NOTES (${(appContext.notes || []).length} registered) ---
+${notesDetail || "No active notes."}${narrativeSnippet}
 ==================================================
 
 CANON ARCHITECTURE & LORE DATABASE PRECEDENCE (DELTA OVER BASE TRAINING):
@@ -3830,7 +3931,8 @@ Always answer concisely, directly, and naturally.
     const callConfig: any = {
       systemInstruction: systemPrompt,
       temperature: 0.3,
-      tools: assistantTools
+      tools: assistantTools,
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
     };
 
     try {
@@ -4171,7 +4273,7 @@ app.get("/api/workspace-assistant/diagnostics", async (req, res) => {
 // Interactive RAG Retrieval & Category Acceleration Test Endpoint
 app.post("/api/workspace-assistant/rag-test", async (req, res) => {
   const startMs = Date.now();
-  const { query, sources = [], characters = [], notes = [], tasks = [] } = req.body;
+  const { query, sources = [], characters = [] } = req.body;
 
   const testQuery = query || "Tell me about the monastery of Heiko-Ji and its rules";
   const rawSources = Array.isArray(sources) ? sources : [];
@@ -4834,7 +4936,7 @@ async function findOrCreateSparkFolder(accessToken: string, folderName: string, 
 // POST /api/spark/export-thread
 app.post("/api/spark/export-thread", async (req, res) => {
   try {
-    const { token, projectId, threadTitle, transcriptText } = req.body;
+    const { token, threadTitle, transcriptText } = req.body;
     const accessToken = token || req.headers.authorization?.replace("Bearer ", "");
 
     if (!transcriptText) {
@@ -4983,7 +5085,7 @@ app.post("/api/spark/export-thread", async (req, res) => {
 // POST /api/spark/sync-codex
 app.post("/api/spark/sync-codex", async (req, res) => {
   try {
-    const { token, projectId } = req.body;
+    const { token } = req.body;
     const accessToken = token || req.headers.authorization?.replace("Bearer ", "");
 
     const now = new Date().toISOString();
@@ -6025,6 +6127,41 @@ app.post("/api/sql/projects", requireAuth, async (req: AuthRequest, res: express
     console.error("Save project error:", error);
     return res.status(500).json({ error: error.message || "Failed to save project" });
   }
+});
+
+// ----------------------------------------------------
+// UNMATCHED API ROUTE HANDLERS (PREVENT SPA HTML FALLBACK)
+// ----------------------------------------------------
+// Explicitly intercept all unmatched /api/* requests before Vite or static SPA
+// catch-all routes. This guarantees API requests return JSON 404 instead of
+// falling through to index.html with HTTP 200 OK.
+app.all("/api", (req: express.Request, res: express.Response) => {
+  res.status(404).json({
+    error: `API endpoint not found: ${req.method} ${req.originalUrl || req.path}`,
+    status: 404,
+  });
+});
+
+app.all("/api/*", (req: express.Request, res: express.Response) => {
+  res.status(404).json({
+    error: `API endpoint not found: ${req.method} ${req.originalUrl || req.path}`,
+    status: 404,
+  });
+});
+
+// Global API error handler: guarantee JSON error responses for any exceptions under /api
+app.use("/api", (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error(`[API Internal Error] ${req.method} ${req.originalUrl || req.path}:`, err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  const statusCode = typeof err.status === "number" && err.status >= 400 && err.status < 600
+    ? err.status
+    : 500;
+  res.status(statusCode).json({
+    error: err.message || "Internal Server Error",
+    status: statusCode,
+  });
 });
 
 // ----------------------------------------------------

@@ -10,46 +10,8 @@ import {
 } from "lucide-react";
 import { listGoogleDocs, fetchGoogleFile, extractDocId } from "../utils/googleWorkspace";
 import Markdown from "react-markdown";
-import firebaseConfig from "../../firebase-applet-config.json";
 import { safeLocalStorage } from "../App";
 import { safeFetchJson } from "../utils/apiClient";
-
-// Helper to perform fetch requests with an optional timeout
-async function fetchWithTimeout(
-  resource: RequestInfo,
-  options: RequestInit & { timeout?: number } = {}
-): Promise<Response> {
-  const { timeout = 90000, ...rest } = options;
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeout);
-  
-  if (options.signal) {
-    if (options.signal.aborted) {
-      clearTimeout(id);
-      controller.abort();
-    } else {
-      options.signal.addEventListener("abort", () => {
-        clearTimeout(id);
-        controller.abort();
-      });
-    }
-  }
-
-  try {
-    const response = await fetch(resource, {
-      ...rest,
-      signal: controller.signal,
-    });
-    clearTimeout(id);
-    return response;
-  } catch (error: any) {
-    clearTimeout(id);
-    if (error.name === "AbortError" && (!options.signal || !options.signal.aborted)) {
-      throw new Error(`Request timed out after ${timeout / 1000} seconds`);
-    }
-    throw error;
-  }
-}
 
 const renderGDriveLogo = (size = 22) => (
   <svg style={{ width: size, height: size }} className="shrink-0" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -192,7 +154,6 @@ export default function WorkspaceSync({
   // Tabs: "all" | "sources" | "keep"
   const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<"all" | "sources" | "keep">("all");
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
-  const [isQuickNoteOpen, setIsQuickNoteOpen] = useState(false);
 
   // Search, Category & Deduplication state
   const [searchQuery, setSearchQuery] = useState("");
@@ -329,7 +290,6 @@ export default function WorkspaceSync({
 
   // Load active sources & notes
   const loreSources: LoreSource[] = Array.isArray(project?.sources) ? project.sources : [];
-  const selectedNote = (Array.isArray(notes) ? notes : []).find(n => `note-${n.id}` === selectedItemId) || null;
   const selectedSource = loreSources.find(s => s.id === (selectedItemId || selectedSourceId)) || loreSources[0] || null;
 
   // Compute status counts for uploaded documents (Done & Attached, Working, Untouched)
@@ -449,16 +409,6 @@ export default function WorkspaceSync({
     await onSetProjectValue("sources", updated);
   };
 
-  const handleToggleSourceActive = async (sourceId: string) => {
-    const updated = loreSources.map((s) => {
-      if (s.id === sourceId) {
-        return { ...s, isActive: s.isActive === false ? true : false };
-      }
-      return s;
-    });
-    await onSetProjectValue("sources", updated);
-  };
-
   // Refs to maintain fresh references inside asynchronous background processes
   const sourcesRef = useRef<LoreSource[]>(loreSources);
   const projectRef = useRef<Project>(project);
@@ -503,7 +453,6 @@ export default function WorkspaceSync({
 
   const [isSyncingGDocs, setIsSyncingGDocs] = useState(false);
   const [isSyncingSparkCodex, setIsSyncingSparkCodex] = useState(false);
-  const [syncStatusMsg, setSyncStatusMsg] = useState("");
 
   // Helper to log actions
   const addLog = (sourceName: string, type: SyncActivityLog["type"], message: string) => {
@@ -590,7 +539,8 @@ export default function WorkspaceSync({
     }
 
     setIsSyncingGDocs(true);
-    setSyncStatusMsg(`Syncing ${gdocSources.length} Google Doc(s)...`);
+    setIsProcessing(true);
+    setProcessingStatus(`Syncing ${gdocSources.length} Google Doc(s)...`);
 
     let updatedSources = [...currentSources];
     let syncedCount = 0;
@@ -645,7 +595,8 @@ export default function WorkspaceSync({
 
     await onSetProjectValue("sources", updatedSources);
     setIsSyncingGDocs(false);
-    setSyncStatusMsg("");
+    setIsProcessing(false);
+    setProcessingStatus("");
 
     if (!isSilent) {
       if (syncedCount > 0) {
@@ -768,112 +719,6 @@ export default function WorkspaceSync({
     addLoreSources(sourcesToIngest);
     setSelectedDriveFileIds(new Set());
     setIsAddSourceModalOpen(false);
-  };
-
-  const getFileIcon = (mimeType: string) => {
-    if (mimeType === "application/vnd.google-apps.document") {
-      return <FileText size={16} className="text-blue-400" />;
-    }
-    if (mimeType === "application/pdf") {
-      return <FileText size={16} className="text-red-400" />;
-    }
-    if (mimeType && mimeType.startsWith("image/")) {
-      return <Image size={16} className="text-purple-400" />;
-    }
-    return <FileText size={16} className="text-slate-400" />;
-  };
-
-  const [isPickerLoading, setIsPickerLoading] = useState(false);
-
-  const openGooglePicker = async () => {
-    if (!googleToken) return;
-    setIsPickerLoading(true);
-    try {
-      await new Promise<void>((resolve, reject) => {
-        if ((window as any).google?.picker) {
-          resolve();
-          return;
-        }
-
-        const loadPickerLib = () => {
-          (window as any).gapi.load("picker", {
-            callback: () => resolve(),
-            onerror: () => reject(new Error("Failed to load Google Picker")),
-          });
-        };
-
-        if (!(window as any).gapi) {
-          const script = document.createElement("script");
-          script.src = "https://apis.google.com/js/api.js";
-          script.onload = () => {
-            loadPickerLib();
-          };
-          script.onerror = () => reject(new Error("Failed to load gapi script"));
-          document.body.appendChild(script);
-        } else {
-          loadPickerLib();
-        }
-      });
-
-      // Use window.location.origin to match the registered Javascript Origin of the OAuth Client ID
-      // inside the sandboxed iframe of AI Studio.
-      const pickerOrigin = window.location.origin;
-
-      // Define our views
-      // 1. My Drive view (Docs) with Search enabled
-      const docsView = new (window as any).google.picker.DocsView((window as any).google.picker.ViewId.DOCS)
-        .setMimeTypes("application/vnd.google-apps.document,application/pdf,text/plain")
-        .setIncludeFolders(true)
-        .setSelectFolderEnabled(false);
-
-      // 2. Recents view
-      const recentView = new (window as any).google.picker.DocsView((window as any).google.picker.ViewId.RECENTLY_USED)
-        .setMimeTypes("application/vnd.google-apps.document,application/pdf,text/plain");
-
-      // 3. Starred view
-      const starredView = new (window as any).google.picker.DocsView((window as any).google.picker.ViewId.DOCS)
-        .setStarred(true)
-        .setLabel("Starred")
-        .setMimeTypes("application/vnd.google-apps.document,application/pdf,text/plain");
-
-      const picker = new (window as any).google.picker.PickerBuilder()
-        .setDeveloperKey(firebaseConfig.apiKey)
-        .setAppId(firebaseConfig.messagingSenderId)
-        .setOAuthToken(googleToken)
-        .addView(docsView)
-        .addView(recentView)
-        .addView(starredView)
-        .enableFeature((window as any).google.picker.Feature.MULTISELECT_ENABLED)
-        .enableFeature((window as any).google.picker.Feature.SUPPORT_DRIVES)
-        .setCallback((data: any) => {
-          if (data.action === (window as any).google.picker.Action.PICKED) {
-            const docs = data.docs;
-            if (docs && docs.length > 0) {
-              const sourcesToIngest = docs.map((doc: any) => ({
-                name: doc.name,
-                content: "",
-                type: "gdoc" as const,
-                extra: {
-                  gdocId: doc.id,
-                  mimeType: doc.mimeType,
-                  size: "GDrive Live",
-                  category: uploadCategoryRef.current
-                }
-              }));
-              addLoreSources(sourcesToIngest);
-              setIsAddSourceModalOpen(false);
-            }
-          }
-        })
-        .setOrigin(pickerOrigin)
-        .build();
-      picker.setVisible(true);
-    } catch (err) {
-      console.error("Failed to open Google Picker:", err);
-      onAddLog("Google Drive", "warning", "Failed to load Google Drive Picker. Please check connection and try again.");
-    } finally {
-      setIsPickerLoading(false);
-    }
   };
 
   // Run background retrieval of document content
@@ -1205,16 +1050,6 @@ export default function WorkspaceSync({
     }
   };
 
-  const handleIngestGoogleFile = async (fileId: string, name: string, mimeType: string) => {
-    if (!googleToken) return;
-    await addLoreSource(name, "", "gdoc", {
-      gdocId: fileId,
-      mimeType,
-      size: "GDrive Live",
-      category: uploadCategoryRef.current
-    });
-  };
-
   const handleWebScrape = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!webUrl) return;
@@ -1271,17 +1106,6 @@ export default function WorkspaceSync({
     } finally {
       setSourceToDelete(null);
     }
-  };
-
-  const handleCancelIngestion = async (sourceId: string) => {
-    if (abortControllersRef.current[sourceId]) {
-      abortControllersRef.current[sourceId].abort();
-      delete abortControllersRef.current[sourceId];
-    }
-    const updated = loreSources.map(s => 
-      s.id === sourceId ? { ...s, isIngesting: false } : s
-    );
-    await onSetProjectValue("sources", updated);
   };
 
   const handleCreateNoteLocal = (e: React.FormEvent) => {

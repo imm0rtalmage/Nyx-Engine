@@ -107,7 +107,15 @@ export async function safeFetchJson<T = any>(
         }
         throw new Error(`Server returned HTTP ${response.status} with an error page.`);
       }
-      throw new Error(`Server returned HTML instead of expected JSON data.`);
+
+      // If status 200 returned HTML, it indicates the request was caught by the SPA fallback
+      // or server during startup. If we have retries left, wait briefly and retry.
+      if (attempts < maxAttempts && !userSignal?.aborted) {
+        await new Promise(r => setTimeout(r, 800));
+        continue;
+      }
+
+      throw new Error(`Server returned HTML instead of expected JSON data from ${resource}. The endpoint may be unhandled, restarting, or routed to the web application.`);
     }
 
     if (!trimmedText) {

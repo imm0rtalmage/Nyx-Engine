@@ -8,9 +8,8 @@ import {
   Project, Message, GeneratedImage, KeepNote, KeepTask, CharacterProfile, SyncActivityLog, RelationshipTrack, LoreSource 
 } from "./types";
 import { 
-  auth, db, googleProvider, googleDriveProvider, signInWithPopup, signOut, onAuthStateChanged,
-  collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, where, orderBy, addDoc,
-  OperationType, handleFirestoreError
+  auth, db, googleDriveProvider, signInWithPopup, signOut, onAuthStateChanged,
+  collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, orderBy, addDoc
 } from "./lib/firebase";
 import { GoogleAuthProvider } from "firebase/auth";
 import { motion, AnimatePresence } from "motion/react";
@@ -21,14 +20,13 @@ import WorkspaceSync from "./components/WorkspaceSync";
 import { StoryArchiveModal } from "./components/StoryArchiveModal";
 import { StudioAssistantSidebar } from "./components/StudioAssistantSidebar";
 import { MobileWorldSettings } from "./components/MobileWorldSettings";
-import { createGoogleDoc } from "./utils/googleWorkspace";
 import { ParsedMessage } from "./utils/domParser";
 import { safeFetchJson } from "./utils/apiClient";
 import { 
   Sparkles, Layers, BookOpen, FileText, Image as ImageIcon, 
   LogIn, LogOut, Plus, Globe, Trash2, FolderOpen,
   Check, X, Edit3, Copy, Smartphone, Monitor,
-  Cloud, RefreshCw
+  Cloud
 } from "lucide-react";
 
 import { cleanForFirestore } from "./lib/firebase";
@@ -1637,13 +1635,16 @@ export default function App() {
         });
       }
 
+      const slidingTurns = activeProj.slidingContextTurns ?? 12;
+      const trimmedOutboundMessages = updatedMessages.slice(-Math.max(slidingTurns * 2, 24));
+
       const data = await safeFetchJson<any>("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
         body: JSON.stringify({
-          messages: updatedMessages,
-          slidingContextTurns: activeProj.slidingContextTurns ?? 12,
+          messages: trimmedOutboundMessages,
+          slidingContextTurns: slidingTurns,
           customInstructions: activeProj.customInstructions,
           thinkingLevel,
           creatorNames: activeProj.creatorNames,
@@ -1923,25 +1924,21 @@ export default function App() {
     }
 
     let historyOfMessages: Message[] = [];
-    let targetNyxMsgIndex: number = -1; // -1 means append a new nyx message
     let targetNyxMsgId: string | null = null;
 
     if (targetMessageId) {
       const idx = messages.findIndex(m => m.id === targetMessageId);
       if (idx !== -1) {
         if (messages[idx].role === "nyx") {
-          targetNyxMsgIndex = idx;
           targetNyxMsgId = messages[idx].id;
           historyOfMessages = messages.slice(0, idx);
         } else if (messages[idx].role === "user") {
           // If there's an existing nyx message right after this user message, target it
           if (idx + 1 < messages.length && messages[idx + 1].role === "nyx") {
-            targetNyxMsgIndex = idx + 1;
             targetNyxMsgId = messages[idx + 1].id;
             historyOfMessages = messages.slice(0, idx + 1);
           } else {
             // Generate a new response for this user message
-            targetNyxMsgIndex = -1;
             historyOfMessages = messages.slice(0, idx + 1);
           }
         }
@@ -1950,12 +1947,10 @@ export default function App() {
       // No targetMessageId provided (e.g. main bottom "Regen" button clicked)
       const lastMsg = messages[messages.length - 1];
       if (lastMsg && lastMsg.role === "nyx") {
-        targetNyxMsgIndex = messages.length - 1;
         targetNyxMsgId = lastMsg.id;
         historyOfMessages = messages.slice(0, messages.length - 1);
       } else {
         // Last message is user or system - generate a new nyx response for the conversation!
-        targetNyxMsgIndex = -1;
         historyOfMessages = [...messages];
       }
     }
@@ -1977,13 +1972,16 @@ export default function App() {
     chatAbortControllerRef.current = controller;
 
     try {
+      const slidingTurns = activeProj.slidingContextTurns ?? 12;
+      const trimmedOutboundMessages = historyOfMessages.slice(-Math.max(slidingTurns * 2, 24));
+
       const data = await safeFetchJson<any>("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
         body: JSON.stringify({
-          messages: historyOfMessages,
-          slidingContextTurns: activeProj.slidingContextTurns ?? 12,
+          messages: trimmedOutboundMessages,
+          slidingContextTurns: slidingTurns,
           customInstructions: activeProj.customInstructions,
           thinkingLevel,
           creatorNames: activeProj.creatorNames,

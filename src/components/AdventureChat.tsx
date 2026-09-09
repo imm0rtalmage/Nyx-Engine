@@ -14,13 +14,12 @@ import {
 } from "lucide-react";
 import { THEME_PRESETS, CHAT_BG_PRESETS, BUBBLE_STYLE_PRESETS } from "../utils/themes";
 import ThematicDashboardBanner, { getDynamicArchetype } from "./ThematicDashboardBanner";
-import Markdown from "react-markdown";
 import ChatMessageMarkdown from "./ChatMessageMarkdown";
 import MessageItem from "./MessageItem";
 import MessageErrorBoundary from "./MessageErrorBoundary";
 import { motion, AnimatePresence } from "motion/react";
 import JSZip from "jszip";
-import { fetchGoogleDoc, listGoogleDocs, fetchGoogleFile, createGoogleDoc, updateGoogleDoc } from "../utils/googleWorkspace";
+import { listGoogleDocs, fetchGoogleFile } from "../utils/googleWorkspace";
 import { GooglePickerButton } from "./GooglePickerButton";
 import { SaveToDrivePickerModal } from "./SaveToDrivePickerModal";
 import { ContextHUDModal } from "./ContextHUDModal";
@@ -41,43 +40,6 @@ export const NARRATIVE_FONT_SIZES: Record<string, { label: string; class: string
   "2xl": { label: "Jumbo", class: "text-2xl leading-relaxed", short: "24px", px: "24px" },
 };
 export const FONT_SIZE_KEYS = ["xs", "sm", "base", "lg", "xl", "2xl"];
-
-// Helper to perform fetch requests with an optional timeout
-async function fetchWithTimeout(
-  resource: RequestInfo,
-  options: RequestInit & { timeout?: number } = {}
-): Promise<Response> {
-  const { timeout = 25000, ...rest } = options;
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeout);
-  
-  if (options.signal) {
-    if (options.signal.aborted) {
-      clearTimeout(id);
-      controller.abort();
-    } else {
-      options.signal.addEventListener("abort", () => {
-        clearTimeout(id);
-        controller.abort();
-      });
-    }
-  }
-
-  try {
-    const response = await fetch(resource, {
-      ...rest,
-      signal: controller.signal,
-    });
-    clearTimeout(id);
-    return response;
-  } catch (error: any) {
-    clearTimeout(id);
-    if (error.name === "AbortError" && (!options.signal || !options.signal.aborted)) {
-      throw new Error(`Request timed out after ${timeout / 1000} seconds`);
-    }
-    throw error;
-  }
-}
 
 interface WorkspaceFile {
   id: string;
@@ -537,7 +499,7 @@ export default function AdventureChat({
       return () => clearTimeout(timer);
     }
   }, [inputText, projectId]);
-  const [thinkingLevel, setThinkingLevel] = useState("Medium");
+  const [thinkingLevel, setThinkingLevel] = useState("Low");
   const [generatingElapsedSeconds, setGeneratingElapsedSeconds] = useState(0);
 
   useEffect(() => {
@@ -1204,8 +1166,6 @@ export default function AdventureChat({
   const [newFieldNameCreation, setNewFieldNameCreation] = useState("");
 
   // 2.0 Dynamic Sliding Context & Scene Roster state
-  const [showSceneRosterBar, setShowSceneRosterBar] = useState(true);
-  const [showAddSceneEntityDropdown, setShowAddSceneEntityDropdown] = useState(false);
   const [showContextHUDModal, setShowContextHUDModal] = useState(false);
   const [newFieldNameEditing, setNewFieldNameEditing] = useState("");
 
@@ -1448,7 +1408,6 @@ export default function AdventureChat({
   const [confidenceReport, setConfidenceReport] = useState<any>(null);
 
   // Attachment states (up to 10 files)
-  const [mainAttachments, setMainAttachments] = useState<any[]>([]);
   const [assistantAttachments, setAssistantAttachments] = useState<any[]>([]);
   const [isChatDragging, setIsChatDragging] = useState(false);
 
@@ -1894,38 +1853,6 @@ export default function AdventureChat({
     }
   };
 
-  const [isGeneratingPortraitId, setIsGeneratingPortraitId] = useState<string | null>(null);
-
-  const handleGeneratePortraitForCharacter = async (char: CharacterProfile) => {
-    setIsGeneratingPortraitId(char.id);
-    try {
-      const settingContext = project.setting ? ` set in the environment of ${project.setting}` : "";
-      const prompt = `A stunning digital art cinematic portrait avatar of ${char.name}, ${char.role}${settingContext}. Details: ${char.description || 'character portrait'}. 1:1 ratio, centered face, professional lighting, detailed art, clean background.`;
-      
-      const data = await safeFetchJson<any>("/api/image", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          aspectRatio: "1:1",
-          projectId: project.id
-        }),
-        timeout: 60000
-      });
-      if (data.success && data.image) {
-        const generatedUrl = `data:image/jpeg;base64,${data.image}`;
-        onUpdateCharacter(char.id, { portraitUrl: generatedUrl });
-      } else {
-        onShowToast?.("Portrait Generation", "Portrait generation failed: " + (data.error || "unknown error"), "error");
-      }
-    } catch (err: any) {
-      console.error(err);
-      onShowToast?.("Portrait Error", "Error generating portrait: " + err.message, "error");
-    } finally {
-      setIsGeneratingPortraitId(null);
-    }
-  };
-
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isGenerating]);
@@ -1949,9 +1876,6 @@ export default function AdventureChat({
       dynamicBgStyle = "linear-gradient(to bottom, #111b15 0%, #050a06 100%)";
     }
   }
-
-  // Fetch current active PC character
-  const activePC = characters.find(c => c.id === project.activeCharacterId) || characters.find(c => c.role.toLowerCase().includes("protagonist")) || characters[0];
 
   // Handle message send & 2.0 Slash Commands
   const handleSend = async (e?: React.FormEvent | React.KeyboardEvent) => {
@@ -2479,21 +2403,10 @@ export default function AdventureChat({
   const slidingTurnsLimit = project.slidingContextTurns ?? 12;
   const loreEngineResult = computeGranularLoreContext(characters, messages, slidingTurnsLimit);
   const {
-    pcEntities,
     granularEntities,
-    activeLoreEntities,
     allActiveContextLore,
     inSceneEntities: inSceneCharacters,
-    remainingBackgroundLore,
-    estimatedTokens
   } = loreEngineResult;
-
-  const activeKeywordTriggers = activeLoreEntities;
-  const estTier1Tokens = estimatedTokens.tier1Protagonist;
-  const estTier2Tokens = estimatedTokens.tier2DynamicContext;
-  const estTier4Tokens = estimatedTokens.tier4BackgroundIndex;
-  const estHistoryTokens = estimatedTokens.slidingHistory;
-  const estTotalContextTokens = estimatedTokens.total;
 
   // Recommendation for next turn
   const lastAssistantMessage = [...messages].reverse().find(m => m.role === "nyx" || m.role === "assistant");
@@ -5415,9 +5328,9 @@ export default function AdventureChat({
             {/* Thinking / Model tier selector */}
             <div className="flex items-center gap-1 bg-slate-950/80 p-0.5 rounded-lg border border-slate-800/80 shrink-0">
               {[
-                { id: "High", label: "High", full: "Flash-Latest (High Thinking / Extended Reasoning)" },
-                { id: "Medium", label: "Medium", full: "Flash-Latest (Medium Thinking / Standard)" },
-                { id: "Low", label: "Low", full: "Flash-Latest (Low Thinking / Fast)" }
+                { id: "Low", label: "Low", full: "Flash-Latest (Low Thinking / Fast & Token-Efficient)" },
+                { id: "Medium", label: "Medium", full: "Flash-Latest (Medium Thinking / Balanced Detail)" },
+                { id: "High", label: "High", full: "Flash-Latest (High Thinking / Multi-Narrative Synthesis)" }
               ].map(tier => (
                 <button
                   key={tier.id}
