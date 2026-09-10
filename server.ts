@@ -176,13 +176,26 @@ function extractRetrySeconds(err: any): number {
   return 0;
 }
 
+// Track model availability and cooldowns across sessions so exhausted models don't waste network calls
+const modelCooldownUntil: Record<string, number> = {
+  // Free tier models with known zero daily quota allocations in this project
+  "gemini-flash-latest": Date.now() + 86400000,
+  "gemini-3.8-flash": Date.now() + 86400000,
+  "gemini-3.1-pro-preview": Date.now() + 86400000,
+};
+
+function markModelCooldown(model: string, seconds = 120) {
+  modelCooldownUntil[model] = Date.now() + Math.max(seconds * 1000, 30000);
+}
+
+function isModelInCooldown(model: string): boolean {
+  const cd = modelCooldownUntil[model];
+  return typeof cd === "number" && Date.now() < cd;
+}
+
 // Helper to perform generateContent calls with multi-stage retry logic, exponential backoff, and model cascading.
-// Primary model: gemini-flash-latest (or configured model).
-// Fallback models: gemini-3.1-flash-lite, gemini-flash-lite-latest (valid official Gemini models).
-// Resilience strategy:
-// 1. Primary: Try gemini-flash-latest with true exponential backoff on transient errors (503, 500, network drop, timeout).
-// 2. Cascade: If primary fails after retries, cascade to gemini-3.1-flash-lite -> gemini-flash-lite-latest.
-// 3. For 429 quota exhaustion: Cascade across available models with clean fallbacks.
+// Primary model: gemini-3.1-flash-lite (high rate limits and reliable capacity).
+// High availability fallback: gemini-flash-lite-latest (fast execution, zero thinking overhead).
 async function generateContentWithRetry(
   ai: GoogleGenAI,
   params: { model?: string; contents: any; config?: any },
@@ -190,62 +203,65 @@ async function generateContentWithRetry(
   initialDelay = 1000,
   timeoutPerAttemptMs = 45000
 ) {
-  const primaryModel = params.model || "gemini-flash-latest";
+  const requestedModel = params.model || "gemini-3.1-flash-lite";
   let lastError: any = null;
 
-  // Build the resilience stages with thinking config preserved
-  const stages: { name: string; model: string; config: any; maxAttempts: number }[] = [];
-
-  // Stage 0: Primary attempt with requested model and configuration
-  // Always grant at least 2 attempts (initial + 1 backoff retry) so transient 503s don't prematurely trigger cascading
-  const primaryAttempts = Math.max((retries || 0) + 1, 2);
-  stages.push({
-    name: `primary (${primaryModel})`,
-    model: primaryModel,
-    config: params.config,
-    maxAttempts: primaryAttempts
-  });
-
-  // Candidate fallback models: valid Gemini models supported by @google/genai SDK
-  // Exclude models that have exhausted daily quota limits
-  const candidateFallbacks = ["gemini-3.1-flash-lite", "gemini-flash-lite-latest"]
-    .filter(m => m !== primaryModel);
-
-  // Add fallback models with appropriate thinking configuration
-  for (const fallbackModel of candidateFallbacks) {
-    let fallbackConfig = params.config;
-    // For gemini-3.1-flash-lite, use MINIMAL thinking to ensure fast execution and lower token quota usage
-    if (fallbackModel === "gemini-3.1-flash-lite" && params.config?.thinkingConfig) {
-      fallbackConfig = {
-        ...params.config,
-        thinkingConfig: {
-          ...params.config.thinkingConfig,
-          thinkingLevel: ThinkingLevel.MINIMAL
-        }
-      };
+  // Clean and normalize incoming config
+  const baseConfig: any = { ...params.config };
+  if (baseConfig.thinkingConfig && "thinkingBudget" in baseConfig.thinkingConfig) {
+    delete baseConfig.thinkingConfig.thinkingBudget;
+    if (Object.keys(baseConfig.thinkingConfig).length === 0) {
+      delete baseConfig.thinkingConfig;
     }
-    stages.push({
-      name: `resilient cascade (${fallbackModel})`,
-      model: fallbackModel,
-      config: fallbackConfig,
-      maxAttempts: 2
-    });
   }
 
-  // Final emergency stage: if high thinking caused global backend capacity failure on all models, try low thinking on primary model
-  const initialThinkingLevel = params.config?.thinkingConfig?.thinkingLevel;
-  if (initialThinkingLevel === ThinkingLevel.HIGH) {
+  // Determine optimal model execution order:
+  // 1. gemini-3.1-flash-lite (high rate boundaries, lightweight reasoning)
+  // 2. gemini-flash-lite-latest (ultra-high availability, fastest standard generation)
+  const candidatePool = ["gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-flash-latest"];
+  const prioritizedModels: string[] = [];
+
+  // If the requested model is not in cooldown, place it first
+  if (!isModelInCooldown(requestedModel)) {
+    prioritizedModels.push(requestedModel);
+  }
+
+  for (const m of candidatePool) {
+    if (!prioritizedModels.includes(m) && !isModelInCooldown(m)) {
+      prioritizedModels.push(m);
+    }
+  }
+
+  // If all candidate models appear cooled down, retain fallback candidates to attempt anyway
+  for (const m of [requestedModel, ...candidatePool]) {
+    if (!prioritizedModels.includes(m)) {
+      prioritizedModels.push(m);
+    }
+  }
+
+  // Build execution stages
+  const stages: { name: string; model: string; config: any; maxAttempts: number }[] = [];
+
+  for (let i = 0; i < prioritizedModels.length; i++) {
+    const model = prioritizedModels[i];
+    let stageConfig = { ...baseConfig };
+
+    // gemini-flash-lite-latest does NOT support thinkingConfig (Gemini 3 only) - strip it completely
+    if (model === "gemini-flash-lite-latest") {
+      delete stageConfig.thinkingConfig;
+    } else if (model === "gemini-3.1-flash-lite" && stageConfig.thinkingConfig) {
+      // Default to MINIMAL thinking for lite models to avoid 503 thinking queue congestion
+      stageConfig.thinkingConfig = {
+        ...stageConfig.thinkingConfig,
+        thinkingLevel: ThinkingLevel.MINIMAL
+      };
+    }
+
     stages.push({
-      name: `emergency reduced thinking (${primaryModel})`,
-      model: primaryModel,
-      config: {
-        ...params.config,
-        thinkingConfig: {
-          ...params.config?.thinkingConfig,
-          thinkingLevel: ThinkingLevel.LOW
-        }
-      },
-      maxAttempts: 1
+      name: i === 0 ? `primary (${model})` : `high-availability cascade (${model})`,
+      model,
+      config: stageConfig,
+      maxAttempts: 2
     });
   }
 
@@ -304,45 +320,45 @@ async function generateContentWithRetry(
           lastError.isRateLimit = true;
         }
 
-        // If it's a brief rate limit cooldown (e.g. <= 4s) and we have an attempt remaining
-        if (isQuotaExceeded && detectedRetrySecs > 0 && detectedRetrySecs <= 4 && attempt < currentStage.maxAttempts - 1) {
-          const waitMs = (detectedRetrySecs * 1000) + 400;
-          safeWarn(`Gemini API: Brief rate limit cooldown (${detectedRetrySecs}s) on ${currentStage.model}. Pausing for ${waitMs}ms before retry...`);
-          await new Promise(resolve => setTimeout(resolve, waitMs));
-          continue;
+        // If hard quota limit is exceeded, record cooldown on this model so subsequent turns skip it directly
+        if (isQuotaExceeded) {
+          markModelCooldown(currentStage.model, detectedRetrySecs > 0 ? detectedRetrySecs : 180);
+          if (stageIdx < stages.length - 1) {
+            console.log(`[Resilience Router] Model ${currentStage.model} reached quota limit. Routing to ${stages[stageIdx + 1].name}...`);
+            break;
+          }
         }
 
-        // If hard quota exhaustion or unavailable model, immediately cascade to next fallback model
-        if ((isQuotaExceeded || isNotFound) && stageIdx < stages.length - 1) {
-          safeWarn(`Gemini API: Quota limit or model unavailable on ${currentStage.model}. Cascading to ${stages[stageIdx + 1].name}...`);
+        // If not found or unsupported model, skip directly to next stage
+        if (isNotFound && stageIdx < stages.length - 1) {
+          console.log(`[Resilience Router] Model ${currentStage.model} unavailable. Routing to ${stages[stageIdx + 1].name}...`);
           break;
         }
 
-        // If timed out, cascade to next stage (with low/minimal thinking or lighter model)
+        // If high demand (503), remove thinkingConfig to bypass reasoning queue congestion
+        if (isHighDemand && currentStage.config?.thinkingConfig) {
+          delete currentStage.config.thinkingConfig;
+        }
+
+        // If timed out, advance to next stage with lighter load
         if (isTimedOut && stageIdx < stages.length - 1) {
-          safeWarn(`Gemini API: Timeout (${timeoutPerAttemptMs}ms) on ${currentStage.model}. Cascading to ${stages[stageIdx + 1].name}...`);
+          console.log(`[Resilience Router] Timeout on ${currentStage.model}. Routing to ${stages[stageIdx + 1].name}...`);
           break;
         }
 
         const isTransient = isTransientError(err) || isHighDemand;
-        // If it's a transient error (e.g. 503 momentary demand spike, network reset) and we have remaining attempts in this stage
         if (isTransient && attempt < currentStage.maxAttempts - 1) {
-          let customDelay = delay;
-          if (detectedRetrySecs > 0 && detectedRetrySecs <= 4) {
-            customDelay = Math.max(customDelay, detectedRetrySecs * 1000);
-          }
-
-          const jitter = Math.floor(Math.random() * 400);
-          const totalWait = customDelay + jitter;
-          safeWarn(`Gemini API: Transient issue (${err.status || '503/Network'}) on ${currentStage.model}. Retrying in ${totalWait}ms (Attempt ${attempt + 1}/${currentStage.maxAttempts})...`);
+          const jitter = Math.floor(Math.random() * 300);
+          const totalWait = Math.min(delay + jitter, 2500);
+          console.log(`[Resilience Router] Temporary condition on ${currentStage.model} (${err.status || '503/Network'}). Retrying in ${totalWait}ms (Attempt ${attempt + 1}/${currentStage.maxAttempts})...`);
           await new Promise(resolve => setTimeout(resolve, totalWait));
-          delay = Math.min(delay * 2, 4000);
+          delay = Math.min(delay * 2, 3000);
           continue;
         }
 
-        // If attempts in this stage are exhausted and we have another stage, cascade!
+        // If attempts on this model are exhausted, advance to next stage cleanly
         if (stageIdx < stages.length - 1) {
-          safeWarn(`Gemini API: Stage ${currentStage.name} failed (${err.status || err.message}). Cascading to ${stages[stageIdx + 1].name}...`);
+          console.log(`[Resilience Router] Stage ${currentStage.name} completed. Routing to ${stages[stageIdx + 1].name}...`);
           break;
         }
       }
@@ -1445,8 +1461,8 @@ app.post("/api/chat", async (req, res) => {
     const ai = getGeminiClient();
     const isMock = process.env.GEMINI_API_KEY ? false : true;
 
-    // Primary model: gemini-flash-latest as requested
-    const modelName = "gemini-flash-latest";
+    // Primary model: gemini-3.1-flash-lite (high rate limits and reliable capacity)
+    const modelName = "gemini-3.1-flash-lite";
 
     // 2.0 Dynamic Lorebook & Scene Grounding Engine (NovelAI-Inspired Tiered Context)
     const dynamicLore = buildDynamicLoreContext(characters, messages, userNickname);
@@ -2092,7 +2108,7 @@ ${ragSummary || "Beginning of campaign."}
           textResponse = `[Nyx Storyteller Note: The scene narrative paused. Let's keep moving forward!]`;
         }
       } catch (err: any) {
-        safeWarn("Gemini API Chat primary call interrupted, evaluating resilient recovery options:", err?.message || err);
+        safeLog("Gemini API Chat primary call interrupted, evaluating resilient recovery options:", err?.message || err);
 
         let emergencySucceeded = false;
         try {
@@ -2367,7 +2383,7 @@ Return JSON with keys:
     } else {
       try {
         const response = await generateContentWithRetry(ai, {
-          model: "gemini-flash-latest",
+          model: "gemini-3.1-flash-lite",
           contents: editPrompt,
           config: {
             responseMimeType: "application/json",
@@ -2392,15 +2408,15 @@ Return JSON with keys:
         resultText = data.editedText || data.edited_text || data.edited || data.polishedText || data.polished_text || data.text || data.result || data.story || safeText;
         ragSummary = data.ragSummary || data.rag_summary || data.summary || "Narrative anchored.";
       } catch (err: any) {
-        safeWarn("Narrative edit primary call failed, attempting fallback:", err);
+        safeLog("Narrative edit primary call failed, attempting fallback:", err?.message || err);
         // If primary call fails, attempt simpler prompt without strict schema as quick fallback
         try {
           const fallbackResp = await generateContentWithRetry(ai, {
-            model: "gemini-flash-latest",
+            model: "gemini-3.1-flash-lite",
             contents: `Rewrite and polish the following tabletop adventure story according to this command: "${userCommand}"\n\nText:\n${safeText.slice(0, 20000)}`,
             config: {
               thinkingConfig: {
-                thinkingLevel: ThinkingLevel.LOW
+                thinkingLevel: ThinkingLevel.MINIMAL
               }
             }
           }, 2);
@@ -2922,8 +2938,7 @@ Output ONLY the raw valid JSON object. No markdown wrapping (like \`\`\`json), n
         contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
         config: {
           responseMimeType: "application/json",
-          temperature: 0.7,
-          thinkingConfig: { thinkingBudget: 0 }
+          temperature: 0.7
         }
       }, 1, 200, 20000);
 
@@ -3006,11 +3021,10 @@ Ensure the "customFields" key-value pairs are highly tailored, extensible, setti
 Output ONLY the raw valid JSON object. No markdown wrapping (like \`\`\`json), no trailing text.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: "gemini-flash-latest",
+      model: "gemini-3.1-flash-lite",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
-        responseMimeType: "application/json",
-        thinkingConfig: { thinkingBudget: 0 }
+        responseMimeType: "application/json"
       }
     });
 
@@ -3090,12 +3104,11 @@ You MUST return a raw JSON object with this exact structure:
 Output ONLY valid JSON. No markdown code blocks, no other text.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: "gemini-flash-latest",
+      model: "gemini-3.1-flash-lite",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
         tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        thinkingConfig: { thinkingBudget: 0 }
+        responseMimeType: "application/json"
       }
     }, 1, 400, 30000);
 
@@ -3196,11 +3209,10 @@ ${transcript}
 Output ONLY valid raw JSON. No markdown code blocks.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: "gemini-flash-latest",
+      model: "gemini-3.1-flash-lite",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
-        responseMimeType: "application/json",
-        thinkingConfig: { thinkingBudget: 0 }
+        responseMimeType: "application/json"
       }
     }, 1, 400, 25000);
 
