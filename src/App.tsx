@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { 
-  Project, Message, GeneratedImage, KeepNote, KeepTask, CharacterProfile, SyncActivityLog, RelationshipTrack, LoreSource 
+  Project, Message, KeepNote, KeepTask, CharacterProfile, SyncActivityLog, RelationshipTrack, LoreSource 
 } from "./types";
 import { 
   auth, db, googleDriveProvider, signInWithPopup, signOut, onAuthStateChanged,
@@ -15,7 +15,6 @@ import { GoogleAuthProvider } from "firebase/auth";
 import { motion, AnimatePresence } from "motion/react";
 import AdventureChat from "./components/AdventureChat";
 import NarrativeSuite from "./components/NarrativeSuite";
-import ImageVideoSuite from "./components/ImageVideoSuite";
 import WorkspaceSync from "./components/WorkspaceSync";
 import { StoryArchiveModal } from "./components/StoryArchiveModal";
 import { StudioAssistantSidebar } from "./components/StudioAssistantSidebar";
@@ -23,7 +22,7 @@ import { MobileWorldSettings } from "./components/MobileWorldSettings";
 import { ParsedMessage } from "./utils/domParser";
 import { safeFetchJson } from "./utils/apiClient";
 import { 
-  Sparkles, Layers, BookOpen, FileText, Image as ImageIcon, 
+  Sparkles, Layers, BookOpen, FileText, 
   LogIn, LogOut, Plus, Globe, Trash2, FolderOpen,
   Check, X, Edit3, Copy, Smartphone, Monitor,
   Cloud
@@ -419,7 +418,7 @@ export default function App() {
   const [isConnectingEngine, setIsConnectingEngine] = useState(true);
   const [isSigningIn, setIsSigningIn] = useState(false);
   const loadedProjectIdRef = React.useRef<string>("");
-  const [activeTab, setActiveTab] = useState<"chat" | "editor" | "image" | "workspace">("chat");
+  const [activeTab, setActiveTab] = useState<"chat" | "editor" | "workspace">("chat");
 
   // Streamlined Mobile Mode state: specifically focuses into Narration, Assistant, and World Settings
   const [isMobileLite, setIsMobileLite] = useState<boolean>(() => {
@@ -523,13 +522,6 @@ export default function App() {
     } catch {}
     return [];
   });
-  const [gallery, setGallery] = useState<GeneratedImage[]>(() => {
-    try {
-      const saved = safeLocalStorage.getItem("local_gallery");
-      return saved ? JSON.parse(saved) : [];
-    } catch {}
-    return [];
-  });
   const [characters, setCharacters] = useState<CharacterProfile[]>(() => {
     try {
       const lastUid = safeLocalStorage.getItem("nyx_last_user_uid");
@@ -629,10 +621,6 @@ export default function App() {
     safeLocalStorage.setItem("local_tasks", JSON.stringify(tasks));
   }, [tasks]);
 
-  useEffect(() => {
-    safeLocalStorage.setItem("local_gallery", JSON.stringify(gallery));
-  }, [gallery]);
-
   // Persist active messages safely (guarded against cross-project race conditions)
   useEffect(() => {
     if (activeProjectId && currentDataProjectIdRef.current === activeProjectId) {
@@ -655,8 +643,6 @@ export default function App() {
 
   // Generation / Loading spinners
   const [isGeneratingChat, setIsGeneratingChat] = useState(false);
-  const [isGeneratingImage, setIsGeneratingImage] = useState(false);
-  const [videoResult, setVideoResult] = useState<string | null>(null);
   const chatAbortControllerRef = useRef<AbortController | null>(null);
 
   // Stop active narrator generation
@@ -834,7 +820,7 @@ export default function App() {
         syncedIds.push(lp.id);
       }
 
-      // 5. Sync notes, tasks, and gallery
+      // 5. Sync notes and tasks
       const savedNotes = safeLocalStorage.getItem("local_notes");
       if (savedNotes) {
         try {
@@ -854,18 +840,6 @@ export default function App() {
           for (const t of tasksList) {
             if (t && t.id) {
               await setDoc(doc(db, `users/${currentUser.uid}/tasks`, t.id), cleanForFirestore(t), { merge: true }).catch(console.warn);
-            }
-          }
-        } catch {}
-      }
-
-      const savedGallery = safeLocalStorage.getItem("local_gallery");
-      if (savedGallery) {
-        try {
-          const galleryList: GeneratedImage[] = JSON.parse(savedGallery);
-          for (const g of galleryList) {
-            if (g && g.id) {
-              await setDoc(doc(db, `users/${currentUser.uid}/gallery`, g.id), cleanForFirestore(g), { merge: true }).catch(console.warn);
             }
           }
         } catch {}
@@ -1082,27 +1056,11 @@ export default function App() {
       console.warn("Firestore tasks snapshot error:", err?.message);
     });
 
-    // E. Sync Image Gallery
-    const qGallery = query(collection(db, `users/${user.uid}/gallery`), orderBy("timestamp", "desc"));
-    const unsubGallery = onSnapshot(qGallery, (snap) => {
-      const list: GeneratedImage[] = [];
-      snap.forEach((doc) => {
-        list.push({ id: doc.id, ...doc.data() } as GeneratedImage);
-      });
-      setGallery((prev) => {
-        const localOnly = prev.filter(g => g.id.startsWith("img-") && !list.some(ol => ol.id === g.id));
-        return [...list, ...localOnly];
-      });
-    }, (err) => {
-      console.warn("Firestore gallery snapshot error:", err?.message);
-    });
-
     return () => {
       unsubUser();
       unsubProj();
       unsubNotes();
       unsubTasks();
-      unsubGallery();
     };
   }, [user]);
 
@@ -1213,9 +1171,6 @@ export default function App() {
 
       const savedTasks = safeLocalStorage.getItem("local_tasks");
       setTasks(savedTasks ? JSON.parse(savedTasks) : []);
-
-      const savedGallery = safeLocalStorage.getItem("local_gallery");
-      setGallery(savedGallery ? JSON.parse(savedGallery) : []);
     } catch (e) {
       console.error("Failed to load offline data from localStorage:", e);
     }
@@ -2309,76 +2264,6 @@ export default function App() {
     await handleSetProjectValue("sources", updatedSources);
   };
 
-  // Image & Video Generations
-  const handleGenerateImage = async (prompt: string, aspect: string, refs: string[]) => {
-    if (!isOnline) {
-      showToast(
-        "🎨 Image Generation Offline",
-        "Generating portraits and campaign art requires an active internet connection.",
-        "error"
-      );
-      return;
-    }
-    setIsGeneratingImage(true);
-    try {
-      const data = await safeFetchJson<any>("/api/image", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          aspectRatio: aspect,
-          references: refs,
-          projectId: activeProjectId
-        }),
-        timeout: 60000
-      });
-
-      const newImage: GeneratedImage = {
-        id: `img-${Date.now()}`,
-        url: data.image,
-        prompt,
-        seed: Math.floor(Math.random() * 1000000),
-        tokensUsed: data.tokensUsed,
-        timestamp: new Date().toISOString(),
-        fileName: data.fileName,
-        projectId: activeProjectId,
-        references: refs
-      };
-
-      setGallery(prev => [newImage, ...prev]);
-
-      if (user) {
-        await addDoc(collection(db, `users/${user.uid}/gallery`), newImage);
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsGeneratingImage(false);
-    }
-  };
-
-  const handleGenerateVideo = async (prompt: string, imageBase64: string, aspect: string) => {
-    if (!isOnline) {
-      showToast(
-        "🎬 Video Generation Offline",
-        "Generating animated videos requires an active internet connection.",
-        "error"
-      );
-      return;
-    }
-    try {
-      const data = await safeFetchJson<any>("/api/video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, baseImage: imageBase64, aspectRatio: aspect }),
-        timeout: 90000
-      });
-      setVideoResult(data.videoUrl);
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
   // Keep Notes & Tasks
   const handleAddNote = async (title: string, content: string) => {
     const localId = `note-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
@@ -2577,7 +2462,7 @@ export default function App() {
 
   const handleNavigateToItem = (target: any) => {
     if (isMobileLite) {
-      if (target?.targetTab === "workspace" || target?.targetTab === "editor" || target?.targetTab === "image") {
+      if (target?.targetTab === "workspace" || target?.targetTab === "editor") {
         setMobileLiteTab("settings");
       } else {
         setMobileLiteTab("chat");
@@ -3047,23 +2932,6 @@ export default function App() {
                 <Layers size={13} className={activeTab === "editor" ? "text-emerald-400" : ""} /> Narrative Editing
               </button>
               <button
-                onClick={() => setActiveTab("image")}
-                className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
-                  activeTab === "image" 
-                    ? "text-pink-300" 
-                    : "text-slate-400 hover:text-slate-200"
-                }`}
-              >
-                {activeTab === "image" && (
-                  <motion.div
-                    layoutId="activeMainTabPill"
-                    className="absolute inset-0 bg-slate-900 border border-slate-800 rounded-xl shadow shadow-pink-950/20 -z-10"
-                    transition={{ type: "spring", stiffness: 450, damping: 35 }}
-                  />
-                )}
-                <ImageIcon size={13} className={activeTab === "image" ? "text-pink-400" : ""} /> Imaging & Video
-              </button>
-              <button
                 onClick={() => setActiveTab("workspace")}
                 className={`relative px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
                   activeTab === "workspace" 
@@ -3090,8 +2958,9 @@ export default function App() {
             <main className={`flex-1 min-w-0 min-h-0 h-full flex flex-col overflow-hidden transition-all duration-300 ${isCinemaMode ? "p-0" : "p-2 sm:p-3 md:p-4"}`}>
               
               {activeProject ? (
-                <div className="h-full w-full min-h-0 flex-1 flex flex-col relative overflow-hidden">
-                  {isMobileLite ? (
+                <div className="h-full w-full min-h-0 flex-1 flex flex-row relative overflow-hidden">
+                  <div className="h-full w-full min-h-0 flex-1 flex flex-col relative overflow-hidden">
+                    {isMobileLite ? (
                     <AnimatePresence mode="wait">
                       {mobileLiteTab === "chat" && (
                         <motion.div
@@ -3119,7 +2988,6 @@ export default function App() {
                             onAddCharacter={handleAddCharacter}
                             onDeleteCharacter={handleDeleteCharacter}
                             onUpdateCharacter={handleUpdateCharacter}
-                            gallery={gallery}
                             googleToken={googleToken}
                             onGoogleSignIn={handleGoogleDriveSignIn}
                             onClearGoogleToken={handleClearGoogleToken}
@@ -3219,7 +3087,6 @@ export default function App() {
                           onAddCharacter={handleAddCharacter}
                           onDeleteCharacter={handleDeleteCharacter}
                           onUpdateCharacter={handleUpdateCharacter}
-                          gallery={gallery}
                           googleToken={googleToken}
                           onGoogleSignIn={handleGoogleDriveSignIn}
                           onClearGoogleToken={handleClearGoogleToken}
@@ -3261,31 +3128,6 @@ export default function App() {
                       </motion.div>
                     )}
 
-                    {activeTab === "image" && (
-                      <motion.div
-                        key="tab-image"
-                        initial={{ opacity: 0, y: 6 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -4 }}
-                        transition={{ duration: 0.18, ease: "easeOut" }}
-                        className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
-                      >
-                        <ImageVideoSuite
-                          gallery={gallery}
-                          onGenerateImage={handleGenerateImage}
-                          onGenerateVideo={handleGenerateVideo}
-                          projectId={activeProjectId}
-                          isGenerating={isGeneratingImage}
-                          videoResult={videoResult}
-                          googleToken={googleToken}
-                          onGoogleSignIn={handleGoogleDriveSignIn}
-                          onShowToast={showToast}
-                          project={activeProject}
-                          characters={characters}
-                        />
-                      </motion.div>
-                    )}
-
                     {activeTab === "workspace" && activeProject && (
                       <motion.div
                         key="tab-workspace"
@@ -3320,6 +3162,35 @@ export default function App() {
                     )}
                   </AnimatePresence>
                   )}
+                  </div>
+
+                  {!isMobileLite && activeProject && (
+                    <StudioAssistantSidebar
+                      isCinemaMode={isCinemaMode}
+                      projects={projects}
+                      activeProject={activeProject}
+                      messages={messages}
+                      characters={characters}
+                      notes={notes}
+                      tasks={tasks}
+                      onSetProjectValue={handleSetProjectValue}
+                      onNavigateToItem={handleNavigateToItem}
+                      onAddCharacter={handleAddCharacter}
+                      onDeleteCharacter={handleDeleteCharacter}
+                      onUpdateCharacter={handleUpdateCharacter}
+                      onAddNote={handleAddNote}
+                      onDeleteNote={handleDeleteNote}
+                      onAddTask={handleAddTask}
+                      onToggleTask={handleToggleTask}
+                      onDeleteTask={handleDeleteTask}
+                      onInjectMessageToMainChat={handleInjectMessageToMainChat}
+                      onEditMessage={handleEditMessage}
+                      onDeleteMessage={handleDeleteMessage}
+                      onShowToast={showToast}
+                      googleToken={googleToken}
+                      onGoogleSignIn={handleGoogleDriveSignIn}
+                    />
+                  )}
                 </div>
           ) : (
             <div className="h-full flex flex-col items-center justify-center max-w-xl mx-auto text-center px-4 py-12">
@@ -3346,33 +3217,6 @@ export default function App() {
           )}
 
         </main>
-
-        {!isCinemaMode && !isMobileLite && activeProject && (
-          <StudioAssistantSidebar
-            projects={projects}
-            activeProject={activeProject}
-            messages={messages}
-            characters={characters}
-            notes={notes}
-            tasks={tasks}
-            onSetProjectValue={handleSetProjectValue}
-            onNavigateToItem={handleNavigateToItem}
-            onAddCharacter={handleAddCharacter}
-            onDeleteCharacter={handleDeleteCharacter}
-            onUpdateCharacter={handleUpdateCharacter}
-            onAddNote={handleAddNote}
-            onDeleteNote={handleDeleteNote}
-            onAddTask={handleAddTask}
-            onToggleTask={handleToggleTask}
-            onDeleteTask={handleDeleteTask}
-            onInjectMessageToMainChat={handleInjectMessageToMainChat}
-            onEditMessage={handleEditMessage}
-            onDeleteMessage={handleDeleteMessage}
-            onShowToast={showToast}
-            googleToken={googleToken}
-            onGoogleSignIn={handleGoogleDriveSignIn}
-          />
-        )}
       </div>
 
       {/* NEW PROJECT MODAL */}

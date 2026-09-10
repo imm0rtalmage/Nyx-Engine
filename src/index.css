@@ -36,3 +36,17 @@ html, body, #root {
   scrollbar-width: thin;
   scrollbar-color: rgba(147, 51, 234, 0.45) rgba(15, 23, 42, 0.6);
 }
+
+/* Utility to smoothly hide scrollbars on horizontal tab strips */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Vertical text mode for side tab handles */
+.writing-mode-vertical {
+  writing-mode: vertical-rl;
+}

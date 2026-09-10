@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { Message, Project, CharacterProfile, GeneratedImage, RelationshipTrack, LoreSource, DEFAULT_INITIAL_PROJECT } from "../types";
+import { Message, Project, CharacterProfile, RelationshipTrack, LoreSource, DEFAULT_INITIAL_PROJECT } from "../types";
 import { LoreSourceStatusBadge, getSourceProcessingState } from "./LoreSourceStatusBadge";
 import { safeLocalStorage, loadProjectMessagesSafely } from "../App";
 import { 
@@ -10,7 +10,8 @@ import {
   Paperclip, FolderOpen, Clock, Eye, EyeOff, ClipboardList,
   User, Ghost, Scroll, MapPin, Rocket, Shield, Flag, Lock, Unlock, XCircle, Heart,
   Maximize2, Minimize2, Copy, ChevronDown, ChevronUp, Sliders, Type, Save,
-  Bold, Italic, Code as CodeIcon, Quote, List as ListIcon, BookOpen, Square, Loader2, Plus, Zap, Info, Layers, Database, Coins, Globe
+  Bold, Italic, Code as CodeIcon, Quote, List as ListIcon, BookOpen, Square, Loader2, Plus, Zap, Info, Layers, Database, Coins, Globe,
+  Pin, SlidersHorizontal
 } from "lucide-react";
 import { THEME_PRESETS, CHAT_BG_PRESETS, BUBBLE_STYLE_PRESETS } from "../utils/themes";
 import ThematicDashboardBanner, { getDynamicArchetype } from "./ThematicDashboardBanner";
@@ -87,12 +88,11 @@ interface AdventureChatProps {
   ) => void;
   onDeleteCharacter: (id: string) => void;
   onUpdateCharacter: (id: string, updates: Partial<CharacterProfile>) => void;
-  gallery: GeneratedImage[];
   googleToken?: string | null;
   onGoogleSignIn?: () => Promise<string | undefined> | void;
   onClearGoogleToken?: () => void;
   onShowToast?: (title: string, description: string, type?: "success" | "error" | "info") => void;
-  setActiveTab?: (tab: "chat" | "editor" | "image" | "workspace") => void;
+  setActiveTab?: (tab: "chat" | "editor" | "workspace") => void;
   navigationTarget?: any;
   isCinemaMode?: boolean;
   onToggleCinemaMode?: () => void;
@@ -445,7 +445,6 @@ export default function AdventureChat({
   onAddCharacter,
   onDeleteCharacter,
   onUpdateCharacter,
-  gallery,
   googleToken,
   onGoogleSignIn,
   onClearGoogleToken,
@@ -519,7 +518,41 @@ export default function AdventureChat({
 
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
-  const [showLeftPanel, setShowLeftPanel] = useState(!isMobileLite);
+
+  const [showLeftPanel, setShowLeftPanel] = useState<boolean>(() => {
+    if (isMobileLite) return false;
+    try {
+      const saved = safeLocalStorage.getItem("project_settings_open");
+      return saved !== null ? saved === "true" : false;
+    } catch {
+      return false;
+    }
+  });
+
+  const [isLeftPanelPinned, setIsLeftPanelPinned] = useState<boolean>(() => {
+    try {
+      const saved = safeLocalStorage.getItem("project_settings_pinned");
+      return saved !== null ? saved === "true" : false;
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      safeLocalStorage.setItem("project_settings_open", String(showLeftPanel));
+    } catch (e) {
+      console.warn("Failed to persist project_settings_open:", e);
+    }
+  }, [showLeftPanel]);
+
+  useEffect(() => {
+    try {
+      safeLocalStorage.setItem("project_settings_pinned", String(isLeftPanelPinned));
+    } catch (e) {
+      console.warn("Failed to persist project_settings_pinned:", e);
+    }
+  }, [isLeftPanelPinned]);
 
   // Cinema focus mode to hide non-narrative sidebars and top headers
   const [localCinemaMode, setLocalCinemaMode] = useState(false);
@@ -752,17 +785,57 @@ export default function AdventureChat({
       setIsSparkExporting(false);
     }
   };
-  const [localName, setLocalName] = useState(project.name || "");
-  const [localNickname, setLocalNickname] = useState(project.userNickname || "");
-  const [localSetting, setLocalSetting] = useState(project.setting || "");
-  const [localPlotOverview, setLocalPlotOverview] = useState(project.plotOverview || "");
-  const [localPersistentContext, setLocalPersistentContext] = useState(project.persistentContext || "");
-  const [localCreatorNames, setLocalCreatorNames] = useState(project.creatorNames || "");
-  const [localCustomInstructions, setLocalCustomInstructions] = useState(project.customInstructions || "");
-  const [localStyleGuide, setLocalStyleGuide] = useState(project.styleGuide || "");
-  const [localMood, setLocalMood] = useState(project.emotionalTone || "");
-  const [localPacing, setLocalPacing] = useState(project.pacing || "");
-  const [localTurnHeader, setLocalTurnHeader] = useState(project.turnHeader || "");
+  const [formFields, setFormFields] = useState({
+    name: project.name || "",
+    userNickname: project.userNickname || "",
+    setting: project.setting || "",
+    emotionalTone: project.emotionalTone || "",
+    pacing: project.pacing || "",
+    turnHeader: project.turnHeader || "",
+    plotOverview: project.plotOverview || "",
+    persistentContext: project.persistentContext || "",
+    creatorNames: project.creatorNames || "",
+    customInstructions: project.customInstructions || "",
+    styleGuide: project.styleGuide || "",
+  });
+
+  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const handleFieldChange = (field: keyof typeof formFields, value: string) => {
+    setFormFields(prev => ({ ...prev, [field]: value }));
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = setTimeout(() => {
+      if (field === "userNickname" && onUpdateNickname) {
+        onUpdateNickname(value);
+      } else {
+        onSetProjectValue(field, value);
+      }
+    }, 600);
+  };
+
+  const localName = formFields.name;
+  const localNickname = formFields.userNickname;
+  const localSetting = formFields.setting;
+  const localPlotOverview = formFields.plotOverview;
+  const localPersistentContext = formFields.persistentContext;
+  const localCreatorNames = formFields.creatorNames;
+  const localCustomInstructions = formFields.customInstructions;
+  const localStyleGuide = formFields.styleGuide;
+  const localMood = formFields.emotionalTone;
+  const localPacing = formFields.pacing;
+  const localTurnHeader = formFields.turnHeader;
+
+  const setLocalName = (v: string) => handleFieldChange("name", v);
+  const setLocalNickname = (v: string) => handleFieldChange("userNickname", v);
+  const setLocalSetting = (v: string) => handleFieldChange("setting", v);
+  const setLocalPlotOverview = (v: string) => handleFieldChange("plotOverview", v);
+  const setLocalPersistentContext = (v: string) => handleFieldChange("persistentContext", v);
+  const setLocalCreatorNames = (v: string) => handleFieldChange("creatorNames", v);
+  const setLocalCustomInstructions = (v: string) => handleFieldChange("customInstructions", v);
+  const setLocalStyleGuide = (v: string) => handleFieldChange("styleGuide", v);
+  const setLocalMood = (v: string) => handleFieldChange("emotionalTone", v);
+  const setLocalPacing = (v: string) => handleFieldChange("pacing", v);
+  const setLocalTurnHeader = (v: string) => handleFieldChange("turnHeader", v);
 
   const activeSettingResolved = localSetting || project.setting || "";
   const funnyLoadingText = useFunnyLoading(
@@ -885,175 +958,29 @@ export default function AdventureChat({
 
   const [focusedField, setFocusedField] = useState<string | null>(null);
 
-  // Sync prop changes back to local state ONLY if the user is not actively typing in that field
-  useEffect(() => {
-    if (focusedField !== "name") setLocalName(project.name || "");
-  }, [project.name, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "userNickname") setLocalNickname(project.userNickname || "");
-  }, [project.userNickname, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "setting") setLocalSetting(project.setting || "");
-  }, [project.setting, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "plotOverview") setLocalPlotOverview(project.plotOverview || "");
-  }, [project.plotOverview, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "persistentContext") setLocalPersistentContext(project.persistentContext || "");
-  }, [project.persistentContext, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "creatorNames") setLocalCreatorNames(project.creatorNames || "");
-  }, [project.creatorNames, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "customInstructions") setLocalCustomInstructions(project.customInstructions || "");
-  }, [project.customInstructions, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "styleGuide") setLocalStyleGuide(project.styleGuide || "");
-  }, [project.styleGuide, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "emotionalTone" && focusedField !== "mood") setLocalMood(project.emotionalTone || "");
-  }, [project.emotionalTone, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "pacing") setLocalPacing(project.pacing || "");
-  }, [project.pacing, focusedField]);
-
-  useEffect(() => {
-    if (focusedField !== "turnHeader") setLocalTurnHeader(project.turnHeader || "");
-  }, [project.turnHeader, focusedField]);
-
   // Full reset when project.id changes
   useEffect(() => {
-    setLocalName(project.name || "");
-    setLocalNickname(project.userNickname || "");
-    setLocalSetting(project.setting || "");
-    setLocalPlotOverview(project.plotOverview || "");
-    setLocalPersistentContext(project.persistentContext || "");
-    setLocalCreatorNames(project.creatorNames || "");
-    setLocalCustomInstructions(project.customInstructions || "");
-    setLocalStyleGuide(project.styleGuide || "");
-    setLocalMood(project.emotionalTone || "");
-    setLocalPacing(project.pacing || "");
-    setLocalTurnHeader(project.turnHeader || "");
+    setFormFields({
+      name: project.name || "",
+      userNickname: project.userNickname || "",
+      setting: project.setting || "",
+      emotionalTone: project.emotionalTone || "",
+      pacing: project.pacing || "",
+      turnHeader: project.turnHeader || "",
+      plotOverview: project.plotOverview || "",
+      persistentContext: project.persistentContext || "",
+      creatorNames: project.creatorNames || "",
+      customInstructions: project.customInstructions || "",
+      styleGuide: project.styleGuide || "",
+    });
   }, [project.id]);
 
-  // Debounced save for name
+  // Clean up debounce timer on unmount
   useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localName.trim() && localName !== (project.name || "")) {
-        onSetProjectValue("name", localName.trim());
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localName]);
-
-  // Debounced save for userNickname
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localNickname !== (project.userNickname || "")) {
-        onUpdateNickname(localNickname);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localNickname]);
-
-  // Debounced save for setting
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localSetting !== (project.setting || "")) {
-        onSetProjectValue("setting", localSetting);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localSetting]);
-
-  // Debounced save for mood / emotionalTone
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localMood !== (project.emotionalTone || "")) {
-        onSetProjectValue("emotionalTone", localMood);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localMood]);
-
-  // Debounced save for pacing
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localPacing !== (project.pacing || "")) {
-        onSetProjectValue("pacing", localPacing);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localPacing]);
-
-  // Debounced save for plotOverview
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localPlotOverview !== (project.plotOverview || "")) {
-        onSetProjectValue("plotOverview", localPlotOverview);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localPlotOverview]);
-
-  // Debounced save for persistentContext
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localPersistentContext !== (project.persistentContext || "")) {
-        onSetProjectValue("persistentContext", localPersistentContext);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localPersistentContext]);
-
-  // Debounced save for creatorNames
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localCreatorNames !== (project.creatorNames || "")) {
-        onSetProjectValue("creatorNames", localCreatorNames);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localCreatorNames]);
-
-  // Debounced save for customInstructions
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localCustomInstructions !== (project.customInstructions || "")) {
-        onSetProjectValue("customInstructions", localCustomInstructions);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localCustomInstructions]);
-
-  // Debounced save for styleGuide
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localStyleGuide !== (project.styleGuide || "")) {
-        onSetProjectValue("styleGuide", localStyleGuide);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localStyleGuide]);
-
-  // Debounced save for turnHeader
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localTurnHeader !== (project.turnHeader || "")) {
-        onSetProjectValue("turnHeader", localTurnHeader);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [localTurnHeader]);
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    };
+  }, []);
 
   // Target item navigation handler from assistant actions
   useEffect(() => {
@@ -1101,6 +1028,9 @@ export default function AdventureChat({
 
   const handleFieldBlur = (field: string, value: string) => {
     setFocusedField(null);
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
     if (field === "userNickname") {
       onUpdateNickname(value);
     } else {
@@ -1109,7 +1039,7 @@ export default function AdventureChat({
   };
 
   // Column sizes (percentages)
-  const [leftWidth, setLeftWidth] = useState(26); // %
+  const [leftWidth, setLeftWidth] = useState(28); // %
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -1119,7 +1049,7 @@ export default function AdventureChat({
   // New character creation state
   const [charName, setCharName] = useState("");
   const [charRole, setCharRole] = useState("Companion"); // e.g. Companion, Protagonist, Villain, NPC
-  const [portraitType, setPortraitType] = useState<"url" | "upload" | "gallery">("upload");
+  const [portraitType, setPortraitType] = useState<"url" | "upload">("upload");
   const [charUrl, setCharUrl] = useState("");
   const [charDesc, setCharDesc] = useState("");
 
@@ -1148,7 +1078,7 @@ export default function AdventureChat({
   const [editRomanceTracks, setEditRomanceTracks] = useState<RelationshipTrack[]>([]);
   const [editLinkedLoreIds, setEditLinkedLoreIds] = useState<string[]>([]);
   const [editPortraitUrl, setEditPortraitUrl] = useState("");
-  const [editPortraitType, setEditPortraitType] = useState<"url" | "upload" | "gallery">("upload");
+  const [editPortraitType, setEditPortraitType] = useState<"url" | "upload">("upload");
   const [editType, setEditType] = useState<CharacterProfile["type"]>("companion");
   const [editIsInScene, setEditIsInScene] = useState<boolean>(false);
   const [editActivationKeys, setEditActivationKeys] = useState<string>("");
@@ -2472,23 +2402,74 @@ export default function AdventureChat({
   }, []);
 
   return (
-    <div className={`flex h-full text-slate-100 rounded-2xl overflow-hidden border ${activeTheme.borderColor} ${activeTheme.bgClass} ${activeTheme.fontFamilyClass}`}>
+    <div className={`flex h-full text-slate-100 rounded-2xl overflow-hidden border ${activeTheme.borderColor} ${activeTheme.bgClass} ${activeTheme.fontFamilyClass} relative`}>
       
+      {/* FLOATING BACKDROP (WHEN OPEN IN UNPINNED OVERLAY MODE) */}
+      {showLeftPanel && !isLeftPanelPinned && (
+        <div 
+          onClick={() => setShowLeftPanel(false)}
+          className="absolute inset-0 bg-black/40 z-35 backdrop-blur-[1px] transition-opacity duration-200 cursor-pointer"
+          title="Click outside to close Project Settings overlay"
+        />
+      )}
+
       {/* 1. LEFT PANEL: Dynamic Settings, Themes, and Cast Members */}
       {showLeftPanel && (
         <div 
-          style={{ width: `${leftWidth}%` }}
-          className={`h-full min-w-[290px] max-w-[550px] ${activeTheme.cardBgClass} border-r ${activeTheme.borderColor} flex flex-col overflow-hidden transition-all duration-75 shrink-0`}
+          style={{ width: isLeftPanelPinned ? `${leftWidth}%` : undefined }}
+          className={`h-full flex flex-col overflow-hidden transition-all duration-200 ${activeTheme.cardBgClass} ${
+            isLeftPanelPinned 
+              ? `min-w-[320px] max-w-[550px] border-r ${activeTheme.borderColor} shrink-0 relative z-30 shadow-md`
+              : `absolute left-0 top-0 bottom-0 z-40 w-[380px] sm:w-[420px] max-w-[92vw] border-r border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/70 animate-in slide-in-from-left duration-200`
+          }`}
         >
           {/* Header */}
-          <div className={`p-4 border-b ${activeTheme.borderColor} flex justify-between items-center bg-slate-900/60`}>
-            <span className={`text-xs font-semibold uppercase tracking-wider ${activeTheme.accentText}`}>Project Settings</span>
-            <button 
-              onClick={() => setShowLeftPanel(false)}
-              className="text-slate-400 hover:text-white p-1 rounded hover:bg-slate-800"
-            >
-              <ChevronLeft size={14} />
-            </button>
+          <div className={`p-3.5 border-b ${activeTheme.borderColor} flex justify-between items-center bg-slate-900/60`}>
+            <div className="flex items-center gap-2 min-w-0">
+              <SlidersHorizontal size={14} className="text-purple-400 shrink-0" />
+              <span className={`text-xs font-bold uppercase tracking-wider ${activeTheme.accentText} truncate`}>Project Settings</span>
+              <span className={`text-[9px] font-mono px-1.5 py-0.2 rounded border shrink-0 ${
+                isLeftPanelPinned 
+                  ? "bg-purple-950/90 text-purple-300 border-purple-800/60 font-semibold" 
+                  : "bg-slate-900 text-slate-400 border-slate-800"
+              }`}>
+                {isLeftPanelPinned ? "PINNED" : "OVERLAY"}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !isLeftPanelPinned;
+                  setIsLeftPanelPinned(next);
+                  onShowToast?.(
+                    next ? "Settings Pinned & Docked" : "Settings Floating Overlay",
+                    next 
+                      ? "UI is locked and shifted right to make room for Project Settings." 
+                      : "Settings is now floating over top of the narration UI without shifting it.",
+                    "info"
+                  );
+                }}
+                className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                  isLeftPanelPinned 
+                    ? "bg-purple-950 text-purple-300 border border-purple-600/50 shadow-sm shadow-purple-950/40" 
+                    : "hover:bg-slate-800 hover:text-slate-200 text-slate-400"
+                }`}
+                title={isLeftPanelPinned ? "Unpin (Float over top of narration UI as overlay)" : "Pin & Dock (Shift narration UI and lock panel)"}
+              >
+                <Pin size={13} className={isLeftPanelPinned ? "rotate-45 text-purple-400 fill-purple-400/40" : ""} />
+              </button>
+
+              <button 
+                type="button"
+                onClick={() => setShowLeftPanel(false)}
+                className="text-slate-400 hover:text-white p-1.5 rounded hover:bg-slate-800 transition-colors cursor-pointer"
+                title="Collapse Project Settings"
+              >
+                <ChevronLeft size={14} />
+              </button>
+            </div>
           </div>
 
           {/* Sub Tab Navigation */}
@@ -3356,7 +3337,7 @@ export default function AdventureChat({
                 <div className="space-y-4">
 
                   {/* Category Tabs */}
-                  <div className="flex flex-wrap gap-1 pb-2 border-b border-slate-900">
+                  <div className="flex gap-1.5 pb-2 overflow-x-auto no-scrollbar scroll-smooth border-b border-slate-900/80 -mx-1 px-1">
                     {loreTypes.map(tab => {
                       const TabIcon = tab.icon;
                       const tabCount = characters.filter(c => {
@@ -3372,15 +3353,17 @@ export default function AdventureChat({
                             setShowRegisterActor(false);
                             resetCreationForm();
                           }}
-                          className={`px-2.5 py-1.5 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all shrink-0 snap-start border ${
+                          className={`px-2.5 py-1.5 rounded-lg text-[10.5px] font-medium flex items-center gap-1.5 transition-all shrink-0 whitespace-nowrap border ${
                             isSelected 
-                              ? "bg-slate-900 border-purple-500/40 text-purple-400 shadow-sm shadow-purple-950/40" 
-                              : "bg-slate-950/40 border-transparent text-slate-400 hover:text-slate-200"
+                              ? "bg-slate-900 border-purple-500/50 text-purple-300 shadow-sm shadow-purple-950/40" 
+                              : "bg-slate-950/40 border-slate-850/60 text-slate-400 hover:text-slate-200 hover:border-slate-800"
                           }`}
                         >
-                          <TabIcon size={11} className={tab.color} />
+                          <TabIcon size={12} className={tab.color} />
                           <span>{tab.label}</span>
-                          <span className="bg-slate-950/80 px-1 py-0.5 rounded text-[8px] text-slate-500 font-mono font-normal">
+                          <span className={`px-1 py-0.2 rounded text-[8.5px] font-mono font-semibold ${
+                            isSelected ? "bg-purple-950/80 text-purple-300" : "bg-slate-900 text-slate-500"
+                          }`}>
                             {tabCount}
                           </span>
                         </button>
@@ -3389,33 +3372,33 @@ export default function AdventureChat({
                   </div>
 
                   {/* Canon & Narrative Delta Studio Quick Launcher */}
-                  <div className="flex items-center justify-between gap-2 p-2.5 bg-gradient-to-r from-teal-950/50 via-slate-900/60 to-purple-950/40 border border-teal-800/40 rounded-xl shadow-md">
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      <div className="p-1.5 rounded-lg bg-teal-950/80 border border-teal-800/60 text-teal-400 shrink-0">
-                        <Globe size={15} />
-                      </div>
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-bold text-slate-100 truncate">Canon & Narrative Delta Studio</span>
-                          <span className="text-[9px] px-1.5 py-0.2 rounded bg-teal-900/60 text-teal-200 border border-teal-700/50 font-mono shrink-0">Wiki + Logs Engine</span>
+                  <div className="p-3 bg-gradient-to-br from-teal-950/40 via-slate-900/60 to-slate-950 border border-teal-800/40 rounded-xl shadow-sm space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0 flex-1">
+                        <div className="p-1.5 rounded-lg bg-teal-950/80 border border-teal-800/60 text-teal-400 shrink-0">
+                          <Globe size={14} />
                         </div>
-                        <p className="text-[10px] text-slate-400 truncate mt-0.5">
-                          Search online canon wiki, harvest campaign logs, and reconcile prequel & adaptation deltas.
-                        </p>
+                        <div className="min-w-0 flex-1">
+                          <span className="text-xs font-bold text-slate-100 block truncate">Canon Delta Studio</span>
+                          <span className="text-[9px] text-teal-400 font-mono block truncate">Wiki & Logs Engine</span>
+                        </div>
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCanonStudioTargetChar(null);
+                          setShowCanonDeltaStudio(true);
+                        }}
+                        className="px-2.5 py-1 bg-teal-600 hover:bg-teal-500 active:bg-teal-700 text-white rounded-lg text-xs font-semibold transition-all shadow cursor-pointer flex items-center gap-1.5 shrink-0"
+                        title="Open Canon & Narrative Delta Studio"
+                      >
+                        <Globe size={12} />
+                        <span>Open Studio</span>
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setCanonStudioTargetChar(null);
-                        setShowCanonDeltaStudio(true);
-                      }}
-                      className="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 active:bg-teal-700 text-white rounded-lg text-xs font-semibold transition-all shadow cursor-pointer flex items-center gap-1.5 shrink-0"
-                      title="Open Canon & Narrative Delta Studio"
-                    >
-                      <Globe size={13} />
-                      <span>Open Studio</span>
-                    </button>
+                    <p className="text-[10px] text-slate-400 leading-relaxed">
+                      Search online canon wiki, harvest campaign logs, and reconcile prequel & adaptation deltas.
+                    </p>
                   </div>
 
                   {/* Filtered Entities List */}
@@ -3434,7 +3417,7 @@ export default function AdventureChat({
                         No {loreTab.toUpperCase()} entities registered yet. Click below to add!
                       </p>
                     ) : (
-                      <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1">
+                      <div className="space-y-2">
                         {filteredEntities.map(char => {
                           const hasPortrait = char.portraitUrl && char.portraitUrl !== "";
                           const isExpanded = expandedEntityId === char.id;
@@ -3454,7 +3437,7 @@ export default function AdventureChat({
                                   {hasPortrait ? (
                                     renderPortrait(char.portraitUrl, char.name, "w-8 h-8 shrink-0", char)
                                   ) : (
-                                    <div className="w-8 h-8 rounded bg-slate-900 border border-slate-800 flex items-center justify-center shrink-0">
+                                    <div className="w-8 h-8 rounded bg-slate-900 border border-slate-850 flex items-center justify-center shrink-0">
                                       {(() => {
                                         const tabMeta = loreTypes.find(t => t.id === loreTab);
                                         if (tabMeta) {
@@ -3466,15 +3449,29 @@ export default function AdventureChat({
                                     </div>
                                   )}
                                   <div className="min-w-0 flex-1 pr-1">
-                                    <p className="text-xs font-semibold text-slate-100 leading-snug break-words flex flex-wrap items-center gap-1.5" title={char.name}>
-                                      <span className="break-words font-medium">{char.name}</span>
-                                      {char.isMook && <span className="bg-red-950/40 text-red-400 border border-red-900/30 text-[7px] px-1 py-0.5 rounded font-mono shrink-0">MOOK</span>}
+                                    <p className="text-xs font-semibold text-slate-100 truncate flex items-center gap-1.5" title={char.name}>
+                                      <span className="truncate">{char.name}</span>
+                                      {char.isMook && <span className="bg-red-950/40 text-red-400 border border-red-900/30 text-[7px] px-1 py-0.2 rounded font-mono shrink-0">MOOK</span>}
                                     </p>
                                     <p className="text-[9px] text-purple-400 truncate font-mono">{char.role || "Standard"}</p>
                                   </div>
                                 </div>
 
-                                <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                                <div className="flex items-center gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                                  {loreTab === "pc" && (
+                                    <button
+                                      type="button"
+                                      onClick={() => onSetProjectValue("activeCharacterId", char.id)}
+                                      className={`px-1.5 py-0.5 rounded text-[8.5px] font-mono font-bold transition-all border ${
+                                        project.activeCharacterId === char.id
+                                          ? "bg-purple-900/60 text-purple-300 border-purple-500/50 shadow-sm"
+                                          : "bg-slate-900 text-slate-500 border-slate-850 hover:text-slate-300"
+                                      }`}
+                                      title={project.activeCharacterId === char.id ? "Active PC for prompts" : "Set as active PC for prompts"}
+                                    >
+                                      {project.activeCharacterId === char.id ? "★ PC" : "Set PC"}
+                                    </button>
+                                  )}
                                   <button
                                     type="button"
                                     onClick={async () => {
@@ -3482,39 +3479,16 @@ export default function AdventureChat({
                                       const updated = characters.map(c => c.id === char.id ? { ...c, isInScene: newStatus } : c);
                                       await onSetProjectValue("characters", updated);
                                     }}
-                                    className={`px-1.5 py-0.5 rounded text-[8.5px] font-mono font-bold transition-all cursor-pointer border ${
+                                    className={`px-2 py-0.5 rounded-full text-[8.5px] font-mono font-medium transition-all cursor-pointer border flex items-center gap-1 ${
                                       char.isInScene
-                                        ? "bg-emerald-950/70 border-emerald-500/50 text-emerald-300 shadow-sm shadow-emerald-950/40"
-                                        : "bg-slate-900 border-slate-800 text-slate-500 hover:text-slate-300 hover:border-slate-700"
+                                        ? "bg-emerald-950/70 border-emerald-500/50 text-emerald-300 shadow-sm"
+                                        : "bg-slate-900 border-slate-850 text-slate-400 hover:text-slate-200"
                                     }`}
-                                    title={char.isInScene ? "In-Scene: Actively present in the immediate narrative scene (Full Context Injection)" : "In-World: Stored in lorebook (Only injected if mentioned)"}
+                                    title={char.isInScene ? "In-Scene: Actively present in current narrative scene" : "In-World: Stored in lorebook"}
                                   >
-                                    {char.isInScene ? "🟢 In Scene" : "⚪ In World"}
+                                    <span className={`w-1.5 h-1.5 rounded-full ${char.isInScene ? "bg-emerald-400" : "bg-slate-500"}`} />
+                                    <span>{char.isInScene ? "In Scene" : "In World"}</span>
                                   </button>
-                                  <select
-                                    value={char.type || (char.isPlayerCharacter ? "pc" : "npc")}
-                                    onChange={(e) => handleMoveLoreCategory(char, e.target.value as any)}
-                                    className="bg-slate-900 hover:bg-slate-850 border border-slate-800 hover:border-purple-500/50 rounded px-1.5 py-0.5 text-[9px] font-mono font-medium text-purple-300 hover:text-purple-200 outline-none cursor-pointer transition-all max-w-[78px] truncate"
-                                    title={`Move "${char.name}" to category (currently: ${char.type || "npc"})`}
-                                  >
-                                    <option value="pc">PC</option>
-                                    <option value="companion">Companion</option>
-                                    <option value="npc">NPC</option>
-                                    <option value="chronicle">Chronicle</option>
-                                    <option value="location">Location</option>
-                                    <option value="vehicle">Vehicle</option>
-                                    <option value="equipment">Equipment</option>
-                                    <option value="faction">Faction</option>
-                                  </select>
-                                  {loreTab === "pc" && (
-                                    <button
-                                      onClick={() => onSetProjectValue("activeCharacterId", char.id)}
-                                      className={`p-1 rounded text-[9px] font-bold ${project.activeCharacterId === char.id ? "bg-purple-900/60 text-purple-300 border border-purple-500/40" : "bg-slate-900 text-slate-500 hover:text-slate-300"}`}
-                                      title="Set as current active PC for prompts"
-                                    >
-                                      PC
-                                    </button>
-                                  )}
                                   <button
                                     onClick={() => onDeleteCharacter(char.id)}
                                     className="text-slate-500 hover:text-red-400 p-1 rounded hover:bg-slate-900 transition-colors"
@@ -3522,8 +3496,8 @@ export default function AdventureChat({
                                   >
                                     <Trash2 size={12} />
                                   </button>
-                                  <span className="text-slate-600 font-mono text-[9px] px-0.5">
-                                    {isExpanded ? "▲" : "▼"}
+                                  <span className="text-slate-500 hover:text-slate-300 p-0.5 transition-colors">
+                                    <ChevronDown size={13} className={`transform transition-transform duration-150 ${isExpanded ? "rotate-180" : ""}`} />
                                   </span>
                                 </div>
                               </div>
@@ -4005,7 +3979,6 @@ export default function AdventureChat({
                                           >
                                             <option value="upload">Upload Photo from device...</option>
                                             <option value="url">Custom Image URL...</option>
-                                            {gallery.length > 0 && <option value="gallery">Select from Generated Gallery...</option>}
                                           </select>
 
                                           {editPortraitType === "upload" && (
@@ -4041,23 +4014,6 @@ export default function AdventureChat({
                                               onChange={(e) => setEditPortraitUrl(e.target.value)}
                                               className="w-full bg-slate-950 border border-slate-850 rounded px-2.5 py-1.5 text-[11px] text-slate-300 outline-none focus:border-purple-500 font-mono"
                                             />
-                                          )}
-
-                                          {editPortraitType === "gallery" && (
-                                            <div className="grid grid-cols-4 gap-1.5 max-h-24 overflow-y-auto p-1 bg-slate-950 border border-slate-850 rounded">
-                                              {gallery.map(img => (
-                                                <button
-                                                  key={img.id}
-                                                  type="button"
-                                                  onClick={() => setEditPortraitUrl(img.url)}
-                                                  className={`relative aspect-square rounded overflow-hidden border-2 ${
-                                                    editPortraitUrl === img.url ? "border-purple-500" : "border-transparent hover:border-slate-850"
-                                                  }`}
-                                                >
-                                                  <img src={img.url} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                                                </button>
-                                              ))}
-                                            </div>
                                           )}
 
                                           {editPortraitUrl && (
@@ -5096,7 +5052,6 @@ export default function AdventureChat({
                             >
                               <option value="upload">Upload Photo from device...</option>
                               <option value="url">Custom Image URL...</option>
-                              {gallery.length > 0 && <option value="gallery">Select from Generated Gallery...</option>}
                             </select>
 
                             {portraitType === "upload" && (
@@ -5138,23 +5093,6 @@ export default function AdventureChat({
                                 onChange={(e) => setCharUrl(e.target.value)}
                                 className="w-full bg-slate-950 border border-slate-850 rounded px-2.5 py-1.5 text-[11px] text-slate-300 outline-none focus:border-purple-500 font-mono"
                               />
-                            )}
-
-                            {portraitType === "gallery" && (
-                              <div className="grid grid-cols-4 gap-1.5 max-h-24 overflow-y-auto p-1 bg-slate-950 border border-slate-850 rounded">
-                                {gallery.map(img => (
-                                  <button
-                                    key={img.id}
-                                    type="button"
-                                    onClick={() => setCharUrl(img.url)}
-                                    className={`relative aspect-square rounded overflow-hidden border-2 ${
-                                      charUrl === img.url ? "border-purple-500" : "border-transparent hover:border-slate-850"
-                                    }`}
-                                  >
-                                    <img src={img.url} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                                  </button>
-                                ))}
-                              </div>
                             )}
                           </div>
                         </div>
@@ -5212,21 +5150,28 @@ export default function AdventureChat({
         </div>
       )}
 
-      {/* Resize handle left */}
-      {showLeftPanel && (
+      {/* Resize handle left (Only active and visible when Pinned) */}
+      {showLeftPanel && isLeftPanelPinned && (
         <div 
           onMouseDown={startResizeLeft}
-          className={`w-1 hover:w-1.5 bg-slate-850 hover:bg-purple-600/60 cursor-col-resize shrink-0 transition-all`}
+          className="w-1 hover:w-1.5 bg-slate-850 hover:bg-purple-600/60 cursor-col-resize shrink-0 transition-all z-30"
+          title="Drag to resize pinned settings panel"
         />
       )}
 
-      {/* Button to restore Left panel */}
+      {/* Button to restore Left panel (Floating tab handle when closed, mirrors Assistant) */}
       {!showLeftPanel && !isMobileLite && (
-        <button 
+        <button
+          type="button"
           onClick={() => setShowLeftPanel(true)}
-          className={`h-full ${activeTheme.cardBgClass} hover:bg-slate-850 border-r ${activeTheme.borderColor} px-1.5 flex items-center justify-center text-slate-400 hover:text-white`}
+          className="absolute left-0 top-20 z-40 bg-slate-900/90 hover:bg-purple-900/90 text-purple-300 hover:text-white px-2 py-3 rounded-r-xl border-y border-r border-purple-600/40 shadow-xl flex flex-col items-center gap-1 transition-all cursor-pointer group"
+          title="Open Project Settings & Lore Database"
         >
-          <ChevronRight size={14} />
+          <SlidersHorizontal size={15} className="text-purple-400 group-hover:rotate-12 transition-transform" />
+          <span className="text-[10px] font-mono font-bold writing-mode-vertical tracking-wider uppercase text-purple-300">
+            Settings
+          </span>
+          <ChevronRight size={14} className="text-slate-400 group-hover:text-white" />
         </button>
       )}
 
@@ -5271,6 +5216,17 @@ export default function AdventureChat({
         {/* Chat Header */}
         <div className={`px-3.5 py-2 border-b ${activeTheme.borderColor} bg-slate-900/60 flex flex-wrap sm:flex-nowrap justify-between items-center gap-2 z-10 shrink-0`}>
           <div className="flex items-center gap-2 min-w-0 flex-1">
+            {!showLeftPanel && (
+              <button
+                type="button"
+                onClick={() => setShowLeftPanel(true)}
+                className="px-2 py-1 rounded-lg bg-slate-950/80 hover:bg-purple-950/90 text-slate-300 hover:text-purple-200 border border-slate-800 hover:border-purple-600/50 transition-all flex items-center gap-1.5 cursor-pointer text-xs shrink-0 shadow-xs"
+                title="Open Project Settings & Lore Database"
+              >
+                <SlidersHorizontal size={13} className="text-purple-400" />
+                <span className="text-[10px] font-mono font-bold tracking-wide">Settings</span>
+              </button>
+            )}
             <Sparkles size={14} className={`${activeTheme.accentIcon} shrink-0`} />
             
             {isEditingTitle ? (
@@ -5485,40 +5441,44 @@ export default function AdventureChat({
             </button>
 
             {/* Save to Google Drive Picker Modal */}
-            <SaveToDrivePickerModal
-              isOpen={showSaveDrivePickerModal}
-              onClose={() => setShowSaveDrivePickerModal(false)}
-              googleToken={googleToken}
-              onGoogleSignIn={onGoogleSignIn}
-              exportTitle={`${project.name} - Official Narrative Log`}
-              exportContent={messages.map(m => `[${m.role.toUpperCase()} - ${formatMsgTimestamp(m.timestamp)}]:\n${m.content}`).join("\n\n---\n\n")}
-              onExportSuccess={(docId) => {
-                onSetProjectValue("persistentContextDocId", docId);
-              }}
-              onShowToast={onShowToast}
-            />
+            {showSaveDrivePickerModal && (
+              <SaveToDrivePickerModal
+                isOpen={true}
+                onClose={() => setShowSaveDrivePickerModal(false)}
+                googleToken={googleToken}
+                onGoogleSignIn={onGoogleSignIn}
+                exportTitle={`${project.name} - Official Narrative Log`}
+                exportContent={messages.map(m => `[${m.role.toUpperCase()} - ${formatMsgTimestamp(m.timestamp)}]:\n${m.content}`).join("\n\n---\n\n")}
+                onExportSuccess={(docId) => {
+                  onSetProjectValue("persistentContextDocId", docId);
+                }}
+                onShowToast={onShowToast}
+              />
+            )}
 
             {/* Author Style & Literary Anti-Drift Modal */}
-            <AuthorStyleModal
-              isOpen={showAuthorStyleModal}
-              onClose={() => setShowAuthorStyleModal(false)}
-              currentAuthors={localCreatorNames || project.creatorNames || ""}
-              onSelectAuthor={(authorName) => {
-                setLocalCreatorNames(authorName);
-                onSetProjectValue("creatorNames", authorName);
-              }}
-              onAnchorStyle={(authorName) => {
-                setLocalCreatorNames(authorName);
-                onSetProjectValue("creatorNames", authorName);
-              }}
-              onPurgeDrift={(authorName) => {
-                setInputText((prev) => {
-                  const reminder = `[Narrator directive: Strict adherence to ${authorName}'s literary style requested. Avoid generic assistant prose, eliminate repetitious dialogue, and ground narration in concrete sensory textures.]\n\n`;
-                  return reminder + prev;
-                });
-              }}
-              onShowToast={onShowToast}
-            />
+            {showAuthorStyleModal && (
+              <AuthorStyleModal
+                isOpen={true}
+                onClose={() => setShowAuthorStyleModal(false)}
+                currentAuthors={localCreatorNames || project.creatorNames || ""}
+                onSelectAuthor={(authorName) => {
+                  setLocalCreatorNames(authorName);
+                  onSetProjectValue("creatorNames", authorName);
+                }}
+                onAnchorStyle={(authorName) => {
+                  setLocalCreatorNames(authorName);
+                  onSetProjectValue("creatorNames", authorName);
+                }}
+                onPurgeDrift={(authorName) => {
+                  setInputText((prev) => {
+                    const reminder = `[Narrator directive: Strict adherence to ${authorName}'s literary style requested. Avoid generic assistant prose, eliminate repetitious dialogue, and ground narration in concrete sensory textures.]\n\n`;
+                    return reminder + prev;
+                  });
+                }}
+                onShowToast={onShowToast}
+              />
+            )}
 
             {onOpenStoryArchives && (
               <button
@@ -6147,16 +6107,18 @@ export default function AdventureChat({
       </div>
 
       {/* 2.0 DYNAMIC CONTEXT & MEMORY INSPECTOR MODAL */}
-      <ContextHUDModal
-        isOpen={showContextHUDModal}
-        onClose={() => setShowContextHUDModal(false)}
-        characters={characters}
-        messages={messages}
-        slidingTurnsLimit={project.slidingContextTurns ?? 12}
-        onSetSlidingTurns={(turns) => onSetProjectValue("slidingContextTurns", turns)}
-        onUpdateCharacter={onUpdateCharacter}
-        onShowToast={onShowToast}
-      />
+      {showContextHUDModal && (
+        <ContextHUDModal
+          isOpen={true}
+          onClose={() => setShowContextHUDModal(false)}
+          characters={characters}
+          messages={messages}
+          slidingTurnsLimit={project.slidingContextTurns ?? 12}
+          onSetSlidingTurns={(turns) => onSetProjectValue("slidingContextTurns", turns)}
+          onUpdateCharacter={onUpdateCharacter}
+          onShowToast={onShowToast}
+        />
+      )}
 
       {/* Workspace Browser, Modals and other absolute layers go below */}
 
@@ -7068,47 +7030,53 @@ export default function AdventureChat({
       )}
 
       {/* Encyclopedic Lore Archives & Codex Modal */}
-      <LoreCodexModal
-        isOpen={isLoreCodexOpen}
-        onClose={() => setIsLoreCodexOpen(false)}
-        activeUniverse={activeSettingResolved}
-        currentCampaign={{
-          id: project?.id,
-          name: project?.name,
-          activeFactIndexes: project?.activeFactIndexes
-        }}
-        onUpdateCampaignIndexes={(indexes) => {
-          onSetProjectValue("activeFactIndexes", indexes);
-        }}
-        onShowToast={onShowToast}
-      />
+      {isLoreCodexOpen && (
+        <LoreCodexModal
+          isOpen={true}
+          onClose={() => setIsLoreCodexOpen(false)}
+          activeUniverse={activeSettingResolved}
+          currentCampaign={{
+            id: project?.id,
+            name: project?.name,
+            activeFactIndexes: project?.activeFactIndexes
+          }}
+          onUpdateCampaignIndexes={(indexes) => {
+            onSetProjectValue("activeFactIndexes", indexes);
+          }}
+          onShowToast={onShowToast}
+        />
+      )}
 
       {/* Turn-Level Token Breakdown Modal */}
-      <TokenBreakdownModal
-        isOpen={!!tokenBreakdownTarget}
-        onClose={() => setTokenBreakdownTarget(null)}
-        msg={tokenBreakdownTarget?.msg || null}
-        turnIndex={tokenBreakdownTarget?.index ?? 0}
-        characters={characters}
-        turnHeader={project.turnHeader}
-        allMessages={messages}
-        onSelectTurn={(newIdx) => {
-          if (newIdx >= 0 && newIdx < messages.length) {
-            setTokenBreakdownTarget({ msg: messages[newIdx], index: newIdx });
-          }
-        }}
-      />
+      {!!tokenBreakdownTarget && (
+        <TokenBreakdownModal
+          isOpen={true}
+          onClose={() => setTokenBreakdownTarget(null)}
+          msg={tokenBreakdownTarget?.msg || null}
+          turnIndex={tokenBreakdownTarget?.index ?? 0}
+          characters={characters}
+          turnHeader={project.turnHeader}
+          allMessages={messages}
+          onSelectTurn={(newIdx) => {
+            if (newIdx >= 0 && newIdx < messages.length) {
+              setTokenBreakdownTarget({ msg: messages[newIdx], index: newIdx });
+            }
+          }}
+        />
+      )}
 
       {/* Canon & Narrative Delta Studio Modal */}
-      <CanonDeltaStudioModal
-        isOpen={showCanonDeltaStudio}
-        onClose={() => setShowCanonDeltaStudio(false)}
-        initialCharacter={canonStudioTargetChar}
-        existingCharacters={characters}
-        chatMessages={messages}
-        projectSetting={project.setting || project.name || ""}
-        onApplyProfile={handleApplyCanonProfile}
-      />
+      {showCanonDeltaStudio && (
+        <CanonDeltaStudioModal
+          isOpen={true}
+          onClose={() => setShowCanonDeltaStudio(false)}
+          initialCharacter={canonStudioTargetChar}
+          existingCharacters={characters}
+          chatMessages={messages}
+          projectSetting={project.setting || project.name || ""}
+          onApplyProfile={handleApplyCanonProfile}
+        />
+      )}
 
     </div>
   );

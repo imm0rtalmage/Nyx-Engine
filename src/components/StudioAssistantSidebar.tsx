@@ -56,7 +56,7 @@ export interface AssistantAttachment {
 export interface AssistantExecutedAction {
   name: string;
   description: string;
-  targetTab?: "chat" | "editor" | "image" | "workspace";
+  targetTab?: "chat" | "editor" | "workspace";
   subType?: "lore" | "world_setting" | "keep" | "tasks" | "main_chat" | "sources" | "vault";
   targetId?: string;
   targetKey?: string;
@@ -81,7 +81,7 @@ export interface StudioAssistantSidebarProps {
   tasks: any[];
   onSetProjectValue: (key: string, value: any) => Promise<void> | void;
   onNavigateToItem?: (target: {
-    targetTab?: "chat" | "editor" | "image" | "workspace";
+    targetTab?: "chat" | "editor" | "workspace";
     subType?: "lore" | "world_setting" | "keep" | "tasks" | "main_chat" | "sources" | "vault";
     targetId?: string;
     targetKey?: string;
@@ -118,6 +118,7 @@ export interface StudioAssistantSidebarProps {
   onGoogleSignIn?: () => void;
   embedded?: boolean;
   onClose?: () => void;
+  isCinemaMode?: boolean;
 }
 
 const STORAGE_KEY_PREFIX = "adventure_assistant_chat_v4_";
@@ -146,7 +147,8 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
   googleToken,
   onGoogleSignIn,
   embedded = false,
-  onClose
+  onClose,
+  isCinemaMode = false
 }) => {
   const [isOpen, setIsOpen] = useState<boolean>(() => {
     try {
@@ -165,6 +167,35 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
       return false;
     }
   });
+
+  const wasOpenBeforeCinemaRef = useRef<boolean | null>(null);
+
+  // When entering Cinema Mode, collapse to a side tab handle like Project Settings
+  useEffect(() => {
+    if (isCinemaMode) {
+      wasOpenBeforeCinemaRef.current = isOpen;
+      setIsOpen(false);
+    } else if (wasOpenBeforeCinemaRef.current !== null) {
+      if (wasOpenBeforeCinemaRef.current) {
+        setIsOpen(true);
+      }
+      wasOpenBeforeCinemaRef.current = null;
+    }
+  }, [isCinemaMode]);
+
+  // Persist open/docked state to maintain consistent layout across refreshes
+  useEffect(() => {
+    if (isCinemaMode) return; // Preserve pre-cinema state in storage
+    try {
+      safeLocalStorage.setItem("studio_assistant_sidebar_open", String(isOpen));
+    } catch {}
+  }, [isOpen, isCinemaMode]);
+
+  useEffect(() => {
+    try {
+      safeLocalStorage.setItem("studio_assistant_sidebar_docked", String(isDocked));
+    } catch {}
+  }, [isDocked]);
 
   const [chatMessages, setChatMessages] = useState<AssistantMessage[]>([]);
   const [inputText, setInputText] = useState("");
@@ -2578,42 +2609,43 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
 
   return (
     <>
-      {/* FLOATING BACKDROP (ONLY IN UNPINNED / FLOATING OVERLAY MODE ON SMALL SCREENS / WHEN OPEN) */}
+      {/* FLOATING BACKDROP (IN UNPINNED OVERLAY MODE WHEN OPEN) */}
       {isOpen && !isDocked && (
         <div 
           onClick={() => setIsOpen(false)}
-          className="fixed inset-0 bg-black/40 z-40 backdrop-blur-[1.5px] transition-opacity duration-200 lg:hidden"
+          className="absolute inset-0 bg-black/40 z-35 backdrop-blur-[1px] transition-opacity duration-200 cursor-pointer"
           title="Click to close floating assistant"
         />
       )}
 
-      <aside 
-        className={`transition-all duration-300 ease-in-out flex flex-col h-full ${
-          isOpen 
-            ? isDocked 
-              ? "relative z-30 w-[390px] sm:w-[420px] lg:w-[450px] shrink-0 border-l border-slate-800/80 bg-slate-950/95 backdrop-blur-md shadow-lg" 
-              : "fixed right-0 top-0 bottom-0 z-50 w-[390px] sm:w-[420px] lg:w-[450px] border-l border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/60 animate-in slide-in-from-right duration-200"
-            : "w-0 overflow-hidden border-none"
-        }`}
-      >
-        {/* TOGGLE TAB HANDLE (WHEN CLOSED) */}
-        {!isOpen && (
-          <button
-            type="button"
-            onClick={() => setIsOpen(true)}
-            className="fixed right-0 top-20 z-50 bg-slate-900 hover:bg-purple-900/90 text-purple-300 hover:text-white px-2 py-3 rounded-l-xl border-y border-l border-purple-600/40 shadow-xl flex flex-col items-center gap-1 transition-all cursor-pointer group"
-            title="Open Studio Assistant (Nyx)"
-          >
-            <Sparkles size={16} className="text-purple-400 group-hover:rotate-12 transition-transform" />
-            <span className="text-[10px] font-mono font-bold writing-mode-vertical tracking-wider uppercase text-purple-300">
-              Assistant
-            </span>
-            <ChevronLeft size={14} className="text-slate-400 group-hover:text-white" />
-          </button>
-        )}
+      {/* TOGGLE TAB HANDLE (WHEN CLOSED) - Symmetrically mirrors Project Settings */}
+      {!isOpen && (
+        <button
+          type="button"
+          onClick={() => setIsOpen(true)}
+          className="absolute right-0 top-20 z-40 bg-slate-900/90 hover:bg-purple-900/90 text-purple-300 hover:text-white px-2 py-3 rounded-l-xl border-y border-l border-purple-600/40 shadow-xl flex flex-col items-center gap-1 transition-all cursor-pointer group"
+          title="Open Studio Assistant (Nyx)"
+        >
+          <Sparkles size={15} className="text-purple-400 group-hover:rotate-12 transition-transform" />
+          <span className="text-[10px] font-mono font-bold writing-mode-vertical tracking-wider uppercase text-purple-300">
+            Assistant
+          </span>
+          <ChevronLeft size={14} className="text-slate-400 group-hover:text-white" />
+        </button>
+      )}
 
-        {isOpen && assistantContent}
-      </aside>
+      {/* ASIDE PANEL (PINNED OR OVERLAY) */}
+      {isOpen && (
+        <aside 
+          className={`transition-all duration-300 ease-in-out flex flex-col h-full ${
+            isDocked 
+              ? "relative z-30 w-[380px] sm:w-[420px] lg:w-[450px] shrink-0 rounded-2xl border border-slate-800/80 bg-slate-950/95 backdrop-blur-md shadow-lg overflow-hidden ml-3" 
+              : "absolute right-0 top-0 bottom-0 z-40 w-[380px] sm:w-[420px] max-w-[92vw] rounded-l-2xl border-y border-l border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/60 animate-in slide-in-from-right duration-200"
+          }`}
+        >
+          {assistantContent}
+        </aside>
+      )}
     </>
   );
 };

@@ -82,19 +82,6 @@ export interface CharacterProfile {
   canonDelta?: string; // The delta: differences between online canon and this campaign's reality
 }
 
-export interface GeneratedImage {
-  id: string;
-  url: string; // base64 or source
-  prompt: string;
-  seed: number;
-  tokensUsed: number;
-  timestamp: string;
-  fileName: string;
-  projectId: string;
-  references?: string[]; // list of referenced image URLs
-  characterTags?: string[]; // tags to organize by character
-}
-
 export interface KeepNote {
   id: string;
   title: string;
