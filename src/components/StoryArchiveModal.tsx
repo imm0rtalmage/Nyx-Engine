@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { 
   BookOpen, RefreshCw, Trash2, Download, Copy, Check, 
-  ArrowRight, Search, FileText, AlertCircle, Sparkles, X, ChevronDown, ChevronUp, Clock, Database
+  ArrowRight, Search, FileText, AlertCircle, Sparkles, X, ChevronDown, ChevronUp, Clock, Database,
+  Upload, FileJson, Laptop, Smartphone, ExternalLink
 } from "lucide-react";
 import { Message, Project } from "../types";
 import { safeLocalStorage } from "../App";
@@ -29,6 +30,8 @@ interface StoryArchiveModalProps {
   onSelectProject: (projectId: string) => void;
   onRestoreMessages: (messages: Message[], campaignName?: string) => void;
   onRestoreOrCreateCampaign?: (campaignName: string, messages?: Message[], specificProjectId?: string) => void;
+  onExportAllData?: () => void;
+  onImportAllData?: (jsonStr: string) => void;
   onShowToast?: (title: string, description: string, type?: "success" | "error" | "info") => void;
 }
 
@@ -192,6 +195,8 @@ export function StoryArchiveModal({
   onSelectProject,
   onRestoreMessages,
   onRestoreOrCreateCampaign,
+  onExportAllData,
+  onImportAllData,
   onShowToast
 }: StoryArchiveModalProps) {
   const [transcripts, setTranscripts] = useState<StoredTranscriptEntry[]>([]);
@@ -199,6 +204,38 @@ export function StoryArchiveModal({
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
+  const [showPasteModal, setShowPasteModal] = useState(false);
+  const [pastedJson, setPastedJson] = useState("");
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      if (text && onImportAllData) {
+        onImportAllData(text);
+        setTimeout(performScan, 400);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const handleConfirmPaste = () => {
+    if (!pastedJson.trim()) {
+      onShowToast?.("Paste Empty", "Please paste valid backup JSON text.", "info");
+      return;
+    }
+    if (onImportAllData) {
+      onImportAllData(pastedJson);
+      setShowPasteModal(false);
+      setPastedJson("");
+      setTimeout(performScan, 400);
+    }
+  };
 
   const performScan = () => {
     setIsScanning(true);
@@ -283,6 +320,35 @@ export function StoryArchiveModal({
           </div>
 
           <div className="flex items-center gap-2">
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileSelect}
+              accept=".json,application/json"
+              className="hidden"
+            />
+            {onExportAllData && (
+              <button
+                type="button"
+                onClick={onExportAllData}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-950/80 hover:bg-purple-900 border border-purple-700/60 text-xs font-semibold text-purple-200 transition-colors shadow-xs cursor-pointer"
+                title="Export all campaigns, characters, notes, and messages to a portable JSON backup file"
+              >
+                <Download size={13} className="text-purple-400" />
+                <span className="hidden sm:inline">Export All</span> (.json)
+              </button>
+            )}
+            {onImportAllData && (
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-700/60 text-xs font-semibold text-emerald-200 transition-colors shadow-xs cursor-pointer"
+                title="Import campaign backup JSON from another machine or device"
+              >
+                <Upload size={13} className="text-emerald-400" />
+                <span className="hidden sm:inline">Import</span> Backup
+              </button>
+            )}
             <button
               type="button"
               onClick={performScan}
@@ -333,6 +399,45 @@ export function StoryArchiveModal({
           </div>
         )}
 
+        {/* Device Switch Migration Helper Banner */}
+        {transcripts.length === 0 && (
+          <div className="mx-6 mt-4 p-4 rounded-xl bg-purple-950/40 border border-purple-800/50 text-xs space-y-2 text-slate-200 shadow-md">
+            <div className="flex items-center gap-2 text-purple-300 font-bold text-sm">
+              <Laptop size={16} className="text-purple-400 shrink-0" />
+              <span>Switched Machines or Don't See Your Campaigns?</span>
+            </div>
+            <p className="text-slate-300 leading-relaxed text-xs">
+              Campaigns, adventure transcripts, and character profiles are stored locally in each browser. Because you are on a new machine or new browser session, this browser doesn't have your previous files yet.
+              <span className="text-emerald-300 font-semibold block mt-1">
+                Your campaigns are safe on your original machine!
+              </span>
+            </p>
+            <div className="bg-slate-950/80 p-3 rounded-lg border border-slate-800 text-[11px] space-y-1 text-slate-300">
+              <div className="font-semibold text-purple-300">Fast 2-step migration:</div>
+              <ol className="list-decimal list-inside space-y-1 text-slate-400">
+                <li>On your <span className="text-slate-200 font-semibold">previous machine</span>, click <span className="text-purple-300 font-mono font-semibold">Archives → "Export All (.json)"</span>.</li>
+                <li>On this machine, click <span className="text-emerald-300 font-mono font-semibold">"Import Backup"</span> below to instantly load all your campaigns, characters, and chats.</li>
+              </ol>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold flex items-center gap-1.5 transition-colors cursor-pointer text-xs"
+              >
+                <Upload size={13} /> Import Backup File (.json)
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowPasteModal(true)}
+                className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-semibold flex items-center gap-1.5 transition-colors cursor-pointer text-xs"
+              >
+                <Copy size={13} /> Paste Backup JSON
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Search & Filter Bar */}
         <div className="px-6 py-3.5 border-b border-slate-800 bg-slate-950/50 flex flex-wrap items-center gap-3 justify-between">
           <div className="relative flex-1 min-w-[240px]">
@@ -353,6 +458,16 @@ export function StoryArchiveModal({
                 <X size={12} />
               </button>
             )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowPasteModal(true)}
+              className="text-[11px] font-medium text-slate-400 hover:text-purple-300 flex items-center gap-1 px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-800 transition-colors"
+              title="Paste raw JSON backup text to restore"
+            >
+              <FileJson size={13} /> Paste JSON
+            </button>
           </div>
         </div>
 
@@ -559,6 +674,58 @@ export function StoryArchiveModal({
         </div>
 
       </div>
+
+      {/* PASTE BACKUP JSON MODAL */}
+      {showPasteModal && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-slate-900 border border-purple-500/40 rounded-2xl w-full max-w-lg p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2 text-purple-400">
+                <FileJson size={18} />
+                <h3 className="text-sm font-bold text-slate-100">Paste Campaign Backup JSON</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPasteModal(false)}
+                className="text-slate-400 hover:text-slate-200 p-1 rounded-lg"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Paste exported JSON text from your previous machine to restore all campaigns, character vaults, notes, and story transcripts.
+            </p>
+
+            <textarea
+              rows={8}
+              value={pastedJson}
+              onChange={(e) => setPastedJson(e.target.value)}
+              placeholder='Paste backup JSON content here (starts with { "version": 2, "projects": [...] } or [{ "id": ... }])...'
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-200 placeholder-slate-600 outline-none focus:border-purple-500 transition-colors resize-none"
+            />
+
+            <div className="flex justify-end gap-2.5 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setShowPasteModal(false)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmPaste}
+                disabled={!pastedJson.trim()}
+                className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white text-xs font-semibold shadow-lg shadow-purple-900/30 transition-all flex items-center gap-1.5"
+              >
+                <Upload size={13} />
+                Restore from Text
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

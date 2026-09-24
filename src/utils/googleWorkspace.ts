@@ -17,6 +17,53 @@ export function safeParseJson<T = any>(rawText: string, fallback: T): T {
   }
 }
 
+// Helper to extract all text recursively from a Google Docs API Document object
+export function extractFullTextFromGoogleDoc(docData: any): string {
+  if (!docData) return "";
+  let fullText = "";
+
+  function traverseElements(elements: any[]) {
+    if (!Array.isArray(elements)) return;
+    for (const el of elements) {
+      if (el?.textRun?.content) {
+        fullText += el.textRun.content;
+      }
+    }
+  }
+
+  function traverseStructuralElements(structuralElements: any[]) {
+    if (!Array.isArray(structuralElements)) return;
+    for (const elem of structuralElements) {
+      if (elem?.paragraph?.elements) {
+        traverseElements(elem.paragraph.elements);
+      }
+      if (elem?.table?.tableRows) {
+        for (const row of elem.table.tableRows) {
+          if (Array.isArray(row?.tableCells)) {
+            for (const cell of row.tableCells) {
+              if (cell?.content) {
+                traverseStructuralElements(cell.content);
+              }
+            }
+          }
+        }
+      }
+      if (elem?.tableOfContents?.content) {
+        traverseStructuralElements(elem.tableOfContents.content);
+      }
+    }
+  }
+
+  if (docData.body?.content) {
+    traverseStructuralElements(docData.body.content);
+  }
+
+  const trimmed = fullText.trim();
+  if (trimmed) return trimmed;
+  if (docData.title) return `[Document: ${docData.title}]`;
+  return "";
+}
+
 // 1. Fetch Google Doc/File content with type-specific parsers
 export async function fetchGoogleFile(
   accessToken: string,
@@ -49,6 +96,13 @@ export async function fetchGoogleFile(
     } catch {
       detail = "";
     }
+
+    if (res.status === 401 || res.status === 403 || detail.includes("invalid authentication credentials") || detail.includes("login page")) {
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("nyx_google_auth_expired"));
+      }
+    }
+
     const statusInfo = res.status ? `HTTP ${res.status}` : "";
     const statusText = res.statusText || (res.status === 401 ? "Unauthorized" : res.status === 403 ? "Forbidden" : res.status === 404 ? "Not Found" : "");
     const combined = [statusInfo, statusText, detail].filter(Boolean).join(" - ");
@@ -66,11 +120,23 @@ export async function fetchGoogleFile(
     const exportUrl = `https://www.googleapis.com/drive/v3/files/${cleanId}/export?mimeType=${exportMime}`;
     const proxyUrl = `/api/google-proxy?url=${encodeURIComponent(exportUrl)}`;
     
+    // Try via proxy first, then direct
     try {
-      const response = await fetch(proxyUrl, {
+      let response = await fetch(proxyUrl, {
         headers: { Authorization: `Bearer ${accessToken}` },
         signal,
       });
+      if (!response.ok) {
+        // Fallback to direct client fetch
+        try {
+          const directResp = await fetch(exportUrl, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+            signal,
+          });
+          if (directResp.ok) response = directResp;
+        } catch {}
+      }
+
       if (response.ok) {
         const text = await response.text();
         if (text && text.trim()) return { text };
@@ -86,25 +152,26 @@ export async function fetchGoogleFile(
       const docUrl = `https://docs.googleapis.com/v1/documents/${cleanId}`;
       const proxyDocUrl = `/api/google-proxy?url=${encodeURIComponent(docUrl)}`;
       try {
-        const docResponse = await fetch(proxyDocUrl, {
+        let docResponse = await fetch(proxyDocUrl, {
           headers: { Authorization: `Bearer ${accessToken}` },
           signal,
         });
+
+        if (!docResponse.ok) {
+          // Fallback to direct client fetch
+          try {
+            const directDocResp = await fetch(docUrl, {
+              headers: { Authorization: `Bearer ${accessToken}` },
+              signal,
+            });
+            if (directDocResp.ok) docResponse = directDocResp;
+          } catch {}
+        }
+
         if (docResponse.ok) {
           const rawDocText = await docResponse.text();
           const docData = safeParseJson<any>(rawDocText, {});
-          let bodyText = "";
-          if (docData.body && docData.body.content) {
-            docData.body.content.forEach((element: any) => {
-              if (element.paragraph && element.paragraph.elements) {
-                element.paragraph.elements.forEach((el: any) => {
-                  if (el.textRun && el.textRun.content) {
-                    bodyText += el.textRun.content;
-                  }
-                });
-              }
-            });
-          }
+          const bodyText = extractFullTextFromGoogleDoc(docData);
           if (bodyText && bodyText.trim()) return { text: bodyText };
         } else {
           lastErrorMessage = await parseErrorText(docResponse, "Google Docs API error");
@@ -115,83 +182,97 @@ export async function fetchGoogleFile(
     }
   }
 
-  // Strategy C: Try standard Drive Media / Alt=Media API
-  const mediaUrl = `https://www.googleapis.com/drive/v3/files/${cleanId}?alt=media`;
-  const proxyMediaUrl = `/api/google-proxy?url=${encodeURIComponent(mediaUrl)}`;
-  try {
-    const response = await fetch(proxyMediaUrl, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      signal,
-    });
+  // Strategy C: For non-Google Apps binary/plain media files, fetch via alt=media
+  // (Note: Google Drive rejects alt=media on Google Docs/Sheets with 403; only use for binary files)
+  if (!isGoogleAppsDoc) {
+    const mediaUrl = `https://www.googleapis.com/drive/v3/files/${cleanId}?alt=media`;
+    const proxyMediaUrl = `/api/google-proxy?url=${encodeURIComponent(mediaUrl)}`;
+    try {
+      let response = await fetch(proxyMediaUrl, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal,
+      });
 
-    if (response.ok) {
-      if (
-        checkMime.startsWith("text/") || 
-        checkMime === "application/json" || 
-        checkMime === "application/xml" ||
-        checkMime === "application/javascript" ||
-        !checkMime
-      ) {
-        const text = await response.text();
-        return { text };
-      } else if (checkMime === "application/pdf" || checkMime.startsWith("image/")) {
-        const blob = await response.blob();
-        return new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            resolve({
-              text: checkMime === "application/pdf" 
-                ? `[Binary PDF file retrieved from Google Drive]` 
-                : `[Image file retrieved from Google Drive]`,
-              fileBase64: reader.result as string,
-              fileMimeType: mimeType
-            });
-          };
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
-        });
-      } else if (checkMime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-        const blob = await response.blob();
-        return new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            const arrayBuffer = reader.result as ArrayBuffer;
-            const zip = new JSZip();
-            zip.loadAsync(arrayBuffer).then(zipFile => {
-              const docXmlFile = zipFile.file("word/document.xml");
-              if (!docXmlFile) {
-                resolve({ text: `[Error reading docx: Could not find word/document.xml]` });
-                return;
-              }
-              docXmlFile.async("text").then(xmlText => {
-                const parser = new DOMParser();
-                const xmlDoc = parser.parseFromString(xmlText, "application/xml");
-                const textNodes = xmlDoc.getElementsByTagName("w:t");
-                let result = "";
-                for (let i = 0; i < textNodes.length; i++) {
-                  result += textNodes[i].textContent || "";
-                }
-                resolve({ text: result || "[Empty Document]" });
-              }).catch(err => {
-                resolve({ text: `[Error parsing docx XML: ${err.message}]` });
-              });
-            }).catch(err => {
-              resolve({ text: `[Error unzipping docx: ${err.message}]` });
-            });
-          };
-          reader.onerror = reject;
-          reader.readAsArrayBuffer(blob);
-        });
-      } else {
-        const text = await response.text();
-        return { text };
+      if (!response.ok) {
+        // Fallback to direct client fetch
+        try {
+          const directMediaResp = await fetch(mediaUrl, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+            signal,
+          });
+          if (directMediaResp.ok) response = directMediaResp;
+        } catch {}
       }
-    } else {
-      lastErrorMessage = await parseErrorText(response, "Google Drive media fetch error");
-    }
-  } catch (err: any) {
-    if (!lastErrorMessage) {
-      lastErrorMessage = `Media fetch failed: ${err.message || String(err)}`;
+
+      if (response.ok) {
+        if (
+          checkMime.startsWith("text/") || 
+          checkMime === "application/json" || 
+          checkMime === "application/xml" ||
+          checkMime === "application/javascript" ||
+          !checkMime
+        ) {
+          const text = await response.text();
+          return { text };
+        } else if (checkMime === "application/pdf" || checkMime.startsWith("image/")) {
+          const blob = await response.blob();
+          return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              resolve({
+                text: checkMime === "application/pdf" 
+                  ? `[Binary PDF file retrieved from Google Drive]` 
+                  : `[Image file retrieved from Google Drive]`,
+                fileBase64: reader.result as string,
+                fileMimeType: mimeType
+              });
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+          });
+        } else if (checkMime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+          const blob = await response.blob();
+          return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const arrayBuffer = reader.result as ArrayBuffer;
+              const zip = new JSZip();
+              zip.loadAsync(arrayBuffer).then(zipFile => {
+                const docXmlFile = zipFile.file("word/document.xml");
+                if (!docXmlFile) {
+                  resolve({ text: `[Error reading docx: Could not find word/document.xml]` });
+                  return;
+                }
+                docXmlFile.async("text").then(xmlText => {
+                  const parser = new DOMParser();
+                  const xmlDoc = parser.parseFromString(xmlText, "application/xml");
+                  const textNodes = xmlDoc.getElementsByTagName("w:t");
+                  let result = "";
+                  for (let i = 0; i < textNodes.length; i++) {
+                    result += textNodes[i].textContent || "";
+                  }
+                  resolve({ text: result || "[Empty Document]" });
+                }).catch(err => {
+                  resolve({ text: `[Error parsing docx XML: ${err.message}]` });
+                });
+              }).catch(err => {
+                resolve({ text: `[Error unzipping docx: ${err.message}]` });
+              });
+            };
+            reader.onerror = reject;
+            reader.readAsArrayBuffer(blob);
+          });
+        } else {
+          const text = await response.text();
+          return { text };
+        }
+      } else {
+        lastErrorMessage = await parseErrorText(response, "Google Drive media fetch error");
+      }
+    } catch (err: any) {
+      if (!lastErrorMessage) {
+        lastErrorMessage = `Media fetch failed: ${err.message || String(err)}`;
+      }
     }
   }
 
@@ -473,15 +554,28 @@ export async function updateGoogleDoc(accessToken: string, docId: string, conten
   }
 }
 
-// Helper to extract Doc ID from a full Google Docs URL if needed
+// Helper to extract Doc ID from a full Google Docs URL or link
 export function extractDocId(input: string): string {
-  if (input.includes("/d/")) {
-    const parts = input.split("/d/");
+  if (!input) return "";
+  let val = input.trim();
+  if (val.includes("/d/")) {
+    const parts = val.split("/d/");
     if (parts[1]) {
-      return parts[1].split("/")[0];
+      val = parts[1].split("/")[0];
+    }
+  } else if (val.includes("id=")) {
+    try {
+      const u = new URL(val.startsWith("http") ? val : `https://${val}`);
+      const param = u.searchParams.get("id");
+      if (param) val = param;
+    } catch {
+      const match = val.match(/id=([a-zA-Z0-9_-]+)/);
+      if (match) val = match[1];
     }
   }
-  return input.trim();
+  // Strip trailing URL query parameters or hash fragments
+  val = val.split("?")[0].split("#")[0].trim();
+  return val;
 }
 
 // 3. List Google Docs and other supported document/media formats from Google Drive with dynamic search and tab filtering

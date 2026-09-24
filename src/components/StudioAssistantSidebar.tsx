@@ -572,13 +572,44 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
               targetKey = "narrativePerspective";
             } else if (
               kNorm === "adventurelogtitle" ||
-              kNorm === "adventurelog" ||
               kNorm === "logtitle" ||
               kNorm === "narrativetitle" ||
               kNorm === "narrativelogtitle" ||
               kNorm === "adventuretitle"
             ) {
               targetKey = "adventureLogTitle";
+            } else if (kNorm === "narrative" || kNorm === "narrativelog" || kNorm === "adventurelog" || kNorm === "storylog" || kNorm === "story") {
+              // Direct narrative prose update routed via update_project_value
+              if (targetVal) {
+                const proseText = String(targetVal);
+                if (proseText.length > 30 || proseText.includes(" ") || proseText.includes("\n")) {
+                  let msg = narrativeMessages.length > 0 ? narrativeMessages[narrativeMessages.length - 1] : null;
+                  const modelMsgs = narrativeMessages.filter(m => m.role === "model" || m.role === "nyx");
+                  if (modelMsgs.length > 0) msg = modelMsgs[modelMsgs.length - 1];
+                  if (msg && onEditMessage) {
+                    await onEditMessage(msg.id, proseText);
+                    executed.push({
+                      name: `Edited Narrative Log Turn`,
+                      description: proseText.slice(0, 140) + "...",
+                      targetTab: "chat",
+                      subType: "main_chat",
+                      targetId: msg.id
+                    });
+                    onShowToast("✨ Narrative Turn Revised", "Successfully edited the active scene turn in the Adventure Log.", "success");
+                  } else if (onInjectMessageToMainChat) {
+                    await onInjectMessageToMainChat(proseText, "model");
+                    executed.push({
+                      name: `Created Narrative Scene Turn`,
+                      description: proseText.slice(0, 140) + "...",
+                      targetTab: "chat",
+                      subType: "main_chat"
+                    });
+                  }
+                  targetKey = ""; // Handled
+                } else {
+                  targetKey = "adventureLogTitle";
+                }
+              }
             } else if (
               kNorm === "turnheader" ||
               kNorm === "turnheadertemplate" ||
@@ -1194,40 +1225,85 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
         else if (
           name === "edit_narrative_log" ||
           name === "edit_narrative_entry" ||
+          name === "edit_narrative" ||
+          name === "update_narrative_log" ||
+          name === "update_narrative" ||
+          name === "rewrite_narrative_turn" ||
+          name === "rewrite_narrative" ||
+          name === "rewrite_message" ||
           name === "edit_message" ||
           name === "update_message" ||
-          name === "rewrite_narrative_turn" ||
-          name === "rewrite_message"
+          name === "modify_narrative_log" ||
+          name === "modify_narrative" ||
+          name === "revise_narrative_log" ||
+          name === "revise_narrative" ||
+          name === "revise_turn" ||
+          name === "edit_turn" ||
+          name === "retcon_narrative"
         ) {
-          const targetId = args.id || args.messageId;
-          const newContent = args.newContent !== undefined ? args.newContent : args.content !== undefined ? args.content : args.text;
-          const searchSnippet = args.searchSnippet || args.snippet || args.match;
+          const targetId = args.id || args.messageId || args.turnId || args.turn;
+          const newContent = args.newContent !== undefined ? args.newContent
+            : args.content !== undefined ? args.content
+            : args.text !== undefined ? args.text
+            : args.prose !== undefined ? args.prose
+            : args.storyText !== undefined ? args.storyText
+            : args.revisedText !== undefined ? args.revisedText
+            : args.editedText !== undefined ? args.editedText
+            : args.narrative !== undefined ? args.narrative
+            : args.updatedContent !== undefined ? args.updatedContent
+            : args.turnText !== undefined ? args.turnText
+            : args.message !== undefined ? args.message
+            : args.revisedProse !== undefined ? args.revisedProse
+            : args.replacement !== undefined ? args.replacement
+            : args.newText;
+          const searchSnippet = args.searchSnippet || args.snippet || args.match || args.query;
 
-          if (newContent !== undefined && onEditMessage && narrativeMessages.length > 0) {
+          if (newContent !== undefined) {
             let matchedMessage: any = null;
 
-            if (targetId && targetId !== "latest" && targetId !== "last") {
-              matchedMessage = narrativeMessages.find(m => m.id === targetId);
+            if (narrativeMessages.length > 0) {
+              if (targetId && targetId !== "latest" && targetId !== "last") {
+                matchedMessage = narrativeMessages.find(m => m.id === targetId);
+                if (!matchedMessage) {
+                  const numMatch = String(targetId).match(/\b(\d+)\b/);
+                  if (numMatch) {
+                    const rawNum = parseInt(numMatch[1], 10);
+                    // Check if it matches 0-based index
+                    if (rawNum >= 0 && rawNum < narrativeMessages.length && String(targetId).includes("0")) {
+                      matchedMessage = narrativeMessages[rawNum];
+                    } else {
+                      // Check 1-based relative to recent snippet (last 25)
+                      const offset = Math.max(0, narrativeMessages.length - 25);
+                      const snippetRelIdx = offset + rawNum - 1;
+                      if (snippetRelIdx >= 0 && snippetRelIdx < narrativeMessages.length) {
+                        matchedMessage = narrativeMessages[snippetRelIdx];
+                      } else if (rawNum - 1 >= 0 && rawNum - 1 < narrativeMessages.length) {
+                        matchedMessage = narrativeMessages[rawNum - 1];
+                      }
+                    }
+                  }
+                }
+              }
+
+              if (!matchedMessage && searchSnippet) {
+                const snippetLower = String(searchSnippet).toLowerCase().trim();
+                matchedMessage = [...narrativeMessages].reverse().find(m => {
+                  const text = (m.versions && typeof m.activeVersionIndex === "number" && m.versions[m.activeVersionIndex])
+                    ? m.versions[m.activeVersionIndex].content
+                    : (m.content || "");
+                  return text.toLowerCase().includes(snippetLower);
+                });
+              }
+
+              if (!matchedMessage) {
+                // Target the latest assistant/model/nyx turn or the very last message in narrative
+                const modelMsgs = narrativeMessages.filter(m => m.role === "model" || m.role === "nyx");
+                matchedMessage = modelMsgs.length > 0 ? modelMsgs[modelMsgs.length - 1] : narrativeMessages[narrativeMessages.length - 1];
+              }
             }
 
-            if (!matchedMessage && searchSnippet) {
-              const snippetLower = String(searchSnippet).toLowerCase().trim();
-              matchedMessage = [...narrativeMessages].reverse().find(m => 
-                (m.content || "").toLowerCase().includes(snippetLower)
-              );
-            }
-
-            if (!matchedMessage) {
-              // Target the latest assistant/model turn or the very last message in narrative
-              const modelMsgs = narrativeMessages.filter(m => m.role === "model" || m.role === "nyx");
-              matchedMessage = modelMsgs.length > 0 ? modelMsgs[modelMsgs.length - 1] : narrativeMessages[narrativeMessages.length - 1];
-            }
-
-            if (matchedMessage) {
-              await Promise.race([
-                onEditMessage(matchedMessage.id, String(newContent)),
-                new Promise(res => setTimeout(res, 2500))
-              ]);
+            if (matchedMessage && onEditMessage) {
+              await onEditMessage(matchedMessage.id, String(newContent));
               executed.push({
                 name: `Edited Narrative Log Turn`,
                 description: String(newContent).slice(0, 140) + (String(newContent).length > 140 ? "..." : ""),
@@ -1235,6 +1311,20 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
                 subType: "main_chat",
                 targetId: matchedMessage.id
               });
+              onShowToast("✨ Narrative Turn Revised", "Successfully edited the active scene turn in the Adventure Log.", "success");
+            } else if (onInjectMessageToMainChat) {
+              // If no message exists yet to edit (e.g. empty log), inject the new turn into the adventure log!
+              await Promise.race([
+                onInjectMessageToMainChat(String(newContent), "model"),
+                new Promise(res => setTimeout(res, 2500))
+              ]);
+              executed.push({
+                name: `Created Narrative Scene Turn`,
+                description: String(newContent).slice(0, 140) + (String(newContent).length > 140 ? "..." : ""),
+                targetTab: "chat",
+                subType: "main_chat"
+              });
+              onShowToast("✨ Narrative Scene Established", "Added new narrative turn directly into the Adventure Log.", "success");
             }
           }
         }
@@ -1341,7 +1431,12 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
     try {
       const recentNarrativeSnippet = (narrativeMessages || [])
         .slice(-25)
-        .map((m: any) => `[Turn ID: ${m.id}] [${m.role === "model" || m.role === "nyx" ? "DM (Nyx)" : "Player"}]: ${m.content}`)
+        .map((m: any, idx: number) => {
+          const contentText = (m.versions && typeof m.activeVersionIndex === "number" && m.versions[m.activeVersionIndex])
+            ? m.versions[m.activeVersionIndex].content
+            : (m.content || "");
+          return `[Turn ${idx + 1} | ID: ${m.id}] [${m.role === "model" || m.role === "nyx" ? "DM (Nyx)" : "Player"}]: ${contentText}`;
+        })
         .join("\n\n");
 
       // Sanitize sources to avoid sending megabytes of background base64 data over fetch, while providing rich document text

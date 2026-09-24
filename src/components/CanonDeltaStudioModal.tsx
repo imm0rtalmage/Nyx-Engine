@@ -23,6 +23,7 @@ import {
   ArrowRight
 } from "lucide-react";
 import { CharacterProfile } from "../types";
+import { safeFetchJson } from "../utils/apiClient";
 
 interface CanonDeltaStudioModalProps {
   isOpen: boolean;
@@ -96,20 +97,16 @@ export const CanonDeltaStudioModal: React.FC<CanonDeltaStudioModalProps> = ({
     setErrorMsg(null);
     setIsResearching(true);
     try {
-      const res = await fetch("/api/canon/research", {
+      const data = await safeFetchJson<any>("/api/canon/research", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           characterName: characterName.trim(),
           setting: projectSetting,
           franchise: franchiseHint
-        })
+        }),
+        timeout: 60000
       });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || "Failed to fetch online canon");
-      }
-      const data = await res.json();
       setOnlineCanon(data);
       setActiveStep(2);
     } catch (err: any) {
@@ -124,20 +121,16 @@ export const CanonDeltaStudioModal: React.FC<CanonDeltaStudioModalProps> = ({
     setErrorMsg(null);
     setIsExtractingLogs(true);
     try {
-      const res = await fetch("/api/canon/extract-from-logs", {
+      const data = await safeFetchJson<any>("/api/canon/extract-from-logs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           characterName: characterName.trim(),
           messages: chatMessages,
           projectSetting
-        })
+        }),
+        timeout: 60000
       });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || "Failed to extract from campaign logs");
-      }
-      const data = await res.json();
       setLogSummary(data);
       setActiveStep(3);
     } catch (err: any) {
@@ -156,7 +149,7 @@ export const CanonDeltaStudioModal: React.FC<CanonDeltaStudioModalProps> = ({
     setErrorMsg(null);
     setIsReconciling(true);
     try {
-      const res = await fetch("/api/canon/reconcile-delta", {
+      const data = await safeFetchJson<any>("/api/canon/reconcile-delta", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -166,13 +159,9 @@ export const CanonDeltaStudioModal: React.FC<CanonDeltaStudioModalProps> = ({
           timelineStage,
           projectSetting,
           userGuidance
-        })
+        }),
+        timeout: 60000
       });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || "Failed to reconcile canon delta");
-      }
-      const data = await res.json();
       setReconciledProfile(data);
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to reconcile canon delta");

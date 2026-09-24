@@ -9,6 +9,7 @@ import { createGoogleDoc } from "../utils/googleWorkspace";
 import { parseExternalChatFile, ParsedMessage } from "../utils/domParser";
 import { GooglePickerButton } from "./GooglePickerButton";
 import { SaveToDrivePickerModal } from "./SaveToDrivePickerModal";
+import { safeFetchJson } from "../utils/apiClient";
 
 interface NarrativeSuiteProps {
   chatTranscript: string;
@@ -145,19 +146,21 @@ export default function NarrativeSuite({
         currentToken = (await onGoogleSignIn()) || null;
       }
       const title = `${projectName || "Campaign"} - Polished Chapter (${new Date().toLocaleDateString()})`;
-      const res = await fetch("/api/spark/export-thread", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          token: currentToken || "",
-          projectId,
-          threadTitle: title,
-          transcriptText: textToSend
-        })
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        if (data.isAuthError || res.status === 401) {
+      let data: any;
+      try {
+        data = await safeFetchJson<any>("/api/spark/export-thread", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            token: currentToken || "",
+            projectId,
+            threadTitle: title,
+            transcriptText: textToSend
+          }),
+          timeout: 45000
+        });
+      } catch (postErr: any) {
+        if (postErr.message?.includes("401") || postErr.message?.includes("auth") || postErr.message?.includes("expired")) {
           if (typeof window !== "undefined") {
             window.dispatchEvent(new CustomEvent("nyx_google_auth_expired"));
           }
@@ -165,7 +168,7 @@ export default function NarrativeSuite({
             onShowToast?.("Re-authenticating...", "Google Drive token expired. Opening Google Sign In...", "info");
             const refreshedToken = await onGoogleSignIn();
             if (refreshedToken) {
-              const retryRes = await fetch("/api/spark/export-thread", {
+              data = await safeFetchJson<any>("/api/spark/export-thread", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -173,17 +176,22 @@ export default function NarrativeSuite({
                   projectId,
                   threadTitle: title,
                   transcriptText: textToSend
-                })
+                }),
+                timeout: 45000
               });
-              const retryData = await retryRes.json();
-              if (retryRes.ok && retryData.success) {
-                onShowToast?.("✨ Polish Sent to Spark Archive!", "Polished chapter dumped into 01_Raw_Threads for background Spark parsing.", "success");
-                return;
-              }
+            } else {
+              throw postErr;
             }
+          } else {
+            throw postErr;
           }
+        } else {
+          throw postErr;
         }
-        throw new Error(data.error || "Failed to send polish to Spark Archive");
+      }
+
+      if (!data || !data.success) {
+        throw new Error(data?.error || "Failed to send polish to Spark Archive");
       }
       onShowToast?.("✨ Polish Sent to Spark Archive!", "Polished chapter dumped into 01_Raw_Threads for background Spark parsing.", "success");
     } catch (err: any) {
@@ -465,18 +473,43 @@ export default function NarrativeSuite({
   };
 
   return (
-    <div className="flex flex-col h-full bg-slate-900 text-slate-100 p-6 rounded-2xl border border-slate-800">
-      <div className="mb-6">
-        <h2 className="text-xl font-sans font-semibold tracking-tight text-emerald-400">Narrative Editing Suite</h2>
-        <p className="text-xs text-slate-400">Convert roleplays to novels, fix inconsistencies, trigger scene retcons, and recalibrate system settings.</p>
+    <div className="flex flex-col flex-1 h-full min-h-0 bg-slate-900 text-slate-100 p-3 sm:p-5 lg:p-6 rounded-2xl border border-slate-800 overflow-y-auto overflow-x-hidden relative scrollbar-thin">
+      <div className="mb-4 sm:mb-6 shrink-0 flex flex-wrap justify-between items-start gap-3">
+        <div>
+          <h2 className="text-xl font-sans font-semibold tracking-tight text-emerald-400">Narrative Editing Suite</h2>
+          <p className="text-xs text-slate-400">Convert roleplays to novels, fix inconsistencies, trigger scene retcons, and recalibrate system settings.</p>
+        </div>
+        <div className="flex items-center gap-1.5 lg:hidden">
+          <button
+            type="button"
+            onClick={() => document.getElementById('narrative-source-panel')?.scrollIntoView({ behavior: 'smooth' })}
+            className="text-[10px] font-mono bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-emerald-300 px-2.5 py-1 rounded-lg border border-slate-700 transition-colors cursor-pointer"
+          >
+            ↓ Raw Source
+          </button>
+          <button
+            type="button"
+            onClick={() => document.getElementById('narrative-output-panel')?.scrollIntoView({ behavior: 'smooth' })}
+            className="text-[10px] font-mono bg-emerald-950/60 hover:bg-emerald-900/80 text-emerald-300 px-2.5 py-1 rounded-lg border border-emerald-800/50 transition-colors cursor-pointer"
+          >
+            ↓ Polished Output
+          </button>
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 flex-1 overflow-hidden">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6 flex-1 min-h-0">
         {/* Left Panel: Raw text input and commands */}
-        <div className="flex flex-col h-full overflow-hidden bg-slate-950 p-5 rounded-xl border border-slate-800/80">
-          <div className="flex justify-between items-center mb-3">
+        <div id="narrative-source-panel" className="flex flex-col bg-slate-950 p-4 sm:p-5 rounded-xl border border-slate-800/80 overflow-y-auto min-h-[500px] lg:min-h-0 lg:h-full scrollbar-thin">
+          <div className="flex flex-wrap justify-between items-center gap-2 mb-3 shrink-0">
             <h3 className="text-xs font-semibold text-emerald-300 uppercase tracking-wider">Raw Transcript & Scene Text</h3>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => document.getElementById('narrative-output-panel')?.scrollIntoView({ behavior: 'smooth' })}
+                className="lg:hidden text-[10px] text-emerald-400 hover:text-emerald-300 font-mono px-2 py-0.5 rounded border border-emerald-800/50 bg-emerald-950/40 cursor-pointer"
+              >
+                To Output ↓
+              </button>
               <button
                 onClick={() => setShowImportPanel(!showImportPanel)}
                 className={`text-[10px] px-2 py-0.5 rounded border flex items-center gap-1 transition-all font-sans font-medium ${
@@ -625,7 +658,7 @@ export default function NarrativeSuite({
             </div>
           )}
 
-          <div className="flex items-center justify-between gap-2 my-1">
+          <div className="flex items-center justify-between gap-2 my-1 shrink-0">
             <span className="text-[10px] font-mono text-slate-400">
               Raw Source Content ({editorText.length} chars | {editorText.trim() ? editorText.trim().split(/\s+/).length : 0} words)
             </span>
@@ -644,10 +677,10 @@ export default function NarrativeSuite({
             value={editorText}
             onChange={(e) => setEditorText(e.target.value)}
             placeholder="Paste raw conversation transcript, long chapter drafts, or scene blocks here... (Drag bottom edge to stretch)"
-            className="flex-1 w-full bg-slate-900 border border-slate-800 rounded-lg p-3 text-xs outline-none focus:ring-1 focus:ring-emerald-500 font-mono resize-y min-h-[220px] max-h-[600px] text-slate-200 scrollbar-thin"
+            className="flex-1 w-full bg-slate-900 border border-slate-800 rounded-lg p-3 text-xs outline-none focus:ring-1 focus:ring-emerald-500 font-mono resize-y min-h-[160px] max-h-[500px] text-slate-200 scrollbar-thin"
           />
 
-          <div className="mt-4 pt-4 border-t border-slate-800/60 space-y-3">
+          <div className="mt-4 pt-4 border-t border-slate-800/60 space-y-3 shrink-0">
             <div>
               <div className="flex justify-between items-center mb-1.5">
                 <label className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
@@ -787,10 +820,17 @@ export default function NarrativeSuite({
         </div>
 
         {/* Right Panel: Polished/edited result and Google Doc export */}
-        <div className="flex flex-col h-full overflow-hidden bg-slate-950 p-5 rounded-xl border border-slate-800/80">
-          <div className="flex justify-between items-center mb-3">
+        <div id="narrative-output-panel" className="flex flex-col bg-slate-950 p-4 sm:p-5 rounded-xl border border-slate-800/80 overflow-y-auto min-h-[500px] lg:min-h-0 lg:h-full scrollbar-thin">
+          <div className="flex flex-wrap justify-between items-center gap-2 mb-3 shrink-0">
             <h3 className="text-xs font-semibold text-emerald-300 uppercase tracking-wider">Polished Narrative Output</h3>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => document.getElementById('narrative-source-panel')?.scrollIntoView({ behavior: 'smooth' })}
+                className="lg:hidden text-[10px] text-slate-400 hover:text-slate-300 font-mono px-2 py-0.5 rounded border border-slate-800 bg-slate-900 cursor-pointer"
+              >
+                ↑ To Source
+              </button>
               {editedResult && !isProcessing && (
                 <>
                   <button
@@ -839,7 +879,7 @@ export default function NarrativeSuite({
           </div>
 
           {isProcessing ? (
-            <div className="flex-1 w-full bg-slate-900/90 border border-emerald-500/30 rounded-xl p-6 flex flex-col items-center justify-center text-center relative overflow-hidden animate-fade-in shadow-inner">
+            <div className="flex-1 w-full bg-slate-900/90 border border-emerald-500/30 rounded-xl p-4 sm:p-6 flex flex-col items-center justify-start sm:justify-center text-center relative overflow-y-auto animate-fade-in shadow-inner min-h-[260px] scrollbar-thin">
               {/* Ambient Glow */}
               <div className="absolute -top-24 -left-24 w-64 h-64 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none" />
               <div className="absolute -bottom-24 -right-24 w-64 h-64 bg-teal-500/10 rounded-full blur-3xl pointer-events-none" />
@@ -927,13 +967,13 @@ export default function NarrativeSuite({
               </div>
             </div>
           ) : (
-            <div className="flex-1 w-full bg-slate-900 border border-slate-800 rounded-lg p-3 text-xs overflow-y-auto font-serif whitespace-pre-wrap text-slate-100 leading-relaxed">
+            <div className="flex-1 w-full bg-slate-900 border border-slate-800 rounded-lg p-3 text-xs overflow-y-auto font-serif whitespace-pre-wrap text-slate-100 leading-relaxed min-h-[200px] scrollbar-thin">
               {editedResult || "Run a narration suite tool on the left to see the finished story output here."}
             </div>
           )}
 
           {/* Export and Grounding Action Controls */}
-          <div className="mt-4 pt-4 border-t border-slate-800/60 space-y-3">
+          <div className="mt-4 pt-4 border-t border-slate-800/60 space-y-3 shrink-0">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <button
                 onClick={handleAttachToSources}
@@ -1073,8 +1113,8 @@ export default function NarrativeSuite({
             </div>
 
             {/* Split / Big Textarea Content */}
-            <div className="flex-1 p-4 bg-slate-950 flex flex-col gap-3 overflow-hidden">
-              <div className="flex-1 flex flex-col">
+            <div className="flex-1 p-4 bg-slate-950 flex flex-col gap-3 overflow-y-auto min-h-0 scrollbar-thin">
+              <div className="flex-1 flex flex-col min-h-[220px]">
                 <label className="text-xs font-semibold text-slate-300 mb-1 font-mono flex justify-between">
                   <span>Source Chapter / Raw Transcript Text</span>
                   <span className="text-slate-500">Monospace View</span>
@@ -1083,7 +1123,7 @@ export default function NarrativeSuite({
                   value={editorText}
                   onChange={(e) => setEditorText(e.target.value)}
                   placeholder="Paste or write large raw transcripts or chapter drafts..."
-                  className="flex-1 w-full bg-slate-900 border border-slate-800 focus:border-emerald-500/80 rounded-xl p-4 text-xs text-slate-100 font-mono outline-none resize-none leading-relaxed scrollbar-thin"
+                  className="flex-1 w-full bg-slate-900 border border-slate-800 focus:border-emerald-500/80 rounded-xl p-4 text-xs text-slate-100 font-mono outline-none resize-none leading-relaxed scrollbar-thin min-h-[180px]"
                   autoFocus
                 />
               </div>
@@ -1113,7 +1153,7 @@ export default function NarrativeSuite({
             </div>
 
             {/* Footer */}
-            <div className="p-3 sm:p-4 border-t border-slate-800 bg-slate-950 flex flex-col gap-2">
+            <div className="p-3 sm:p-4 border-t border-slate-800 bg-slate-950 flex flex-col gap-2 shrink-0">
               {isProcessing && (
                 <div className="w-full bg-slate-900 border border-emerald-500/40 rounded-xl p-2.5 space-y-1.5 animate-fade-in">
                   <div className="flex justify-between items-center text-xs">

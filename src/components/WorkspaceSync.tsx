@@ -463,17 +463,18 @@ export default function WorkspaceSync({
     setIsSyncingSparkCodex(true);
     addLog("Spark Codex", "info", "⚡ Initiating background sync with RP Master Archives/02_Codex...");
     try {
-      const res = await fetch("/api/spark/sync-codex", {
+      const data = await safeFetchJson<any>("/api/spark/sync-codex", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           token: googleToken || "",
           projectId: project.id
-        })
+        }),
+        timeout: 60000
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || "Failed to sync Spark Codex");
+
+      if (!data || !data.success) {
+        throw new Error(data?.error || "Failed to sync Spark Codex");
       }
 
       const entityCount = data.syncedEntitiesCount || 0;
@@ -559,15 +560,13 @@ export default function WorkspaceSync({
           let newSummary = doc.summary;
           if (fetchedText.length > 60 && (!newSummary || newSummary === "On-demand reference document." || newSummary === "Attached reference document." || newSummary.includes("⚡ AI Indexing"))) {
             try {
-              const sumRes = await fetch("/api/summarize-source", {
+              const sumData = await safeFetchJson<any>("/api/summarize-source", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ name: doc.name, content: fetchedText })
+                body: JSON.stringify({ name: doc.name, content: fetchedText }),
+                timeout: 30000
               });
-              if (sumRes.ok) {
-                const sumData = await sumRes.json();
-                if (sumData.summary) newSummary = sumData.summary;
-              }
+              if (sumData?.summary) newSummary = sumData.summary;
             } catch (e) {
               // ignore
             }

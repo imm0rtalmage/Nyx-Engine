@@ -355,7 +355,8 @@ export function generateAuthorStyleBlueprint(rawInput: string = ""): AuthorStyle
     "No hackneyed narrative clichés ('A testament to', 'Little did they know', 'A shiver ran down their spine', 'Dance of shadows')",
     "No modern conversational slang or memes bleeding into character narration",
     "No emotional hand-holding or unsolicited moralizing narrator voice",
-    "Zero persona bleed: Nyx's casual/bratty DM persona is 100% barred from narrative story prose (outside square brackets)"
+    "Zero persona bleed: Nyx's casual/bratty DM persona is 100% barred from narrative story prose (outside square brackets)",
+    "ZERO PLAYER CHARACTER PUPPETEERING: Strictly never write spoken dialogue, uncommanded actions, thoughts, or emotional reactions for the player character"
   ];
 
   const synthesizedBlueprint = isMulti
@@ -456,6 +457,49 @@ export function detectAuthorRemindersAndDrift(
 }
 
 /**
+ * Detects if the player is reminding the AI to stop writing for the PC,
+ * asking it not to speak for them, or telling it to facilitate rather than puppeteer.
+ */
+export function detectPlayerAgencyComplaints(messages: any[] = []): {
+  isAgencyAlert: boolean;
+  complaintSnippet: string | null;
+} {
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    return { isAgencyAlert: false, complaintSnippet: null };
+  }
+
+  const userMessages = messages.filter(m => m.role === "user");
+  const recentTurns = userMessages.slice(-3);
+
+  const agencyComplaintPatterns = [
+    /(?:writing|spoke|speaking|acted|acting|deciding|control|controlling|puppeteer|puppeteering)\s+(?:for|as)\s+(?:the\s+)?(?:pc|player|my\s+character|me)/i,
+    /(?:stop|don'?t|quit|never)\s+(?:writing|speaking|acting|deciding)\s+(?:for|as)\s+(?:me|my\s+character|the\s+pc|the\s+player)/i,
+    /(?:writing\s+for\s+the\s+pc\s+rather\s+than\s+just\s+facilitating)/i,
+    /(?:just|only)\s+facilitat(?:e|ing)(?:\s+the\s+story)?/i,
+    /(?:facilitat(?:e|ing|or)\s+(?:only|mode|role))/i,
+    /(?:stop|don'?t)\s+(?:speak|talk|act)\s+for\s+me/i,
+    /(?:stop|don'?t)\s+godmod(?:ing)?/i,
+    /(?:let\s+me\s+decide|let\s+me\s+speak|i\s+control\s+my\s+character)/i
+  ];
+
+  for (let i = recentTurns.length - 1; i >= 0; i--) {
+    const text = recentTurns[i].content || recentTurns[i].text || "";
+    if (!text) continue;
+
+    for (const pattern of agencyComplaintPatterns) {
+      if (pattern.test(text)) {
+        return {
+          isAgencyAlert: true,
+          complaintSnippet: text.slice(0, 120)
+        };
+      }
+    }
+  }
+
+  return { isAgencyAlert: false, complaintSnippet: null };
+}
+
+/**
  * Builds the authoritative system prompt section governing authorial prose.
  */
 export function buildAuthorSystemInstruction(authorString: string, isDriftAlert: boolean = false): string {
@@ -469,9 +513,11 @@ You operate on TWO STRICTLY INDEPENDENT LAYERS in every turn:
 
 1. IN-CHARACTER STORY PROSE (All text outside square brackets):
    - MUST BE 100% WRITTEN IN THE DISTINCTIVE VOICE OF: "${bp.targetAuthors.toUpperCase()}".
-   - You are the master literary ghostwriter channeling ${bp.targetAuthors}.
+   - You are the master literary ghostwriter channeling ${bp.targetAuthors} FOR THE WORLD ENVIRONMENT AND ALL NPCS.
+   - YOU ARE THE STORY FACILITATOR / DUNGEON MASTER, NOT THE PLAYER CHARACTER.
    - NYX'S CASUAL, BRATTY, SPICY, OR FLIRTY PERSONA IS 100% FORBIDDEN FROM BLEEDING INTO THE STORY PROSE.
    - Do NOT use modern slang, cheeky fourth-wall breaks, or conversational filler in scene narration.
+   - STRICT PLAYER AGENCY RULE: Never puppet, speak for, or dictate actions for the Player Character. Channel ${bp.targetAuthors} strictly for scene staging, sensory physics, and authentic NPC dialogue.
    - Strictly apply the Stylistic Blueprint below:
 
    [STYLISTIC BLUEPRINT: ${bp.targetAuthors}]
@@ -500,18 +546,27 @@ You MUST immediately purge all generic assistant tone, purge all conversational 
 
 /**
  * Builds the high-priority recency re-anchor injected at the context frontier (last turn).
- * This directly defeats history drift caused by earlier generic turns.
+ * This directly defeats history drift and strictly enforces the facilitator / player agency boundary.
  */
-export function buildContextFrontierAuthorAnchor(authorString: string, isDriftAlert: boolean = false): string {
+export function buildContextFrontierAuthorAnchor(
+  authorString: string,
+  isDriftAlert: boolean = false,
+  pcLabel: string = "the Player Character (PC)",
+  isAgencyAlert: boolean = false
+): string {
   const bp = generateAuthorStyleBlueprint(authorString);
 
-  return `\n\n[STRICT STYLISTIC GOVERNANCE & ANTI-DRIFT RE-ANCHOR]
-Target Voice: "${bp.targetAuthors}"
-CRITICAL INSTRUCTION FOR THIS TURN:
-- Disregard any generic cadence, repetitive sentence structures, or conversational assistant habits from earlier chat turns.
-- Write this turn's story prose exclusively through the lens of ${bp.targetAuthors}.
-- Apply ${bp.targetAuthors}'s signature sentence syntax, sensory texture, and dialogue economy.
-- Zero persona bleed into third-person narration. Zero generic AI filler.`;
+  return `\n\n[STRICT STORY FACILITATION & ANTI-PUPPETEERING ANCHOR]
+Role: Master Story Facilitator / Dungeon Master.
+Target Authorial Voice (for World & NPCs): "${bp.targetAuthors}".
+CRITICAL PLAYER AGENCY MANDATES FOR THIS TURN:
+- YOU FACILITATE THE WORLD AND NPCS ONLY. NEVER WRITE FOR ${pcLabel.toUpperCase()}.
+- ZERO DIALOGUE FOR PC: Do NOT generate quotes ("...") or speech tags spoken by ${pcLabel}.
+- ZERO UNCOMMANDED ACTIONS: Do NOT make ${pcLabel} move, draw weapons, smile, nod, or take actions.
+- ZERO INTERNAL MONOLOGUE/FEELINGS: Do NOT describe what ${pcLabel} feels or thinks.
+- Channel ${bp.targetAuthors}'s sensory prose and dialogue rhythm solely to depict the environment and NPCs.
+- When an NPC speaks, questions, or a threat appears, STOP IMMEDIATELY and yield the turn to the player!${isAgencyAlert ? `
+*** EMERGENCY AGENCY DIRECTIVE: The player explicitly instructed you to stop writing for their character and facilitate the story. Obey this with 100% fidelity on this turn! ***` : ""}`;
 }
 
 // Backward compatibility helper

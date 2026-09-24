@@ -14,7 +14,7 @@ export async function safeFetchJson<T = any>(
   const { timeout = 240000, signal: userSignal, ...fetchOptions } = options;
 
   let attempts = 0;
-  const maxAttempts = 2;
+  const maxAttempts = 3;
   let lastError: any = null;
 
   while (attempts < maxAttempts) {
@@ -67,13 +67,18 @@ export async function safeFetchJson<T = any>(
       }
 
       lastError = error;
-      // If momentary network disconnect and user has not aborted, do a quick single retry
+      // If momentary network disconnect or container cold start, retry with exponential backoff
       if (attempts < maxAttempts && !userSignal?.aborted) {
-        await new Promise(r => setTimeout(r, 600));
+        await new Promise(r => setTimeout(r, attempts * 500));
         continue;
       }
 
-      throw new Error(error.message || `Network error connecting to ${resource}`);
+      const rawMsg = error.message || "";
+      if (rawMsg.includes("Failed to fetch") || error.name === "TypeError") {
+        throw new Error(`Connection interrupted while contacting ${resource}. The server may be restarting or waking up. Please try again.`);
+      }
+
+      throw new Error(rawMsg || `Network error connecting to ${resource}`);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -146,5 +151,9 @@ export async function safeFetchJson<T = any>(
     return parsed as T;
   }
 
+  const fallbackMsg = lastError?.message || "";
+  if (fallbackMsg.includes("Failed to fetch") || lastError?.name === "TypeError") {
+    throw new Error(`Connection interrupted while contacting ${resource}. The server may be restarting or waking up. Please try again.`);
+  }
   throw lastError || new Error(`Network error connecting to ${resource}`);
 }

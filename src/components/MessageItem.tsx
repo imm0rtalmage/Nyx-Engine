@@ -9,6 +9,7 @@ import {
   ChevronRight,
   RefreshCw,
   Coins,
+  Sparkles,
 } from "lucide-react";
 import ChatMessageMarkdown from "./ChatMessageMarkdown";
 import { Message, CharacterProfile } from "../types";
@@ -458,17 +459,17 @@ export const MessageItem = memo(function MessageItem({
             )}
           </div>
 
-          {/* Turn-specific In-Context Lore Log & Version Controls */}
-          {msg.role === "nyx" && (parsedContextBadges.length > 0 || (msg.versions && msg.versions.length > 1)) && (
+          {/* Turn-specific In-Context Lore Log, Version Controls & Better Regen Button */}
+          {msg.role === "nyx" && (
             <div
-              className="mt-3 text-[10px] text-slate-400 font-mono flex items-center justify-between gap-3 border-t border-slate-900/60 pt-2 flex-wrap"
+              className="mt-3.5 text-xs text-slate-400 font-mono flex items-center justify-between gap-3 border-t border-slate-800/80 pt-2.5 flex-wrap"
               onClick={(e) => e.stopPropagation()}
             >
               {/* Logged in-context entities snapshot for this specific turn */}
               {parsedContextBadges.length > 0 ? (
                 <div className="flex items-center gap-1.5 flex-wrap min-w-0">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
-                  <span className="text-slate-500 font-bold shrink-0">In Context:</span>
+                  <span className="text-slate-500 font-bold shrink-0 text-[10px]">In Context:</span>
                   <div className="flex items-center gap-1.5 flex-wrap">
                     {parsedContextBadges.map((ent, eIdx) => {
                       let badgeStyle = "bg-slate-800 text-slate-400";
@@ -485,7 +486,7 @@ export const MessageItem = memo(function MessageItem({
                       }
 
                       return (
-                        <span key={eIdx} className="inline-flex items-center gap-1 text-slate-300">
+                        <span key={eIdx} className="inline-flex items-center gap-1 text-slate-300 text-[10px]">
                           <span className="text-slate-200">{ent.name}</span>
                           <span className={`text-[8px] px-1 py-0.2 rounded font-mono ${badgeStyle}`}>
                             {ent.badge}
@@ -499,68 +500,76 @@ export const MessageItem = memo(function MessageItem({
                   </div>
                 </div>
               ) : (
-                <div />
-              )}
-
-              {/* Version Switcher when multiple versions exist */}
-              {msg.versions && msg.versions.length > 1 && (
-                <div className="flex items-center gap-1.5 bg-slate-950/80 px-2 py-1 rounded-lg border border-slate-800/80 shrink-0 ml-auto">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const vIdx =
-                        msg.activeVersionIndex !== undefined
-                          ? msg.activeVersionIndex
-                          : 0;
-                      if (vIdx > 0) {
-                        onSelectMessageVersion?.(msg.id, vIdx - 1);
-                      }
-                    }}
-                    disabled={
-                      msg.activeVersionIndex === 0 ||
-                      msg.activeVersionIndex === undefined
-                    }
-                    className="text-slate-400 hover:text-purple-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
-                    title="Previous version"
-                  >
-                    <ChevronLeft size={12} />
-                  </button>
-                  <span className="text-[9px] text-slate-300 font-semibold select-none">
-                    {(msg.activeVersionIndex !== undefined
-                      ? msg.activeVersionIndex
-                      : 0) + 1}{" "}
-                    / {msg.versions.length}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const vIdx =
-                        msg.activeVersionIndex !== undefined
-                          ? msg.activeVersionIndex
-                          : 0;
-                      if (msg.versions && vIdx < msg.versions.length - 1) {
-                        onSelectMessageVersion?.(msg.id, vIdx + 1);
-                      }
-                    }}
-                    disabled={
-                      msg.versions &&
-                      msg.activeVersionIndex === msg.versions.length - 1
-                    }
-                    className="text-slate-400 hover:text-purple-400 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
-                    title="Next version"
-                  >
-                    <ChevronRight size={12} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onRegenerateResponse(thinkingLevel, msg.id)}
-                    className="ml-1 text-slate-400 hover:text-amber-400 transition-colors cursor-pointer"
-                    title="Generate another version"
-                  >
-                    <RefreshCw size={10} />
-                  </button>
+                <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                  <span className="w-1.5 h-1.5 rounded-full bg-purple-400/60 shrink-0" />
+                  <span>Storyteller Turn</span>
                 </div>
               )}
+
+              {/* Version Controls and Dedicated Better Regen Button on Turn Frame */}
+              <div className="flex items-center gap-2 shrink-0 ml-auto">
+                {msg.versions && msg.versions.length > 1 && (
+                  <div className="flex items-center gap-1 bg-slate-950/90 px-2 py-1 rounded-lg border border-slate-800 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const vIdx =
+                          msg.activeVersionIndex !== undefined
+                            ? msg.activeVersionIndex
+                            : 0;
+                        if (vIdx > 0) {
+                          onSelectMessageVersion?.(msg.id, vIdx - 1);
+                        }
+                      }}
+                      disabled={
+                        msg.activeVersionIndex === 0 ||
+                        msg.activeVersionIndex === undefined
+                      }
+                      className="text-slate-400 hover:text-purple-300 p-0.5 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                      title="Previous version"
+                    >
+                      <ChevronLeft size={13} />
+                    </button>
+                    <span className="text-[10px] text-amber-300 font-bold select-none px-1">
+                      {(msg.activeVersionIndex !== undefined
+                        ? msg.activeVersionIndex
+                        : 0) + 1}{" "}
+                      / {msg.versions.length}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const vIdx =
+                          msg.activeVersionIndex !== undefined
+                            ? msg.activeVersionIndex
+                            : 0;
+                        if (msg.versions && vIdx < msg.versions.length - 1) {
+                          onSelectMessageVersion?.(msg.id, vIdx + 1);
+                        }
+                      }}
+                      disabled={
+                        msg.versions &&
+                        msg.activeVersionIndex === msg.versions.length - 1
+                      }
+                      className="text-slate-400 hover:text-purple-300 p-0.5 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                      title="Next version"
+                    >
+                      <ChevronRight size={13} />
+                    </button>
+                  </div>
+                )}
+
+                {/* Better Regen Button on the actual Turn Frame */}
+                <button
+                  type="button"
+                  onClick={() => onRegenerateResponse(thinkingLevel, msg.id)}
+                  className="group flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-amber-500/15 hover:bg-amber-500/25 text-amber-200 hover:text-amber-100 border border-amber-500/40 hover:border-amber-400/80 shadow-sm shadow-amber-950/30 transition-all hover:scale-102 active:scale-98 cursor-pointer"
+                  title="Regenerate this storyteller turn"
+                >
+                  <RefreshCw size={13} className="text-amber-400 group-hover:rotate-180 transition-transform duration-500" />
+                  <span>{msg.versions && msg.versions.length > 1 ? "New Version" : "Regen Turn"}</span>
+                </button>
+              </div>
             </div>
           )}
         </div>

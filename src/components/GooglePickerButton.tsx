@@ -5,7 +5,7 @@ import {
   RefreshCw, Star, Check, SlidersHorizontal, Info, ExternalLink,
   ChevronDown, HelpCircle, FileText
 } from "lucide-react";
-import firebaseConfig from "../../firebase-applet-config.json";
+import firebaseConfig from "../lib/firebaseConfig";
 import { fetchGoogleFile, listGoogleDocs, extractDocId } from "../utils/googleWorkspace";
 import { safeLocalStorage } from "../App";
 

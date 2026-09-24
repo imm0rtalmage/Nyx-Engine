@@ -8,7 +8,7 @@ import {
   Project, Message, KeepNote, KeepTask, CharacterProfile, SyncActivityLog, RelationshipTrack, LoreSource 
 } from "./types";
 import { 
-  auth, db, googleDriveProvider, signInWithPopup, signOut, onAuthStateChanged,
+  auth, db, isFirebaseConfigured, googleProvider, googleDriveProvider, signInWithPopup, signOut, onAuthStateChanged,
   collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, orderBy, addDoc
 } from "./lib/firebase";
 import { GoogleAuthProvider } from "firebase/auth";
@@ -17,6 +17,7 @@ import AdventureChat from "./components/AdventureChat";
 import NarrativeSuite from "./components/NarrativeSuite";
 import WorkspaceSync from "./components/WorkspaceSync";
 import { StoryArchiveModal } from "./components/StoryArchiveModal";
+import { CloudSyncModal } from "./components/CloudSyncModal";
 import { StudioAssistantSidebar } from "./components/StudioAssistantSidebar";
 import { MobileWorldSettings } from "./components/MobileWorldSettings";
 import { ParsedMessage } from "./utils/domParser";
@@ -25,7 +26,7 @@ import {
   Sparkles, Layers, BookOpen, FileText, 
   LogIn, LogOut, Plus, Globe, Trash2, FolderOpen,
   Check, X, Edit3, Copy, Smartphone, Monitor,
-  Cloud
+  Cloud, Upload, Download, Laptop
 } from "lucide-react";
 
 import { cleanForFirestore } from "./lib/firebase";
@@ -95,8 +96,87 @@ function sanitizeProjects(rawList: any[]): Project[] {
 const inMemoryStorage: Record<string, string> = {};
 let isStorageWorking = true;
 
+/**
+ * Reclaims localStorage space by clearing duplicate backup keys while ensuring
+ * no primary data is lost.
+ */
+export function cleanRedundantStorage(): void {
+  if (typeof window === "undefined" || !window.localStorage) return;
+  try {
+    // 1. Ensure projects exist in primary key before cleaning duplicate backup keys
+    const hasPrimaryProjects = !!(
+      localStorage.getItem("local_projects") ||
+      (typeof localStorage.length === "number" &&
+        Object.keys(localStorage).some((k) => k.startsWith("local_projects_")))
+    );
+
+    if (!hasPrimaryProjects) {
+      const backup =
+        localStorage.getItem("nyx_backup_projects") ||
+        localStorage.getItem("local_projects_backup");
+      if (backup) {
+        try {
+          localStorage.setItem("local_projects", backup);
+        } catch {}
+      }
+    }
+
+    // 2. Remove redundant global project duplicate keys
+    try {
+      localStorage.removeItem("nyx_backup_projects");
+    } catch {}
+    try {
+      localStorage.removeItem("local_projects_backup");
+    } catch {}
+
+    // 3. For any message or character backup, ensure primary exists before removing backup key
+    const backupMsgKeys: string[] = [];
+    const backupCharKeys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      if (k.startsWith("local_messages_backup_")) {
+        backupMsgKeys.push(k);
+      } else if (k.startsWith("local_characters_backup_")) {
+        backupCharKeys.push(k);
+      }
+    }
+
+    for (const bKey of backupMsgKeys) {
+      const primaryKey = bKey.replace("local_messages_backup_", "local_messages_");
+      if (!localStorage.getItem(primaryKey)) {
+        const val = localStorage.getItem(bKey);
+        if (val) {
+          try {
+            localStorage.setItem(primaryKey, val);
+          } catch {}
+        }
+      }
+      try {
+        localStorage.removeItem(bKey);
+      } catch {}
+    }
+
+    for (const bKey of backupCharKeys) {
+      const primaryKey = bKey.replace("local_characters_backup_", "local_characters_");
+      if (!localStorage.getItem(primaryKey)) {
+        const val = localStorage.getItem(bKey);
+        if (val) {
+          try {
+            localStorage.setItem(primaryKey, val);
+          } catch {}
+        }
+      }
+      try {
+        localStorage.removeItem(bKey);
+      } catch {}
+    }
+  } catch {}
+}
+
 try {
   if (typeof window !== "undefined" && window.localStorage) {
+    cleanRedundantStorage();
     const testKey = "__nyx_storage_test__";
     window.localStorage.setItem(testKey, "1");
     if (window.localStorage.getItem(testKey) !== "1") {
@@ -114,39 +194,48 @@ try {
 export const safeLocalStorage = {
   isAvailable: (): boolean => isStorageWorking,
   getItem: (key: string): string | null => {
+    if (inMemoryStorage[key] !== undefined) {
+      return inMemoryStorage[key];
+    }
     if (!isStorageWorking) {
-      return inMemoryStorage[key] || null;
+      return null;
     }
     try {
-      return localStorage.getItem(key);
+      const val = localStorage.getItem(key);
+      if (val !== null) {
+        inMemoryStorage[key] = val;
+      }
+      return val;
     } catch (e) {
-      console.warn(`localStorage.getItem failed for key "${key}":`, e);
       return inMemoryStorage[key] || null;
     }
   },
   setItem: (key: string, value: string): void => {
+    // Keep in-memory cache updated as instant mirror
+    inMemoryStorage[key] = value;
     if (!isStorageWorking) {
-      inMemoryStorage[key] = value;
       return;
     }
     try {
       localStorage.setItem(key, value);
     } catch (e) {
-      console.warn(`localStorage.setItem failed for key "${key}":`, e);
-      inMemoryStorage[key] = value;
+      // Storage quota exceeded or blocked; run proactive cleanup of duplicate keys and retry
+      cleanRedundantStorage();
+      try {
+        localStorage.setItem(key, value);
+      } catch {
+        // Fall back quietly to inMemoryStorage without throwing UI warning banner
+      }
     }
   },
   removeItem: (key: string): void => {
+    delete inMemoryStorage[key];
     if (!isStorageWorking) {
-      delete inMemoryStorage[key];
       return;
     }
     try {
       localStorage.removeItem(key);
-    } catch (e) {
-      console.warn(`localStorage.removeItem failed for key "${key}":`, e);
-      delete inMemoryStorage[key];
-    }
+    } catch {}
   }
 };
 
@@ -495,6 +584,8 @@ export default function App() {
 
   // Track the project ID that the in-memory messages, prompts, and characters actually belong to
   const currentDataProjectIdRef = React.useRef<string>(activeProjectId);
+  // Track initial reconciliation per project so live real-time streaming updates cleanly across devices
+  const initialReconciledProjectsRef = React.useRef<Record<string, boolean>>({});
 
   const [messages, setMessages] = useState<Message[]>(() => {
     try {
@@ -585,11 +676,9 @@ export default function App() {
       if (prevProjectId && prevProjectId !== activeProjectId) {
         if (messages.length > 0) {
           safeLocalStorage.setItem(`local_messages_${prevProjectId}`, JSON.stringify(messages));
-          safeLocalStorage.setItem(`local_messages_backup_${prevProjectId}`, JSON.stringify(messages));
         }
         if (characters.length > 0) {
           safeLocalStorage.setItem(`local_characters_${prevProjectId}`, JSON.stringify(characters));
-          safeLocalStorage.setItem(`local_characters_backup_${prevProjectId}`, JSON.stringify(characters));
         }
       }
 
@@ -625,9 +714,6 @@ export default function App() {
   useEffect(() => {
     if (activeProjectId && currentDataProjectIdRef.current === activeProjectId) {
       safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(messages));
-      if (messages.length > 0) {
-        safeLocalStorage.setItem(`local_messages_backup_${activeProjectId}`, JSON.stringify(messages));
-      }
     }
   }, [messages, activeProjectId]);
 
@@ -635,9 +721,6 @@ export default function App() {
   useEffect(() => {
     if (activeProjectId && currentDataProjectIdRef.current === activeProjectId) {
       safeLocalStorage.setItem(`local_characters_${activeProjectId}`, JSON.stringify(characters));
-      if (characters.length > 0) {
-        safeLocalStorage.setItem(`local_characters_backup_${activeProjectId}`, JSON.stringify(characters));
-      }
     }
   }, [characters, activeProjectId]);
 
@@ -662,10 +745,42 @@ export default function App() {
   // New Project Modal State
   const [showNewProjModal, setShowNewProjModal] = useState(false);
   const [showStoryArchiveModal, setShowStoryArchiveModal] = useState(false);
+  const [showCloudSyncModal, setShowCloudSyncModal] = useState(false);
+  const [autoSyncOnLaunch, setAutoSyncOnLaunch] = useState<boolean>(() => {
+    const saved = safeLocalStorage.getItem("nyx_auto_sync_on_launch");
+    return saved !== null ? saved === "true" : true;
+  });
   const [newProjName, setNewProjName] = useState("");
   const [newProjSetting, setNewProjSetting] = useState("");
   const [newProjNickname, setNewProjNickname] = useState("");
   const [newProjCloneFromCurrent, setNewProjCloneFromCurrent] = useState(false);
+
+  const handleToggleAutoSyncOnLaunch = (enabled: boolean) => {
+    setAutoSyncOnLaunch(enabled);
+    safeLocalStorage.setItem("nyx_auto_sync_on_launch", enabled ? "true" : "false");
+    if (user) {
+      setDoc(doc(db, `users/${user.uid}`), { autoSyncOnLaunch: enabled }, { merge: true }).catch(console.warn);
+    }
+    showToast(
+      enabled ? "🔄 Auto-Sync on Launch Enabled" : "⏸️ Auto-Sync on Launch Disabled",
+      enabled
+        ? "Nyx will automatically sync campaigns to the cloud whenever the app loads."
+        : "Auto-sync on launch is now disabled. Campaigns will only sync when manually requested.",
+      "info"
+    );
+  };
+
+  const handleSelectProject = (projectId: string) => {
+    if (!projectId) return;
+    setActiveProjectId(projectId);
+    const key = user ? `local_activeProjectId_${user.uid}` : "local_activeProjectId";
+    safeLocalStorage.setItem(key, projectId);
+    safeLocalStorage.setItem("local_activeProjectId", projectId);
+    if (user) {
+      setDoc(doc(db, `users/${user.uid}`), { activeProjectId: projectId, lastActiveAt: Date.now() }, { merge: true }).catch(console.warn);
+      setDoc(doc(db, `users/${user.uid}/projects/${projectId}`), { updatedAt: Date.now() }, { merge: true }).catch(console.warn);
+    }
+  };
 
   const handleRestoreOrCreateCampaign = (campaignName: string, restoredMsgs?: Message[], specificProjectId?: string) => {
     const name = campaignName?.trim() || "Shima";
@@ -694,7 +809,6 @@ export default function App() {
       if (restoredMsgs && restoredMsgs.length > 0) {
         setMessages(restoredMsgs);
         safeLocalStorage.setItem(`local_messages_${targetId}`, JSON.stringify(restoredMsgs));
-        safeLocalStorage.setItem(`local_messages_backup_${targetId}`, JSON.stringify(restoredMsgs));
         if (user) {
           for (const m of restoredMsgs) {
             setDoc(doc(db, `users/${user.uid}/projects/${targetId}/messages`, m.id), m).catch(console.warn);
@@ -721,7 +835,6 @@ export default function App() {
     setMessages(restoredMsgs);
     if (activeProjectId) {
       safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(restoredMsgs));
-      safeLocalStorage.setItem(`local_messages_backup_${activeProjectId}`, JSON.stringify(restoredMsgs));
       if (user) {
         for (const m of restoredMsgs) {
           setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, m.id), m).catch(console.warn);
@@ -731,6 +844,199 @@ export default function App() {
   };
 
   const [confirmDeleteProjId, setConfirmDeleteProjId] = useState<string | null>(null);
+
+  // Campaign Backup & Device Migration Engine
+  const campaignBackupInputRef = useRef<HTMLInputElement>(null);
+  const [dismissedDeviceMigrationBanner, setDismissedDeviceMigrationBanner] = useState(() => {
+    return safeLocalStorage.getItem("nyx_dismiss_migration_banner") === "true";
+  });
+
+  const handleExportAllCampaignsData = () => {
+    try {
+      const allFoundProjects = loadAllProjectsSafely(user?.uid);
+      const messagesByProject: Record<string, Message[]> = {};
+      const charactersByProject: Record<string, CharacterProfile[]> = {};
+
+      allFoundProjects.forEach((p) => {
+        messagesByProject[p.id] = loadProjectMessagesSafely(p.id, p.name);
+        charactersByProject[p.id] = loadProjectCharactersSafely(p.id);
+      });
+
+      // Ensure active campaign's currently held state in memory is captured
+      if (activeProjectId) {
+        messagesByProject[activeProjectId] = messages;
+        charactersByProject[activeProjectId] = characters;
+      }
+
+      const exportPayload = {
+        version: 2,
+        exportedAt: new Date().toISOString(),
+        sourceApp: "Nyx AI Studio",
+        activeProjectId,
+        projects: allFoundProjects,
+        messagesByProject,
+        charactersByProject,
+        notes,
+        tasks
+      };
+
+      const jsonStr = JSON.stringify(exportPayload, null, 2);
+      const blob = new Blob([jsonStr], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const dateStamp = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `nyx_campaigns_backup_${dateStamp}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast(
+        "💾 Campaigns Exported",
+        `Downloaded full backup containing ${allFoundProjects.length} campaign(s) and all transcripts.`,
+        "success"
+      );
+    } catch (err: any) {
+      console.error("Export error:", err);
+      showToast("Export Failed", err.message || "Could not export backup.", "error");
+    }
+  };
+
+  const handleImportCampaignsData = (rawJson: string | object) => {
+    try {
+      const parsed = typeof rawJson === "string" ? JSON.parse(rawJson) : rawJson;
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error("Invalid backup: expected valid JSON object or campaigns list.");
+      }
+
+      let importedProjects: Project[] = [];
+      let importedMsgCount = 0;
+      let importedCharCount = 0;
+
+      if (Array.isArray(parsed)) {
+        importedProjects = parsed;
+      } else if (Array.isArray(parsed.projects)) {
+        importedProjects = parsed.projects;
+      } else if (parsed.id && (parsed.name || parsed.setting)) {
+        importedProjects = [parsed];
+      }
+
+      if (importedProjects.length === 0) {
+        throw new Error("No campaigns were found in this file.");
+      }
+
+      // Restore messages by project
+      if (parsed.messagesByProject && typeof parsed.messagesByProject === "object") {
+        Object.entries(parsed.messagesByProject).forEach(([projId, msgs]) => {
+          if (Array.isArray(msgs) && msgs.length > 0) {
+            safeLocalStorage.setItem(`local_messages_${projId}`, JSON.stringify(msgs));
+            importedMsgCount += msgs.length;
+          }
+        });
+      }
+
+      // Restore characters by project
+      if (parsed.charactersByProject && typeof parsed.charactersByProject === "object") {
+        Object.entries(parsed.charactersByProject).forEach(([projId, chars]) => {
+          if (Array.isArray(chars) && chars.length > 0) {
+            safeLocalStorage.setItem(`local_characters_${projId}`, JSON.stringify(chars));
+            importedCharCount += chars.length;
+          }
+        });
+      }
+
+      // Restore notes & tasks if present
+      if (Array.isArray(parsed.notes) && parsed.notes.length > 0) {
+        setNotes(prev => {
+          const combined = [...prev];
+          parsed.notes.forEach((n: KeepNote) => {
+            if (!combined.some(x => x.id === n.id)) combined.push(n);
+          });
+          safeLocalStorage.setItem("local_notes", JSON.stringify(combined));
+          return combined;
+        });
+      }
+
+      if (Array.isArray(parsed.tasks) && parsed.tasks.length > 0) {
+        setTasks(prev => {
+          const combined = [...prev];
+          parsed.tasks.forEach((t: KeepTask) => {
+            if (!combined.some(x => x.id === t.id)) combined.push(t);
+          });
+          safeLocalStorage.setItem("local_tasks", JSON.stringify(combined));
+          return combined;
+        });
+      }
+
+      // Merge imported projects with current projects
+      const combinedProjects = [...projects];
+      importedProjects.forEach(ip => {
+        const idx = combinedProjects.findIndex(p => p.id === ip.id || (p.name && ip.name && p.name.trim().toLowerCase() === ip.name.trim().toLowerCase()));
+        if (idx >= 0) {
+          combinedProjects[idx] = { ...combinedProjects[idx], ...ip };
+        } else {
+          combinedProjects.push(ip);
+        }
+      });
+
+      const sanitized = sanitizeProjects(combinedProjects);
+      const storageKey = user ? `local_projects_${user.uid}` : "local_projects";
+      safeLocalStorage.setItem(storageKey, JSON.stringify(sanitized));
+      safeLocalStorage.setItem("local_projects", JSON.stringify(sanitized));
+
+      setProjects(sanitized);
+
+      const targetId = parsed.activeProjectId && sanitized.some(p => p.id === parsed.activeProjectId)
+        ? parsed.activeProjectId
+        : sanitized[0].id;
+
+      setActiveProjectId(targetId);
+
+      // If active project messages exist in backup, load them immediately
+      if (parsed.messagesByProject?.[targetId]) {
+        setMessages(parsed.messagesByProject[targetId]);
+      } else {
+        const loaded = loadProjectMessagesSafely(targetId, sanitized.find(p => p.id === targetId)?.name);
+        if (loaded.length > 0) setMessages(loaded);
+      }
+
+      if (parsed.charactersByProject?.[targetId]) {
+        setCharacters(parsed.charactersByProject[targetId]);
+      } else {
+        const loadedChars = loadProjectCharactersSafely(targetId);
+        if (loadedChars.length > 0) setCharacters(loadedChars);
+      }
+
+      // If logged in, auto sync to firestore
+      if (user) {
+        syncLocalDataToFirestore(user, true);
+      }
+
+      setDismissedDeviceMigrationBanner(true);
+      safeLocalStorage.setItem("nyx_dismiss_migration_banner", "true");
+
+      showToast(
+        "🎉 Campaigns Restored!",
+        `Successfully restored ${importedProjects.length} campaign(s), ${importedMsgCount} message(s), and ${importedCharCount} character(s).`,
+        "success"
+      );
+    } catch (err: any) {
+      console.error("Import error:", err);
+      showToast("Import Failed", err.message || "Failed to process backup file.", "error");
+    }
+  };
+
+  const handleCampaignFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      if (text) {
+        handleImportCampaignsData(text);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
 
   // Title Editing State
   const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -749,11 +1055,11 @@ export default function App() {
         }
       });
 
-      // Filter projects that need cloud sync
-      const targetProjects = forceSyncAll ? combinedProjects : combinedProjects.filter(p => !p.syncedToCloud || forceSyncAll);
-      if (targetProjects.length === 0 && !forceSyncAll) return;
+      // Sync all found projects to ensure new sources, narratives, and messages are not skipped
+      const targetProjects = combinedProjects;
+      if (targetProjects.length === 0) return;
 
-      if (targetProjects.length > 0) {
+      if (targetProjects.length > 0 && forceSyncAll) {
         showToast("☁️ Syncing Campaigns to Cloud...", `Transferring ${targetProjects.length} campaigns to your Google Cloud account.`, "info");
       }
 
@@ -794,13 +1100,15 @@ export default function App() {
           stAuthorsMix: lp.stAuthorsMix || "",
           stAdventureModule: lp.stAdventureModule || "",
           sources: lp.sources || [],
+          updatedAt: lp.updatedAt || Date.now(),
           syncedToCloud: true
         };
 
         await setDoc(projRef, cleanForFirestore(cleanedProj), { merge: true });
 
-        // 2. Sync active chat messages
-        const messagesList = loadProjectMessagesSafely(lp.id, lp.name);
+        // 2. Sync active chat messages (prioritize current in-memory messages if this is the active project)
+        const inMemoryMsgs = (lp.id === activeProjectId && messages.length > 0) ? messages : [];
+        const messagesList = inMemoryMsgs.length > 0 ? inMemoryMsgs : loadProjectMessagesSafely(lp.id, lp.name);
         for (const m of messagesList) {
           if (m && m.id) {
             const mRef = doc(db, `users/${currentUser.uid}/projects/${lp.id}/messages`, m.id);
@@ -889,20 +1197,44 @@ export default function App() {
       showToast("☁️ Desktop Sync", "Synchronizing all campaigns, stories, and characters with desktop...", "info");
       await syncLocalDataToFirestore(user, true);
       
-      // Also check user profile active project from cloud
+      // Also query all projects from Firestore directly to discover any new campaigns from the other device
       try {
-        const userSnap = await getDoc(doc(db, `users/${user.uid}`));
-        if (userSnap.exists() && userSnap.data()?.activeProjectId) {
-          const cloudActiveId = userSnap.data().activeProjectId;
-          if (cloudActiveId && cloudActiveId !== activeProjectId) {
-            setActiveProjectId(cloudActiveId);
+        const qSnap = await getDocs(collection(db, `users/${user.uid}/projects`));
+        const cloudProjs: Project[] = [];
+        qSnap.forEach(d => {
+          cloudProjs.push({ id: d.id, ...d.data() } as Project);
+        });
+
+        if (cloudProjs.length > 0) {
+          setProjects(prev => {
+            const combined = [...cloudProjs];
+            for (const p of prev) {
+              if (!combined.some(c => c.id === p.id)) {
+                combined.push(p);
+              }
+            }
+            return sanitizeProjects(combined);
+          });
+
+          // Check for user doc active project or most recently updated project
+          const userSnap = await getDoc(doc(db, `users/${user.uid}`));
+          const cloudActiveId = userSnap.exists() ? userSnap.data()?.activeProjectId : null;
+          
+          if (cloudActiveId && cloudProjs.some(p => p.id === cloudActiveId)) {
+            handleSelectProject(cloudActiveId);
+          } else {
+            // Sort by updatedAt descending to pick the most recently active campaign from any device
+            const sorted = [...cloudProjs].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+            if (sorted[0]?.id && sorted[0].id !== activeProjectId) {
+              handleSelectProject(sorted[0].id);
+            }
           }
         }
-      } catch (errUserSnap) {
-        console.warn("Could not query user doc activeProjectId:", errUserSnap);
+      } catch (errCloudProjs) {
+        console.warn("Could not query cloud projects directly during desktop sync:", errCloudProjs);
       }
 
-      showToast("✅ Synced with Desktop", "All campaigns, transcripts, and settings are up to date!", "success");
+      showToast("✅ Synced with Desktop", "All campaigns, transcripts, and settings are up to date across your devices!", "success");
     } catch (err: any) {
       console.error("Sync with desktop error:", err);
       showToast("Sync Notice", "Sync completed: " + (err?.message || err), "info");
@@ -931,7 +1263,14 @@ export default function App() {
         } catch (eLoad) {
           console.error("Failed to load user cached projects:", eLoad);
         }
-        syncLocalDataToFirestore(currentUser);
+
+        // Check user preference for Auto-Sync on Launch
+        const isAutoSyncEnabled = safeLocalStorage.getItem("nyx_auto_sync_on_launch") !== "false";
+        if (isAutoSyncEnabled) {
+          syncLocalDataToFirestore(currentUser);
+        } else {
+          console.log("Auto-Sync on Launch is disabled by user preference.");
+        }
       } else {
         setGoogleToken(null);
         safeLocalStorage.removeItem("nyx_google_token");
@@ -972,12 +1311,16 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
 
-    // A. Sync user profile (active project selection)
+    // A. Sync user profile (active project selection & preferences)
     const unsubUser = onSnapshot(doc(db, `users/${user.uid}`), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
         if (data.activeProjectId) {
           setActiveProjectId(prev => prev !== data.activeProjectId ? data.activeProjectId : prev);
+        }
+        if (typeof data.autoSyncOnLaunch === "boolean") {
+          setAutoSyncOnLaunch(data.autoSyncOnLaunch);
+          safeLocalStorage.setItem("nyx_auto_sync_on_launch", data.autoSyncOnLaunch ? "true" : "false");
         }
       }
     }, (err) => {
@@ -996,15 +1339,42 @@ export default function App() {
         // Deep scan all local and backup sources so nothing is ever dropped
         const localAll = loadAllProjectsSafely(user?.uid);
 
-        // Combine Firestore with all discovered local campaigns
-        const combined = [...projs];
+        // Combine Firestore with all discovered local campaigns, merging sources bidirectionally
+        const combined = projs.map(p => {
+          const matchingLocal = localAll.find(lp => lp.id === p.id || (lp.name && p.name && lp.name.toLowerCase() === p.name.toLowerCase()));
+          if (matchingLocal) {
+            const cloudSources = Array.isArray(p.sources) ? p.sources : [];
+            const localSources = Array.isArray(matchingLocal.sources) ? matchingLocal.sources : [];
+            const mergedSources = [...cloudSources];
+            let hasNewLocalSources = false;
+            for (const ls of localSources) {
+              if (ls && !mergedSources.some(s => s.id === ls.id || (s.name && ls.name && s.name.toLowerCase() === ls.name.toLowerCase()))) {
+                mergedSources.push(ls);
+                hasNewLocalSources = true;
+              }
+            }
+            if (hasNewLocalSources && user) {
+              setDoc(doc(db, `users/${user.uid}/projects/${p.id}`), { sources: mergedSources, updatedAt: Date.now() }, { merge: true }).catch(console.warn);
+            }
+            return {
+              ...p,
+              sources: mergedSources,
+              updatedAt: Math.max(p.updatedAt || 0, matchingLocal.updatedAt || 0)
+            };
+          }
+          return p;
+        });
+
         for (const lp of localAll) {
           if (!combined.some(p => p.id === lp.id || (p.name && lp.name && p.name.toLowerCase() === lp.name.toLowerCase()))) {
             combined.push(lp);
           }
         }
 
-        return sanitizeProjects(combined);
+        const sanitized = sanitizeProjects(combined);
+        safeLocalStorage.setItem(`local_projects_${user.uid}`, JSON.stringify(sanitized));
+        safeLocalStorage.setItem("local_projects", JSON.stringify(sanitized));
+        return sanitized;
       });
 
       // Automatically select desktop synced project if current project is default initial placeholder
@@ -1084,28 +1454,54 @@ export default function App() {
         return tA - tB;
       });
 
-      if (list.length > 0) {
-        setMessages(list);
-        currentDataProjectIdRef.current = activeProjectId;
-        loadedProjectIdRef.current = activeProjectId;
-        safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(list));
-        safeLocalStorage.setItem(`local_messages_backup_${activeProjectId}`, JSON.stringify(list));
-      } else {
-        // If Firestore is empty for this project, check if local storage or backups have offline messages
+      const isFirstLoadForProject = !initialReconciledProjectsRef.current[activeProjectId];
+
+      if (isFirstLoadForProject) {
+        initialReconciledProjectsRef.current[activeProjectId] = true;
         const targetProj = projects.find(p => p.id === activeProjectId);
         const localMsgs = loadProjectMessagesSafely(activeProjectId, targetProj?.name);
-        if (localMsgs.length > 0) {
+
+        if (list.length > 0) {
+          const combinedMsgs = [...list];
+          let hasNewLocal = false;
+
+          for (const lm of localMsgs) {
+            if (lm && lm.id && !combinedMsgs.some(m => m.id === lm.id)) {
+              combinedMsgs.push(lm);
+              hasNewLocal = true;
+              setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, lm.id), cleanForFirestore(lm)).catch(console.warn);
+            }
+          }
+
+          if (hasNewLocal) {
+            combinedMsgs.sort((a, b) => {
+              const tA = typeof a.timestamp === "number" ? a.timestamp : new Date(a.timestamp || 0).getTime();
+              const tB = typeof b.timestamp === "number" ? b.timestamp : new Date(b.timestamp || 0).getTime();
+              return tA - tB;
+            });
+            setMessages(combinedMsgs);
+            currentDataProjectIdRef.current = activeProjectId;
+            loadedProjectIdRef.current = activeProjectId;
+            safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(combinedMsgs));
+            return;
+          }
+        } else if (localMsgs.length > 0) {
+          // If Firestore is empty on first load, seed from local storage
           setMessages(localMsgs);
           currentDataProjectIdRef.current = activeProjectId;
           loadedProjectIdRef.current = activeProjectId;
-          // Sync local messages up to Firestore cloud so they remain backed up in both places
           for (const m of localMsgs) {
             setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, m.id), cleanForFirestore(m)).catch(console.warn);
           }
-        } else {
-          setMessages([]);
+          return;
         }
       }
+
+      // Live real-time stream from Firestore
+      setMessages(list);
+      currentDataProjectIdRef.current = activeProjectId;
+      loadedProjectIdRef.current = activeProjectId;
+      safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(list));
     }, (err) => {
       console.warn("Firestore messages snapshot error (using local storage fallback):", err?.message);
     });
@@ -1122,16 +1518,22 @@ export default function App() {
       if (list.length > 0) {
         setCharacters(list);
         safeLocalStorage.setItem(`local_characters_${activeProjectId}`, JSON.stringify(list));
-        safeLocalStorage.setItem(`local_characters_backup_${activeProjectId}`, JSON.stringify(list));
       } else {
-        const localChars = loadProjectCharactersSafely(activeProjectId);
-        if (localChars.length > 0) {
-          setCharacters(localChars);
-          for (const c of localChars) {
-            setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/characters`, c.id), c).catch(console.warn);
+        const isFirstCharLoad = !initialReconciledProjectsRef.current[`chars_${activeProjectId}`];
+        if (isFirstCharLoad) {
+          initialReconciledProjectsRef.current[`chars_${activeProjectId}`] = true;
+          const localChars = loadProjectCharactersSafely(activeProjectId);
+          if (localChars.length > 0) {
+            setCharacters(localChars);
+            for (const c of localChars) {
+              setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/characters`, c.id), cleanForFirestore(c)).catch(console.warn);
+            }
+          } else {
+            setCharacters([]);
           }
         } else {
           setCharacters([]);
+          safeLocalStorage.setItem(`local_characters_${activeProjectId}`, JSON.stringify([]));
         }
       }
     }, (err) => {
@@ -1194,6 +1596,14 @@ export default function App() {
 
   // Google Sign-In helper
   const handleGoogleSignIn = async (): Promise<string | undefined> => {
+    if (!isFirebaseConfigured) {
+      showToast(
+        "Cloud Sync Not Configured",
+        "Cloud account sync is currently offline because Firebase is not linked. Your campaigns and story archives remain safely preserved on this device, and you can transfer them anytime using the Export/Import buttons!",
+        "info"
+      );
+      return undefined;
+    }
     if (isSigningIn) {
       console.log("Sign-in already in progress, ignoring duplicate call.");
       return undefined;
@@ -1201,18 +1611,18 @@ export default function App() {
     setIsSigningIn(true);
     try {
       if (auth.currentUser?.email) {
-        googleDriveProvider.setCustomParameters({ login_hint: auth.currentUser.email });
+        googleProvider.setCustomParameters({ login_hint: auth.currentUser.email });
       }
-      const result = await signInWithPopup(auth, googleDriveProvider);
+      const result = await signInWithPopup(auth, googleProvider);
       const credential = GoogleAuthProvider.credentialFromResult(result);
       const token = credential?.accessToken;
       if (token) {
         setGoogleToken(token);
         safeLocalStorage.setItem("nyx_google_token", token);
         safeLocalStorage.setItem("nyx_google_token_timestamp", Date.now().toString());
-        showToast("Signed In with Google", "Google Account & Workspace sync connected successfully.", "success");
-        return token;
       }
+      showToast("Signed In with Google", `Welcome ${result.user?.email || "Storyteller"}! Cloud sync is active across your devices.`, "success");
+      return token;
     } catch (err: any) {
       if (err?.code === "auth/popup-closed-by-user" || err?.message?.includes("popup-closed-by-user")) {
         console.warn("Sign-in popup was closed by the user.");
@@ -1231,6 +1641,14 @@ export default function App() {
 
   // Google Drive/Workspace Connection helper (with granular scopes)
   const handleGoogleDriveSignIn = async (): Promise<string | undefined> => {
+    if (!isFirebaseConfigured) {
+      showToast(
+        "Cloud Sync Not Configured",
+        "Cloud account sync is currently offline because Firebase is not linked. Your campaigns and story archives remain safely preserved on this device, and you can transfer them anytime using the Export/Import buttons!",
+        "info"
+      );
+      return undefined;
+    }
     if (isSigningIn) {
       console.log("Sign-in already in progress, ignoring duplicate call.");
       return undefined;
@@ -1342,9 +1760,7 @@ export default function App() {
 
         // Explicitly initialize local storage to empty arrays so no scanners grab foreign data
         safeLocalStorage.setItem(`local_messages_${newId}`, JSON.stringify([]));
-        safeLocalStorage.setItem(`local_messages_backup_${newId}`, JSON.stringify([]));
         safeLocalStorage.setItem(`local_characters_${newId}`, JSON.stringify([]));
-        safeLocalStorage.setItem(`local_characters_backup_${newId}`, JSON.stringify([]));
 
         currentDataProjectIdRef.current = newId;
         loadedProjectIdRef.current = newId;
@@ -1367,9 +1783,7 @@ export default function App() {
 
         // Explicitly initialize local storage to empty arrays
         safeLocalStorage.setItem(`local_messages_${newId}`, JSON.stringify([]));
-        safeLocalStorage.setItem(`local_messages_backup_${newId}`, JSON.stringify([]));
         safeLocalStorage.setItem(`local_characters_${newId}`, JSON.stringify([]));
-        safeLocalStorage.setItem(`local_characters_backup_${newId}`, JSON.stringify([]));
 
         currentDataProjectIdRef.current = newId;
         loadedProjectIdRef.current = newId;
@@ -1410,34 +1824,39 @@ export default function App() {
     if (key === "messages") {
       setMessages(val);
       safeLocalStorage.setItem(`local_messages_${targetId}`, JSON.stringify(val));
-      if (Array.isArray(val) && val.length > 0) {
-        safeLocalStorage.setItem(`local_messages_backup_${targetId}`, JSON.stringify(val));
+      if (user && targetId && Array.isArray(val)) {
+        for (const m of val) {
+          if (m && m.id) {
+            setDoc(doc(db, `users/${user.uid}/projects/${targetId}/messages`, m.id), cleanForFirestore(m)).catch(console.warn);
+          }
+        }
+        setDoc(doc(db, `users/${user.uid}/projects/${targetId}`), { updatedAt: Date.now() }, { merge: true }).catch(console.warn);
       }
       return;
     }
 
+    const now = Date.now();
     const normalizedVal = key === "themeId" && typeof val === "string" ? val.toLowerCase() : val;
     
     setProjects(prev => {
       const exists = prev.some(p => p.id === targetId);
       const updated = exists 
-        ? prev.map(p => p.id === targetId ? { ...p, [key]: normalizedVal } : p)
-        : [...prev, { id: targetId, name: key === "name" ? normalizedVal : "Nyx Roleplay Campaign", [key]: normalizedVal } as Project];
+        ? prev.map(p => p.id === targetId ? { ...p, [key]: normalizedVal, updatedAt: now } : p)
+        : [...prev, { id: targetId, name: key === "name" ? normalizedVal : "Nyx Roleplay Campaign", [key]: normalizedVal, updatedAt: now } as Project];
       
       if (user) {
         safeLocalStorage.setItem(`local_projects_${user.uid}`, JSON.stringify(updated));
       }
       safeLocalStorage.setItem("local_projects", JSON.stringify(updated));
-      safeLocalStorage.setItem("nyx_backup_projects", JSON.stringify(updated));
-      safeLocalStorage.setItem("local_projects_backup", JSON.stringify(updated));
       return updated;
     });
 
     if (user && targetId) {
-      const docRef = doc(db, `users/${user.uid}/projects`, targetId);
-      setDoc(docRef, cleanForFirestore({ [key]: normalizedVal }), { merge: true }).catch((err) => {
+      const docRef = doc(db, `users/${user.uid}/projects/${targetId}`);
+      setDoc(docRef, cleanForFirestore({ [key]: normalizedVal, updatedAt: now }), { merge: true }).catch((err) => {
         console.warn("Firestore project value sync warning:", err);
       });
+      setDoc(doc(db, `users/${user.uid}`), { activeProjectId: targetId, lastActiveAt: now }, { merge: true }).catch(console.warn);
     }
   };
 
@@ -1614,6 +2033,8 @@ export default function App() {
           storyModules: activeProj.storyModules,
           persistentContext: activeProj.persistentContext || "",
           plotOverview: activeProj.plotOverview || "",
+          activeCharacterId: activeProj.activeCharacterId || "",
+          strictPlayerAgency: activeProj.strictPlayerAgency !== false,
           activeSources: (activeProj.sources || []).map((s: any) => ({
             id: s.id,
             name: s.name,
@@ -1794,6 +2215,24 @@ export default function App() {
               showToast("📋 Task Added", `Added objective: "${text}".`, "success");
               handleAddSyncLog(text, "success", `Added task "${text}".`);
             }
+          } else if (action.action === "edit_narrative" || action.action === "edit_narrative_log") {
+            const targetId = args.id || args.messageId || "latest";
+            const newContent = args.newContent || args.content || args.text || args.prose;
+            if (newContent) {
+              let msgToEdit: any = null;
+              if (targetId && targetId !== "latest" && targetId !== "last") {
+                msgToEdit = messages.find(m => m.id === targetId);
+              }
+              if (!msgToEdit) {
+                const modelMsgs = messages.filter(m => m.role === "nyx" || m.role === "assistant");
+                msgToEdit = modelMsgs.length > 0 ? modelMsgs[modelMsgs.length - 1] : messages[messages.length - 1];
+              }
+              if (msgToEdit) {
+                await handleEditMessage(msgToEdit.id, String(newContent));
+                showToast("✨ Narrative Turn Revised", "Edited previous scene turn in the Adventure Log.", "success");
+                handleAddSyncLog("Narrative Log", "success", "Revised previous narrative turn via AI agent.");
+              }
+            }
           }
         }
       }
@@ -1951,6 +2390,8 @@ export default function App() {
           storyModules: activeProj.storyModules,
           persistentContext: activeProj.persistentContext || "",
           plotOverview: activeProj.plotOverview || "",
+          activeCharacterId: activeProj.activeCharacterId || "",
+          strictPlayerAgency: activeProj.strictPlayerAgency !== false,
           activeSources: (activeProj.sources || []).map((s: any) => ({
             id: s.id,
             name: s.name,
@@ -2134,18 +2575,63 @@ export default function App() {
   };
 
   const handleEditMessage = async (id: string, newContent: string) => {
-    const updated = messages.map(m => m.id === id ? { ...m, content: newContent } : m);
-    setMessages(updated);
+    let savedMsg: any = null;
+    let nextMessages: Message[] = [];
+    setMessages(prev => {
+      const updated = prev.map(m => {
+        if (m.id !== id) return m;
 
-    if (user && activeProjectId) {
-      const docRef = doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, id);
-      await setDoc(docRef, { content: newContent }, { merge: true });
+        let updatedVersions = m.versions;
+        if (Array.isArray(m.versions) && m.versions.length > 0) {
+          const activeIdx = typeof m.activeVersionIndex === "number" && m.activeVersionIndex >= 0 && m.activeVersionIndex < m.versions.length
+            ? m.activeVersionIndex
+            : m.versions.length - 1;
+
+          updatedVersions = m.versions.map((ver: any, vIdx: number) => {
+            if (vIdx === activeIdx) {
+              return { ...ver, content: newContent };
+            }
+            return ver;
+          });
+        }
+
+        const updatedMsg = {
+          ...m,
+          content: newContent,
+          versions: updatedVersions
+        };
+        savedMsg = updatedMsg;
+        return updatedMsg;
+      });
+      nextMessages = updated;
+      return updated;
+    });
+
+    if (activeProjectId && nextMessages.length > 0) {
+      safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(nextMessages));
+    }
+
+    if (user && activeProjectId && savedMsg) {
+      try {
+        const docRef = doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, id);
+        await setDoc(docRef, savedMsg, { merge: true });
+      } catch (err) {
+        console.warn("Firestore save message edit failed:", err);
+      }
     }
   };
 
   const handleDeleteMessage = async (id: string) => {
-    const updated = messages.filter(m => m.id !== id);
-    setMessages(updated);
+    let nextMessages: Message[] = [];
+    setMessages(prev => {
+      const updated = prev.filter(m => m.id !== id);
+      nextMessages = updated;
+      return updated;
+    });
+
+    if (activeProjectId) {
+      safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(nextMessages));
+    }
 
     if (user && activeProjectId) {
       const docRef = doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, id);
@@ -2273,7 +2759,7 @@ export default function App() {
     if (user) {
       const payload = { title, content, updatedAt: newNote.updatedAt };
       Promise.race([
-        addDoc(collection(db, `users/${user.uid}/notes`), payload),
+        setDoc(doc(db, `users/${user.uid}/notes`, localId), cleanForFirestore(payload)),
         new Promise((_, reject) => setTimeout(() => reject(new Error("Firestore write timeout")), 2500))
       ]).catch(err => {
         console.warn("Firestore save note timed out or failed (local state preserved):", err);
@@ -2301,7 +2787,7 @@ export default function App() {
     if (user) {
       const payload = { text, completed: false };
       Promise.race([
-        addDoc(collection(db, `users/${user.uid}/tasks`), payload),
+        setDoc(doc(db, `users/${user.uid}/tasks`, localId), cleanForFirestore(payload)),
         new Promise((_, reject) => setTimeout(() => reject(new Error("Firestore write timeout")), 2500))
       ]).catch(err => {
         console.warn("Firestore save task timed out or failed (local state preserved):", err);
@@ -2393,11 +2879,9 @@ export default function App() {
     // 2. Persist to Firestore with safety timeout so async callers never freeze
     if (user && activeProjectId) {
       try {
-        const firestorePayload: any = { ...newItem };
-        delete firestorePayload.id;
-
+        const charDocRef = doc(db, `users/${user.uid}/projects/${activeProjectId}/characters`, localId);
         await Promise.race([
-          addDoc(collection(db, `users/${user.uid}/projects/${activeProjectId}/characters`), firestorePayload),
+          setDoc(charDocRef, cleanForFirestore(newItem)),
           new Promise((_, reject) => setTimeout(() => reject(new Error("Firestore character write timeout")), 2500))
         ]).catch(err => {
           console.warn("Firestore save character timed out or failed (local state preserved):", err);
@@ -2555,23 +3039,26 @@ export default function App() {
 
                   {/* System & Sync Controls */}
                   <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-                    {/* SYNC WITH DESKTOP BUTTON */}
+                    {/* CROSS-DEVICE CLOUD SYNC BUTTON */}
                     <button
                       type="button"
-                      onClick={handleSyncWithDesktop}
-                      disabled={isSyncingDesktop || !isOnline}
-                      className={`flex items-center gap-1 px-2 sm:px-2.5 py-1.5 rounded-lg text-xs font-mono font-medium transition-all cursor-pointer border ${
-                        isSyncingDesktop
-                          ? "bg-purple-950 text-purple-200 border-purple-500/60 shadow-sm"
-                          : user
-                          ? "bg-slate-950/90 hover:bg-purple-950/60 text-slate-300 hover:text-purple-200 border-slate-800 hover:border-purple-700/50 shadow-xs"
-                          : "bg-slate-950 text-slate-400 hover:text-slate-200 border-slate-800"
+                      onClick={() => setShowCloudSyncModal(true)}
+                      className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 rounded-lg text-xs font-mono font-medium transition-all cursor-pointer border ${
+                        user
+                          ? "bg-slate-950/90 hover:bg-emerald-950/40 text-emerald-300 hover:text-emerald-200 border-emerald-800/50 hover:border-emerald-700 shadow-xs"
+                          : "bg-amber-950/40 hover:bg-amber-900/50 text-amber-300 border-amber-800/70 animate-pulse"
                       }`}
-                      title="Sync with Desktop (Transfers latest stories, campaigns, notes & settings)"
+                      title={
+                        user
+                          ? `⚡ Live Real-Time Synced to ${user.email} - All narrative, chat, and character changes stream live across all your devices`
+                          : "Device Not Synced - Click to Sign In and link other Chrome devices"
+                      }
                     >
-                      <Cloud size={13} className={isSyncingDesktop ? "animate-pulse text-cyan-400" : "text-purple-400"} />
-                      <span className="hidden sm:inline">{isSyncingDesktop ? "Syncing..." : "Sync Desktop"}</span>
-                      <span className="sm:hidden">{isSyncingDesktop ? "..." : "Sync"}</span>
+                      <Cloud size={13} className={isSyncingDesktop ? "animate-pulse text-cyan-400" : user ? "text-emerald-400" : "text-amber-400"} />
+                      <span className="hidden sm:inline">
+                        {isSyncingDesktop ? "Syncing..." : user ? "⚡ Live Synced" : "Sync Devices"}
+                      </span>
+                      <span className="sm:hidden">{isSyncingDesktop ? "..." : user ? "Live" : "Sync"}</span>
                     </button>
 
                     {/* LITE MOBILE / FULL STUDIO MODE TOGGLE */}
@@ -2713,10 +3200,16 @@ export default function App() {
                             handleRestoreOrCreateCampaign("Shima");
                           } else if (val === "rescan-all") {
                             handleDeepScanAndRecover();
+                          } else if (val === "export-all") {
+                            handleExportAllCampaignsData();
+                          } else if (val === "import-backup") {
+                            campaignBackupInputRef.current?.click();
                           } else if (val === "sync-cloud") {
                             handleSyncWithDesktop();
+                          } else if (val === "cloud-sync-modal") {
+                            setShowCloudSyncModal(true);
                           } else if (val) {
-                            setActiveProjectId(val);
+                            handleSelectProject(val);
                           }
                         }}
                         className="bg-transparent text-xs font-semibold text-slate-300 outline-none cursor-pointer flex-1 min-w-0 truncate"
@@ -2738,8 +3231,17 @@ export default function App() {
                             <option value="new" className="bg-slate-950 text-purple-400 font-semibold">
                               + Create New Campaign...
                             </option>
+                            <option value="cloud-sync-modal" className="bg-emerald-950 text-emerald-300 font-semibold">
+                              ☁️ Cross-Device Cloud Sync Manager...
+                            </option>
+                            <option value="export-all" className="bg-purple-950 text-purple-200 font-semibold">
+                              📤 Export All Campaigns (.json)
+                            </option>
+                            <option value="import-backup" className="bg-emerald-950 text-emerald-300 font-semibold">
+                              📥 Import Campaign Backup (.json)...
+                            </option>
                             <option value="sync-cloud" className="bg-emerald-950 text-emerald-300 font-semibold">
-                              ☁️ Sync All Campaigns with Desktop ({projects.length})
+                              🔄 Sync All Campaigns with Cloud Now ({projects.length})
                             </option>
                             {!projects.some(p => p.name.toLowerCase().includes("shima")) && (
                               <option value="recover-shima" className="bg-purple-950 text-purple-300 font-semibold">
@@ -2957,6 +3459,63 @@ export default function App() {
           <div className="flex-1 flex min-h-0 h-full overflow-hidden relative">
             <main className={`flex-1 min-w-0 min-h-0 h-full flex flex-col overflow-hidden transition-all duration-300 ${isCinemaMode ? "p-0" : "p-2 sm:p-3 md:p-4"}`}>
               
+              {/* DEVICE MIGRATION & RECOVERY HELPER BANNER */}
+              {!dismissedDeviceMigrationBanner && projects.length <= 1 && (!messages || messages.length === 0) && (
+                <div className="mb-3 p-3.5 sm:p-4 rounded-2xl bg-gradient-to-r from-purple-950/60 via-slate-900 to-slate-900 border border-purple-700/50 shadow-xl shadow-purple-950/20 text-xs space-y-2.5 animate-in fade-in slide-in-from-top-2 duration-300">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-center gap-2 text-purple-200 font-bold text-sm">
+                      <Laptop size={18} className="text-purple-400 shrink-0" />
+                      <span>Switched Devices or Don't See Your Campaigns?</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDismissedDeviceMigrationBanner(true);
+                        safeLocalStorage.setItem("nyx_dismiss_migration_banner", "true");
+                      }}
+                      className="text-slate-400 hover:text-slate-200 p-1 rounded-lg hover:bg-slate-800 transition-colors"
+                      title="Dismiss notification"
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                  <p className="text-slate-300 leading-relaxed text-xs">
+                    Campaigns, narrative logs, and character vaults are stored locally in each browser session. Because you opened this application on a new machine, your previous local files aren't in this browser yet.
+                    <span className="text-emerald-300 font-semibold ml-1">
+                      Your campaigns are still safe on your other computer!
+                    </span>
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => campaignBackupInputRef.current?.click()}
+                      className="px-3.5 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-semibold flex items-center gap-1.5 shadow-md shadow-purple-900/30 transition-all cursor-pointer text-xs"
+                    >
+                      <Upload size={13} />
+                      Import Campaign Backup (.json)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowStoryArchiveModal(true)}
+                      className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-purple-200 border border-purple-800/50 font-semibold flex items-center gap-1.5 transition-colors cursor-pointer text-xs"
+                    >
+                      <BookOpen size={13} className="text-purple-400" />
+                      Story Archives & Transfer Guide
+                    </button>
+                    {!user && (
+                      <button
+                        type="button"
+                        onClick={handleGoogleSignIn}
+                        className="px-3.5 py-1.5 rounded-xl bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-700/60 text-emerald-300 font-semibold flex items-center gap-1.5 transition-colors cursor-pointer text-xs"
+                      >
+                        <LogIn size={13} />
+                        Sign in with Google
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {activeProject ? (
                 <div className="h-full w-full min-h-0 flex-1 flex flex-row relative overflow-hidden">
                   <div className="h-full w-full min-h-0 flex-1 flex flex-col relative overflow-hidden">
@@ -3107,10 +3666,15 @@ export default function App() {
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -4 }}
                         transition={{ duration: 0.18, ease: "easeOut" }}
-                        className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
+                        className="h-full w-full min-h-0 flex-1 flex flex-col overflow-y-auto overflow-x-hidden scrollbar-thin"
                       >
                         <NarrativeSuite
-                          chatTranscript={messages.map(m => `[${m.role}] ${m.content}`).join("\n\n")}
+                          chatTranscript={messages.map(m => {
+                            const text = (m.versions && typeof m.activeVersionIndex === "number" && m.versions[m.activeVersionIndex])
+                              ? m.versions[m.activeVersionIndex].content
+                              : (m.content || "");
+                            return `[${m.role}] ${text}`;
+                          }).join("\n\n")}
                           onEditNarrative={handleEditNarrative}
                           ragSummary={activeProject.ragSummary}
                           onUpdateRagSummary={(summary) => handleSetProjectValue("ragSummary", summary)}
@@ -3389,11 +3953,44 @@ export default function App() {
         projects={projects}
         activeProjectId={activeProjectId}
         onSelectProject={(projId) => {
-          setActiveProjectId(projId);
+          handleSelectProject(projId);
         }}
         onRestoreMessages={handleRestoreArchivedMessages}
         onRestoreOrCreateCampaign={handleRestoreOrCreateCampaign}
+        onExportAllData={handleExportAllCampaignsData}
+        onImportAllData={handleImportCampaignsData}
         onShowToast={showToast}
+      />
+
+      {/* CROSS-DEVICE CLOUD SYNC MANAGER MODAL */}
+      <CloudSyncModal
+        isOpen={showCloudSyncModal}
+        onClose={() => setShowCloudSyncModal(false)}
+        user={user}
+        isSyncing={isSyncingDesktop}
+        onSyncNow={handleSyncWithDesktop}
+        onGoogleSignIn={handleGoogleSignIn}
+        onGoogleSignOut={handleLogout}
+        projects={projects}
+        activeProjectId={activeProjectId}
+        onSelectProject={(id) => {
+          handleSelectProject(id);
+          setShowCloudSyncModal(false);
+        }}
+        onExportAll={handleExportAllCampaignsData}
+        onImportFile={handleCampaignFileInput}
+        autoSyncOnLaunch={autoSyncOnLaunch}
+        onToggleAutoSyncOnLaunch={handleToggleAutoSyncOnLaunch}
+        onShowToast={showToast}
+      />
+
+      {/* Hidden File Input for Direct Campaign Backup Upload */}
+      <input
+        type="file"
+        ref={campaignBackupInputRef}
+        onChange={handleCampaignFileInput}
+        accept=".json,application/json"
+        className="hidden"
       />
 
         </>

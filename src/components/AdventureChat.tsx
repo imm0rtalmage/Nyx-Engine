@@ -2571,6 +2571,59 @@ export default function AdventureChat({
                   </div>
                 </div>
 
+                {/* Strict Player Agency / Story Facilitator Toggle */}
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                      <span>Story Facilitator / Agency</span>
+                      <span className="px-1.5 py-0.5 rounded text-[8px] font-bold tracking-normal bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                        Zero Puppeteering
+                      </span>
+                    </label>
+                    <span className="text-[9px] text-slate-400">
+                      {project.strictPlayerAgency !== false ? "Active" : "Flexible"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextVal = project.strictPlayerAgency === false ? true : false;
+                      onSetProjectValue("strictPlayerAgency", nextVal);
+                      onShowToast?.(
+                        nextVal ? "Strict Facilitator Active" : "Facilitator Guard Relaxed",
+                        nextVal 
+                          ? "AI is strictly locked to story facilitation. It will never generate spoken quotes or actions for your PC."
+                          : "Facilitator guard relaxed.",
+                        nextVal ? "success" : "info"
+                      );
+                    }}
+                    className={`w-full py-2 px-3 rounded-xl border text-left text-xs transition-all flex items-center justify-between ${
+                      project.strictPlayerAgency !== false
+                        ? "bg-emerald-950/30 border-emerald-800/60 text-emerald-200"
+                        : "bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+                    }`}
+                  >
+                    <div className="flex flex-col gap-0.5">
+                      <span className="font-semibold flex items-center gap-1.5">
+                        <span className={`w-2 h-2 rounded-full ${project.strictPlayerAgency !== false ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "bg-slate-600"}`} />
+                        {project.strictPlayerAgency !== false ? "Strict Facilitator Mode Enabled" : "Facilitator Mode Off"}
+                      </span>
+                      <span className="text-[10px] text-slate-400">
+                        {project.strictPlayerAgency !== false 
+                          ? "AI only describes the world & NPCs. Spoken quotes & actions for your PC are strictly prohibited." 
+                          : "AI may occasionally extrapolate actions for narrative flow."}
+                      </span>
+                    </div>
+                    <span className={`text-[10px] font-bold px-2 py-1 rounded-lg border ${
+                      project.strictPlayerAgency !== false
+                        ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"
+                        : "bg-slate-800 text-slate-400 border-slate-700"
+                    }`}>
+                      {project.strictPlayerAgency !== false ? "ON" : "OFF"}
+                    </span>
+                  </button>
+                </div>
+
                 {/* Turn Header / Episode Code */}
                 <div>
                   <div className="flex justify-between items-center mb-1">
@@ -5858,6 +5911,32 @@ export default function AdventureChat({
               >
                 <span className="text-purple-400 font-bold">POV:</span>
                 <span>{project.narrativePerspective === "second_person" ? "🎯 2nd (You)" : "👤 3rd (Sena)"}</span>
+              </button>
+
+              {/* Strict Story Facilitator Quick Toggle */}
+              <button
+                type="button"
+                onClick={() => {
+                  const nextVal = project.strictPlayerAgency === false ? true : false;
+                  onSetProjectValue("strictPlayerAgency", nextVal);
+                  onShowToast?.(
+                    nextVal ? "Story Facilitator Locked" : "Facilitator Guard Relaxed",
+                    nextVal 
+                      ? "Strict Facilitator Mode active: AI will strictly narrate the world & NPCs. Spoken quotes and actions for your PC are forbidden."
+                      : "Strict Facilitator Mode relaxed.",
+                    nextVal ? "success" : "info"
+                  );
+                }}
+                className={`flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-lg border transition-all ${
+                  project.strictPlayerAgency !== false
+                    ? "bg-emerald-950/80 border-emerald-500/50 text-emerald-200 shadow-sm"
+                    : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200"
+                }`}
+                title="Click to toggle Story Facilitator Mode (Locks AI from speaking or acting for your PC)"
+              >
+                <Shield size={11} className={project.strictPlayerAgency !== false ? "text-emerald-400 shrink-0" : "text-slate-400 shrink-0"} />
+                <span className={project.strictPlayerAgency !== false ? "text-emerald-400 font-bold" : "text-slate-400 font-bold"}>Facilitator:</span>
+                <span>{project.strictPlayerAgency !== false ? "🛡️ Strict" : "Off"}</span>
               </button>
 
               {/* Author Style & Zero-Drift Quick Anchor */}

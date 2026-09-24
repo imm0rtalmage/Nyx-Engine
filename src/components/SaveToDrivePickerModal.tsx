@@ -4,7 +4,7 @@ import {
   FolderOpen, Loader2, Search, X, Grid, List, AlertCircle, 
   RefreshCw, Check, FileText, ExternalLink, Plus, Save
 } from "lucide-react";
-import firebaseConfig from "../../firebase-applet-config.json";
+import firebaseConfig from "../lib/firebaseConfig";
 import { listGoogleDocs, createGoogleDoc, updateGoogleDoc } from "../utils/googleWorkspace";
 
 const GoogleDriveIcon = ({ size = 18, className = "" }: { size?: number; className?: string }) => (

@@ -556,6 +556,13 @@ export const LoreCodexModal: React.FC<LoreCodexModalProps> = ({
         categories={allCategories}
         defaultUniverse={selectedCategory !== "all" && selectedCategory !== "bookmarks" && selectedCategory !== "custom" ? selectedCategory : activeUniverse}
         onImportSuccess={(count, universeName) => {
+          const matched = allCategories.find(c => 
+            c.name.toLowerCase() === universeName.toLowerCase() || 
+            c.id.toLowerCase() === universeName.toLowerCase()
+          );
+          if (matched) {
+            setSelectedCategory(matched.id);
+          }
           onShowToast?.(
             "Lore Imported!",
             `Distilled and imported ${count} fact(s) into universe: "${universeName}"`,

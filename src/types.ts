@@ -170,6 +170,8 @@ export interface Project {
   sparkRawThreadsFolderId?: string;
   sparkCodexFolderId?: string;
   lastSparkSyncTimestamp?: string;
+  strictPlayerAgency?: boolean; // When true (default), prevents AI from speaking for or controlling the player character
+  updatedAt?: number; // Millisecond timestamp of latest message or update for cross-device sync
 }
 
 export const DEFAULT_INITIAL_PROJECT: Project = {
@@ -181,6 +183,7 @@ export const DEFAULT_INITIAL_PROJECT: Project = {
   customInstructions: "",
   narrationStyle: "Vivid novel-grade detail",
   narrativePerspective: "third_person",
+  strictPlayerAgency: true,
   pacing: "Default to Author(s)",
   emotionalTone: "Default to Author(s)",
   canonSource: "Custom Core",

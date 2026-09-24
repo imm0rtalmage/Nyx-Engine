@@ -42,52 +42,59 @@ The user interface popup for the extension.
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8">
   <style>
     body {
-      width: 240px;
+      width: 260px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: #0f172a;
       color: #f1f5f9;
       margin: 0;
-      padding: 12px;
+      padding: 14px;
     }
     h3 {
-      font-size: 13px;
+      font-size: 14px;
       margin: 0 0 4px 0;
       color: #a855f7;
     }
     p {
-      font-size: 10px;
+      font-size: 11px;
       color: #94a3b8;
       margin: 0 0 12px 0;
+      line-height: 1.4;
     }
     button {
       width: 100%;
       background: #a855f7;
       color: white;
       border: none;
-      padding: 8px 12px;
+      padding: 9px 12px;
       border-radius: 6px;
-      font-size: 11px;
-      font-weight: bold;
+      font-size: 12px;
+      font-weight: 600;
       cursor: pointer;
-      transition: background 0.2s;
+      transition: background 0.2s, opacity 0.2s;
     }
-    button:hover {
+    button:hover:not(:disabled) {
       background: #9333ea;
     }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
     .status {
-      font-size: 9px;
+      font-size: 10px;
       color: #10b981;
-      margin-top: 8px;
+      margin-top: 10px;
       text-align: center;
       display: none;
+      word-break: break-word;
     }
   </style>
 </head>
 <body>
   <h3>Nyx DOM Exporter</h3>
-  <p>Download active playground or chat session DOMs in high fidelity.</p>
+  <p>Download active chat playground or session DOMs with virtualized element mounting.</p>
   <button id="export-btn">Export Active Chat DOM</button>
   <div id="status-text" class="status">Export completed successfully!</div>
   
@@ -97,16 +104,25 @@ The user interface popup for the extension.
 ```
 
 ### 3. `popup.js`
-Injects the content extraction script into the active tab and triggers the file download.
+Injects the content extraction script into the active tab, executes an asynchronous micro-scroll loop to mount virtualized DOM elements, and triggers the file download.
 ```javascript
 document.getElementById("export-btn").addEventListener("click", async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const status = document.getElementById("status-text");
+  const exportBtn = document.getElementById("export-btn");
   
-  chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: exportChatDOM
-  }, (results) => {
-    if (results && results[0]) {
+  exportBtn.disabled = true;
+  status.textContent = "Scanning & mounting virtualized DOM elements...";
+  status.style.display = "block";
+  status.style.color = "#c084fc";
+
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: exportChatDOM
+    });
+
+    if (results && results[0] && results[0].result) {
       const htmlContent = results[0].result;
       const blob = new Blob([htmlContent], { type: "text/html" });
       const url = URL.createObjectURL(blob);
@@ -119,38 +135,99 @@ document.getElementById("export-btn").addEventListener("click", async () => {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
       
-      const status = document.getElementById("status-text");
-      status.style.display = "block";
-      setTimeout(() => status.style.display = "none", 3000);
+      status.textContent = "Export completed successfully!";
+      status.style.color = "#10b981";
+      setTimeout(() => {
+        status.style.display = "none";
+        exportBtn.disabled = false;
+      }, 3000);
+    } else {
+      throw new Error("No chat DOM content found on the active page.");
     }
-  });
+  } catch (err) {
+    status.textContent = "Export failed: " + (err.message || "Unknown error");
+    status.style.color = "#f87171";
+    exportBtn.disabled = false;
+  }
 });
 
 // Executed in the context of the active tab
-function exportChatDOM() {
-  // 1. Identify common chat containers
-  const selectors = [
-    ".chat-container", 
-    ".messages-wrapper", 
-    "main", 
-    "[class*='chat']", 
-    "[class*='message']", 
-    ".message-feed"
+async function exportChatDOM() {
+  // 1. Semantic and framework-agnostic selectors for message turns and containers
+  const messageSelectors = [
+    "article",
+    "[data-message-author-role]",
+    "[data-testid*='message']",
+    "[data-testid*='conversation-turn']",
+    ".message",
+    "[class*='ChatMessage']",
+    "[class*='MessageItem']"
   ];
-  
+
+  const containerSelectors = [
+    "main",
+    "[role='log']",
+    "[role='presentation']",
+    ".chat-container",
+    ".messages-wrapper",
+    ".message-feed",
+    "[class*='chat-container']",
+    "[class*='conversation-stream']",
+    "[class*='messages-container']",
+    "[class*='feed']",
+    "[class*='chat']"
+  ];
+
+  // Helper to find the scrollable container ancestor
+  function findScrollContainer(element) {
+    let current = element;
+    while (current && current !== document.body && current !== document.documentElement) {
+      const style = window.getComputedStyle(current);
+      const overflowY = style.overflowY;
+      if ((overflowY === "auto" || overflowY === "scroll") && current.scrollHeight > current.clientHeight) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+    return document.scrollingElement || document.documentElement || document.body;
+  }
+
+  // 2. Identify target chat feed container
   let targetContainer = null;
-  for (const selector of selectors) {
-    const el = document.querySelector(selector);
-    if (el) {
-      targetContainer = el;
-      break;
+  const sampleMessage = document.querySelector(messageSelectors.join(", "));
+  if (sampleMessage) {
+    targetContainer = sampleMessage.closest("main, [role='log'], .chat-container, [class*='conversation'], [class*='feed']") || sampleMessage.parentElement;
+  }
+
+  if (!targetContainer) {
+    for (const selector of containerSelectors) {
+      const el = document.querySelector(selector);
+      if (el) {
+        targetContainer = el;
+        break;
+      }
     }
   }
-  
-  // Fallback to document body if no specific chat containers are detected
-  const exportNode = targetContainer || document.body;
-  
-  // Wrap in simple base page structure
+
+  const exportNode = targetContainer || document.querySelector("main") || document.body;
+  const scrollContainer = findScrollContainer(exportNode);
+
+  // 3. Asynchronous micro-scroll loop to mount virtualized DOM elements before export
+  if (scrollContainer) {
+    const originalScrollTop = scrollContainer.scrollTop;
+    if (originalScrollTop > 0) {
+      const step = Math.max(150, Math.floor(scrollContainer.clientHeight / 3));
+      while (scrollContainer.scrollTop > 0) {
+        scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollTop - step);
+        // Yield execution to allow virtual list listeners to trigger and mount elements
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      }
+      // Brief stabilization delay at the top
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
+  // 4. Wrap exported innerHTML into a valid HTML document
   return `<!DOCTYPE html>
 <html>
 <head>
