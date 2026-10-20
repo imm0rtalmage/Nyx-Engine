@@ -9,7 +9,8 @@ import {
 } from "./types";
 import { 
   auth, db, isFirebaseConfigured, googleProvider, googleDriveProvider, signInWithPopup, signOut, onAuthStateChanged,
-  collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, orderBy, addDoc
+  collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, onSnapshot, query, orderBy, addDoc,
+  isFirestoreQuotaExhausted, markFirestoreQuotaExhausted
 } from "./lib/firebase";
 import { GoogleAuthProvider } from "firebase/auth";
 import { motion, AnimatePresence } from "motion/react";
@@ -30,7 +31,8 @@ import {
 } from "lucide-react";
 
 import { cleanForFirestore } from "./lib/firebase";
-export { cleanForFirestore };
+import { normalizeCharacterName } from "./lib/nyxLoreEngine";
+export { cleanForFirestore, normalizeCharacterName };
 
 const DEFAULT_INITIAL_PROJECT: Project = {
   id: "proj-default-nyx",
@@ -55,7 +57,9 @@ const DEFAULT_INITIAL_PROJECT: Project = {
   sources: [],
   persistentContext: "",
   plotOverview: "",
-  turnHeader: ""
+  turnHeader: "",
+  selectedModel: "gemini-3.8-flash",
+  thinkingLevel: "Low"
 };
 
 function sanitizeProjects(rawList: any[]): Project[] {
@@ -445,6 +449,57 @@ export function loadProjectMessagesSafely(projectId: string, projectName?: strin
   return [];
 }
 
+export function deduplicateCharacters(chars: CharacterProfile[]): CharacterProfile[] {
+  if (!Array.isArray(chars) || chars.length === 0) return [];
+  const seen = new Map<string, CharacterProfile>();
+
+  for (const c of chars) {
+    if (!c) continue;
+    const rawName = c.name || "";
+    const norm = normalizeCharacterName(rawName);
+    if (!norm) {
+      const fallbackKey = c.id || Math.random().toString();
+      seen.set(fallbackKey, c);
+      continue;
+    }
+
+    if (!seen.has(norm)) {
+      seen.set(norm, c);
+    } else {
+      // Merge duplicate character into the existing one!
+      const existing = seen.get(norm)!;
+      // Prefer the name that has "Companion" or is longer/more descriptive (e.g. "Ashley Companion" over "Ashley")
+      const preferCurrentName = 
+        (rawName.toLowerCase().includes("companion") && !existing.name.toLowerCase().includes("companion")) ||
+        ((rawName.length > existing.name.length) && !existing.name.toLowerCase().includes("companion"));
+      
+      const mergedName = preferCurrentName ? rawName : existing.name;
+      const mergedRole = (c.role && c.role !== "NPC" && c.role !== "Role") ? c.role : existing.role;
+      const mergedType = (c.type === "companion" || existing.type === "companion") 
+        ? "companion" 
+        : (c.type === "pc" || existing.type === "pc" ? "pc" : (existing.type || c.type || "npc"));
+      
+      const merged: CharacterProfile = {
+        ...existing,
+        name: mergedName,
+        role: mergedRole,
+        type: mergedType as any,
+        description: (c.description && c.description.length > (existing.description || "").length) ? c.description : existing.description,
+        backstory: (c.backstory && c.backstory.length > (existing.backstory || "").length) ? c.backstory : existing.backstory,
+        relationships: (c.relationships && c.relationships.length > (existing.relationships || "").length) ? c.relationships : existing.relationships,
+        signatureItems: (c.signatureItems && c.signatureItems.length > (existing.signatureItems || "").length) ? c.signatureItems : existing.signatureItems,
+        factionName: existing.factionName || c.factionName,
+        portraitUrl: existing.portraitUrl || c.portraitUrl,
+        isInScene: existing.isInScene || c.isInScene,
+        customFields: { ...(existing.customFields || {}), ...(c.customFields || {}) }
+      };
+      seen.set(norm, merged);
+    }
+  }
+
+  return Array.from(seen.values());
+}
+
 export function loadProjectCharactersSafely(projectId: string): CharacterProfile[] {
   if (!projectId) return [];
   try {
@@ -452,7 +507,7 @@ export function loadProjectCharactersSafely(projectId: string): CharacterProfile
     if (primaryStr !== null) {
       try {
         const parsed = JSON.parse(primaryStr);
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed)) return deduplicateCharacters(parsed);
       } catch {}
     }
     const backupStr = safeLocalStorage.getItem(`local_characters_backup_${projectId}`);
@@ -461,7 +516,7 @@ export function loadProjectCharactersSafely(projectId: string): CharacterProfile
         const parsed = JSON.parse(backupStr);
         if (Array.isArray(parsed)) {
           safeLocalStorage.setItem(`local_characters_${projectId}`, backupStr);
-          return parsed;
+          return deduplicateCharacters(parsed);
         }
       } catch {}
     }
@@ -509,6 +564,20 @@ export default function App() {
   const loadedProjectIdRef = React.useRef<string>("");
   const [activeTab, setActiveTab] = useState<"chat" | "editor" | "workspace">("chat");
 
+  // Dynamic responsive screen width detection
+  const [isMobileScreen, setIsMobileScreen] = useState<boolean>(() => {
+    return typeof window !== "undefined" ? window.innerWidth < 768 : false;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleResize = () => {
+      setIsMobileScreen(window.innerWidth < 768);
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
   // Streamlined Mobile Mode state: specifically focuses into Narration, Assistant, and World Settings
   const [isMobileLite, setIsMobileLite] = useState<boolean>(() => {
     try {
@@ -520,7 +589,8 @@ export default function App() {
     }
   });
 
-  const [mobileLiteTab, setMobileLiteTab] = useState<"chat" | "assistant" | "settings">("chat");
+  type MobileTabType = "chat" | "assistant" | "editor" | "settings" | "workspace";
+  const [mobileLiteTab, setMobileLiteTab] = useState<MobileTabType>("chat");
 
   const toggleMobileLiteMode = () => {
     setIsMobileLite(prev => {
@@ -534,7 +604,7 @@ export default function App() {
         next ? "📱 Streamlined Mobile View Active" : "💻 Full Studio Mode Active",
         next 
           ? "Streamlined interface focused on Narration, Assistant, and World Settings." 
-          : "Full desktop suite with Narrative Editing, Image Generator, and Workspace Sync enabled.",
+          : "Full suite mode enabled with Narrative Editing and Workspace Sync.",
         "info"
       );
       return next;
@@ -544,6 +614,17 @@ export default function App() {
   const [isOnline, setIsOnline] = useState<boolean>(() => {
     return typeof navigator !== "undefined" ? navigator.onLine : true;
   });
+
+  const [isQuotaExhausted, setIsQuotaExhausted] = useState<boolean>(() => isFirestoreQuotaExhausted());
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleQuota = () => {
+      setIsQuotaExhausted(true);
+    };
+    window.addEventListener("nyx:firestore-quota-exhausted", handleQuota);
+    return () => window.removeEventListener("nyx:firestore-quota-exhausted", handleQuota);
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1044,7 +1125,7 @@ export default function App() {
 
   // Background Sync: Auto-sync any unsynced local campaigns, characters, messages & notes to Firestore
   const syncLocalDataToFirestore = async (currentUser: any, forceSyncAll: boolean = false) => {
-    if (!currentUser) return;
+    if (!currentUser || isFirestoreQuotaExhausted()) return;
     try {
       // Gather all known projects across all storage sources
       const allFound = loadAllProjectsSafely(currentUser.uid);
@@ -1055,7 +1136,6 @@ export default function App() {
         }
       });
 
-      // Sync all found projects to ensure new sources, narratives, and messages are not skipped
       const targetProjects = combinedProjects;
       if (targetProjects.length === 0) return;
 
@@ -1066,7 +1146,7 @@ export default function App() {
       const syncedIds: string[] = [];
 
       for (const lp of targetProjects) {
-        if (!lp.id) continue;
+        if (!lp.id || isFirestoreQuotaExhausted()) break;
 
         // 1. Sync project document
         const projRef = doc(db, `users/${currentUser.uid}/projects`, lp.id);
@@ -1106,55 +1186,64 @@ export default function App() {
 
         await setDoc(projRef, cleanForFirestore(cleanedProj), { merge: true });
 
-        // 2. Sync active chat messages (prioritize current in-memory messages if this is the active project)
-        const inMemoryMsgs = (lp.id === activeProjectId && messages.length > 0) ? messages : [];
-        const messagesList = inMemoryMsgs.length > 0 ? inMemoryMsgs : loadProjectMessagesSafely(lp.id, lp.name);
-        for (const m of messagesList) {
-          if (m && m.id) {
-            const mRef = doc(db, `users/${currentUser.uid}/projects/${lp.id}/messages`, m.id);
-            await setDoc(mRef, cleanForFirestore(m), { merge: true }).catch(console.warn);
+        // 2. Only sync messages and characters during explicit manual full sync, avoiding quota burns on launch
+        if (forceSyncAll && !isFirestoreQuotaExhausted()) {
+          const inMemoryMsgs = (lp.id === activeProjectId && messages.length > 0) ? messages : [];
+          const messagesList = inMemoryMsgs.length > 0 ? inMemoryMsgs : loadProjectMessagesSafely(lp.id, lp.name);
+          // Sync most recent messages to protect free-tier daily write units
+          const recentMsgs = messagesList.slice(-20);
+          for (const m of recentMsgs) {
+            if (isFirestoreQuotaExhausted()) break;
+            if (m && m.id) {
+              const mRef = doc(db, `users/${currentUser.uid}/projects/${lp.id}/messages`, m.id);
+              await setDoc(mRef, cleanForFirestore(m), { merge: true }).catch(console.warn);
+            }
           }
-        }
 
-        // 4. Sync character profiles
-        const charsList = loadProjectCharactersSafely(lp.id);
-        for (const c of charsList) {
-          if (c && c.id) {
-            const cRef = doc(db, `users/${currentUser.uid}/projects/${lp.id}/characters`, c.id);
-            await setDoc(cRef, cleanForFirestore(c), { merge: true }).catch(console.warn);
+          const charsList = loadProjectCharactersSafely(lp.id);
+          for (const c of charsList) {
+            if (isFirestoreQuotaExhausted()) break;
+            if (c && c.id) {
+              const cRef = doc(db, `users/${currentUser.uid}/projects/${lp.id}/characters`, c.id);
+              await setDoc(cRef, cleanForFirestore(c), { merge: true }).catch(console.warn);
+            }
           }
         }
 
         syncedIds.push(lp.id);
       }
 
-      // 5. Sync notes and tasks
-      const savedNotes = safeLocalStorage.getItem("local_notes");
-      if (savedNotes) {
-        try {
-          const notesList: KeepNote[] = JSON.parse(savedNotes);
-          for (const n of notesList) {
-            if (n && n.id) {
-              await setDoc(doc(db, `users/${currentUser.uid}/notes`, n.id), cleanForFirestore(n), { merge: true }).catch(console.warn);
+      // 3. Sync notes and tasks only on explicit full sync
+      if (forceSyncAll && !isFirestoreQuotaExhausted()) {
+        const savedNotes = safeLocalStorage.getItem("local_notes");
+        if (savedNotes) {
+          try {
+            const notesList: KeepNote[] = JSON.parse(savedNotes);
+            for (const n of notesList) {
+              if (isFirestoreQuotaExhausted()) break;
+              if (n && n.id) {
+                await setDoc(doc(db, `users/${currentUser.uid}/notes`, n.id), cleanForFirestore(n), { merge: true }).catch(console.warn);
+              }
             }
-          }
-        } catch {}
-      }
+          } catch {}
+        }
 
-      const savedTasks = safeLocalStorage.getItem("local_tasks");
-      if (savedTasks) {
-        try {
-          const tasksList: KeepTask[] = JSON.parse(savedTasks);
-          for (const t of tasksList) {
-            if (t && t.id) {
-              await setDoc(doc(db, `users/${currentUser.uid}/tasks`, t.id), cleanForFirestore(t), { merge: true }).catch(console.warn);
+        const savedTasks = safeLocalStorage.getItem("local_tasks");
+        if (savedTasks) {
+          try {
+            const tasksList: KeepTask[] = JSON.parse(savedTasks);
+            for (const t of tasksList) {
+              if (isFirestoreQuotaExhausted()) break;
+              if (t && t.id) {
+                await setDoc(doc(db, `users/${currentUser.uid}/tasks`, t.id), cleanForFirestore(t), { merge: true }).catch(console.warn);
+              }
             }
-          }
-        } catch {}
+          } catch {}
+        }
       }
 
       // Sync active project id to user profile
-      if (activeProjectId) {
+      if (activeProjectId && !isFirestoreQuotaExhausted()) {
         await setDoc(doc(db, `users/${currentUser.uid}`), cleanForFirestore({ activeProjectId }), { merge: true }).catch(console.warn);
       }
 
@@ -1175,12 +1264,14 @@ export default function App() {
         prev.map(p => syncedIds.includes(p.id) ? { ...p, syncedToCloud: true } : p)
       );
 
-      if (syncedIds.length > 0) {
-        showToast("☁️ Cloud Sync Complete!", `All ${syncedIds.length} campaigns, transcripts, and characters are saved online to Firestore.`, "success");
+      if (syncedIds.length > 0 && forceSyncAll) {
+        showToast("☁️ Cloud Sync Complete!", `Campaigns and settings are saved online to Firestore.`, "success");
       }
     } catch (err: any) {
-      console.error("Local sync to Firestore failed:", err);
-      showToast("Sync Notice", "Some offline projects could not be fully synced online: " + err.message, "error");
+      console.warn("Local sync to Firestore notice:", err);
+      if (forceSyncAll) {
+        showToast("Sync Notice", "Working in offline-protected mode: " + (err.message || err), "info");
+      }
     }
   };
 
@@ -1346,15 +1437,10 @@ export default function App() {
             const cloudSources = Array.isArray(p.sources) ? p.sources : [];
             const localSources = Array.isArray(matchingLocal.sources) ? matchingLocal.sources : [];
             const mergedSources = [...cloudSources];
-            let hasNewLocalSources = false;
             for (const ls of localSources) {
               if (ls && !mergedSources.some(s => s.id === ls.id || (s.name && ls.name && s.name.toLowerCase() === ls.name.toLowerCase()))) {
                 mergedSources.push(ls);
-                hasNewLocalSources = true;
               }
-            }
-            if (hasNewLocalSources && user) {
-              setDoc(doc(db, `users/${user.uid}/projects/${p.id}`), { sources: mergedSources, updatedAt: Date.now() }, { merge: true }).catch(console.warn);
             }
             return {
               ...p,
@@ -1469,7 +1555,6 @@ export default function App() {
             if (lm && lm.id && !combinedMsgs.some(m => m.id === lm.id)) {
               combinedMsgs.push(lm);
               hasNewLocal = true;
-              setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, lm.id), cleanForFirestore(lm)).catch(console.warn);
             }
           }
 
@@ -1486,13 +1571,10 @@ export default function App() {
             return;
           }
         } else if (localMsgs.length > 0) {
-          // If Firestore is empty on first load, seed from local storage
+          // If Firestore is empty on first load, use local storage safely
           setMessages(localMsgs);
           currentDataProjectIdRef.current = activeProjectId;
           loadedProjectIdRef.current = activeProjectId;
-          for (const m of localMsgs) {
-            setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, m.id), cleanForFirestore(m)).catch(console.warn);
-          }
           return;
         }
       }
@@ -1516,8 +1598,20 @@ export default function App() {
         list.push({ id: doc.id, ...doc.data() } as CharacterProfile);
       });
       if (list.length > 0) {
-        setCharacters(list);
-        safeLocalStorage.setItem(`local_characters_${activeProjectId}`, JSON.stringify(list));
+        const dedupedList = deduplicateCharacters(list);
+        setCharacters(dedupedList);
+        safeLocalStorage.setItem(`local_characters_${activeProjectId}`, JSON.stringify(dedupedList));
+
+        // Purge obsolete duplicate documents from Firestore so duplicates like "Ashley" don't persist alongside "Ashley Companion"
+        if (user && activeProjectId && dedupedList.length < list.length) {
+          const keptIds = new Set(dedupedList.map(c => c.id));
+          const removedDocs = list.filter(c => !keptIds.has(c.id));
+          for (const rem of removedDocs) {
+            if (rem && rem.id) {
+              deleteDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/characters`, rem.id)).catch(() => {});
+            }
+          }
+        }
       } else {
         const isFirstCharLoad = !initialReconciledProjectsRef.current[`chars_${activeProjectId}`];
         if (isFirstCharLoad) {
@@ -1525,9 +1619,6 @@ export default function App() {
           const localChars = loadProjectCharactersSafely(activeProjectId);
           if (localChars.length > 0) {
             setCharacters(localChars);
-            for (const c of localChars) {
-              setDoc(doc(db, `users/${user.uid}/projects/${activeProjectId}/characters`, c.id), cleanForFirestore(c)).catch(console.warn);
-            }
           } else {
             setCharacters([]);
           }
@@ -1824,11 +1915,10 @@ export default function App() {
     if (key === "messages") {
       setMessages(val);
       safeLocalStorage.setItem(`local_messages_${targetId}`, JSON.stringify(val));
-      if (user && targetId && Array.isArray(val)) {
-        for (const m of val) {
-          if (m && m.id) {
-            setDoc(doc(db, `users/${user.uid}/projects/${targetId}/messages`, m.id), cleanForFirestore(m)).catch(console.warn);
-          }
+      if (user && targetId && Array.isArray(val) && !isFirestoreQuotaExhausted()) {
+        const lastMsg = val[val.length - 1];
+        if (lastMsg && lastMsg.id) {
+          setDoc(doc(db, `users/${user.uid}/projects/${targetId}/messages`, lastMsg.id), cleanForFirestore(lastMsg)).catch(console.warn);
         }
         setDoc(doc(db, `users/${user.uid}/projects/${targetId}`), { updatedAt: Date.now() }, { merge: true }).catch(console.warn);
       }
@@ -1952,7 +2042,7 @@ export default function App() {
   };
 
   // Chat message submission
-  const handleSendMessage = async (text: string, thinkingLevel: string, attachments?: any[]) => {
+  const handleSendMessage = async (text: string, thinkingLevel: string, attachments?: any[], selectedModel?: string) => {
     const activeProj = projects.find(p => p.id === activeProjectId);
     if (!activeProj) return;
 
@@ -2020,7 +2110,8 @@ export default function App() {
           messages: trimmedOutboundMessages,
           slidingContextTurns: slidingTurns,
           customInstructions: activeProj.customInstructions,
-          thinkingLevel,
+          thinkingLevel: thinkingLevel || activeProj.thinkingLevel || "Low",
+          selectedModel: selectedModel || activeProj.selectedModel || "gemini-3.8-flash",
           creatorNames: activeProj.creatorNames,
           setting: activeProj.setting,
           ragSummary: activeProj.ragSummary,
@@ -2081,15 +2172,21 @@ export default function App() {
 
           if (action.action === "create") {
             const targetName = (args.name || "").trim().toLowerCase();
+            const targetNorm = normalizeCharacterName(args.name || "");
             const existingByName = characters.find(
               c => c && ((targetName && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === targetName) ||
+                   (targetNorm && c.name && typeof c.name === "string" && normalizeCharacterName(c.name) === targetNorm) ||
                    (args.type === "pc" && (c.isPlayerCharacter || c.type === "pc")))
             );
 
             if (existingByName) {
               // Redirect to update if character/PC already exists!
               const updates: any = {};
-              if (args.name) updates.name = args.name;
+              if (args.name) {
+                const existingHasComp = existingByName.name.toLowerCase().includes("companion");
+                const newHasComp = args.name.toLowerCase().includes("companion");
+                updates.name = (existingHasComp && !newHasComp) ? existingByName.name : args.name;
+              }
               if (args.role) updates.role = args.role;
               if (args.description) updates.description = args.description;
               if (args.portraitUrl) updates.portraitUrl = args.portraitUrl;
@@ -2130,13 +2227,21 @@ export default function App() {
           } else if (action.action === "update") {
             const targetId = (args.id || "").trim();
             const targetName = (args.name || "").trim().toLowerCase();
+            const targetNorm = normalizeCharacterName(args.name || "");
 
             let existing = characters.find(c => c && c.id === targetId);
             if (!existing && targetName) {
-              existing = characters.find(c => c && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === targetName);
+              existing = characters.find(c => c && c.name && typeof c.name === "string" && (
+                c.name.trim().toLowerCase() === targetName ||
+                (targetNorm && normalizeCharacterName(c.name) === targetNorm)
+              ));
             }
             if (!existing && targetId) {
-              existing = characters.find(c => c && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === targetId.toLowerCase());
+              const targetIdNorm = normalizeCharacterName(targetId);
+              existing = characters.find(c => c && c.name && typeof c.name === "string" && (
+                c.name.trim().toLowerCase() === targetId.toLowerCase() ||
+                (targetIdNorm && normalizeCharacterName(c.name) === targetIdNorm)
+              ));
             }
             if (!existing && (args.type === "pc" || targetId.toLowerCase().includes("pc") || targetName.includes("pc"))) {
               existing = characters.find(c => c && (c.isPlayerCharacter || c.type === "pc"));
@@ -2192,6 +2297,18 @@ export default function App() {
               showToast("⚙️ World Setting Synced", `Updated ${key} in campaign settings!`, "success");
               handleAddSyncLog(key, "success", `Updated ${key} setting to "${value.substring(0, 40)}..."`);
             }
+          } else if (action.action === "context_add") {
+            const entryText = (args.entry || args.text || args.value || "").trim();
+            if (entryText) {
+              const current = activeProj.persistentContext || "";
+              let updated = current;
+              if (!current.includes(entryText)) {
+                updated = current ? `${current}\n- ${entryText}` : `- ${entryText}`;
+              }
+              handleSetProjectValue("persistentContext", updated);
+              showToast("📌 Grounding Context Added", `Pinned to persistent grounding: "${entryText}"`, "success");
+              handleAddSyncLog("Grounding Context", "success", `Added "${entryText}" to persistent context.`);
+            }
           } else if (action.action === "delete") {
             const targetId = (args.id || "").trim();
             const targetName = (args.name || "").trim().toLowerCase();
@@ -2214,24 +2331,6 @@ export default function App() {
               await handleAddTask(text);
               showToast("📋 Task Added", `Added objective: "${text}".`, "success");
               handleAddSyncLog(text, "success", `Added task "${text}".`);
-            }
-          } else if (action.action === "edit_narrative" || action.action === "edit_narrative_log") {
-            const targetId = args.id || args.messageId || "latest";
-            const newContent = args.newContent || args.content || args.text || args.prose;
-            if (newContent) {
-              let msgToEdit: any = null;
-              if (targetId && targetId !== "latest" && targetId !== "last") {
-                msgToEdit = messages.find(m => m.id === targetId);
-              }
-              if (!msgToEdit) {
-                const modelMsgs = messages.filter(m => m.role === "nyx" || m.role === "assistant");
-                msgToEdit = modelMsgs.length > 0 ? modelMsgs[modelMsgs.length - 1] : messages[messages.length - 1];
-              }
-              if (msgToEdit) {
-                await handleEditMessage(msgToEdit.id, String(newContent));
-                showToast("✨ Narrative Turn Revised", "Edited previous scene turn in the Adventure Log.", "success");
-                handleAddSyncLog("Narrative Log", "success", "Revised previous narrative turn via AI agent.");
-              }
             }
           }
         }
@@ -2269,7 +2368,9 @@ export default function App() {
         speakerIds: [],
         contextEntities: data.inContextEntities || [],
         isTimelineAnomaly: isAnomaly,
-        retrySeconds: data.retrySeconds || (isAnomaly ? 20 : undefined)
+        retrySeconds: data.retrySeconds || (isAnomaly ? 20 : undefined),
+        modelUsed: data.modelUsed || selectedModel || activeProj.selectedModel || "gemini-3.8-flash",
+        thinkingLevel: data.thinkingLevel || thinkingLevel || "Low"
       };
 
       setMessages(prev => [...prev, nyxMsg]);
@@ -2302,7 +2403,7 @@ export default function App() {
     }
   };
 
-  const handleRegenerateResponse = async (thinkingLevel: string, targetMessageId?: string) => {
+  const handleRegenerateResponse = async (thinkingLevel: string, targetMessageId?: string, selectedModel?: string) => {
     const activeProj = projects.find(p => p.id === activeProjectId);
     if (!activeProj) return;
 
@@ -2377,7 +2478,8 @@ export default function App() {
           messages: trimmedOutboundMessages,
           slidingContextTurns: slidingTurns,
           customInstructions: activeProj.customInstructions,
-          thinkingLevel,
+          thinkingLevel: thinkingLevel || activeProj.thinkingLevel || "Low",
+          selectedModel: selectedModel || activeProj.selectedModel || "gemini-3.8-flash",
           creatorNames: activeProj.creatorNames,
           setting: activeProj.setting,
           ragSummary: activeProj.ragSummary,
@@ -2575,63 +2677,18 @@ export default function App() {
   };
 
   const handleEditMessage = async (id: string, newContent: string) => {
-    let savedMsg: any = null;
-    let nextMessages: Message[] = [];
-    setMessages(prev => {
-      const updated = prev.map(m => {
-        if (m.id !== id) return m;
+    const updated = messages.map(m => m.id === id ? { ...m, content: newContent } : m);
+    setMessages(updated);
 
-        let updatedVersions = m.versions;
-        if (Array.isArray(m.versions) && m.versions.length > 0) {
-          const activeIdx = typeof m.activeVersionIndex === "number" && m.activeVersionIndex >= 0 && m.activeVersionIndex < m.versions.length
-            ? m.activeVersionIndex
-            : m.versions.length - 1;
-
-          updatedVersions = m.versions.map((ver: any, vIdx: number) => {
-            if (vIdx === activeIdx) {
-              return { ...ver, content: newContent };
-            }
-            return ver;
-          });
-        }
-
-        const updatedMsg = {
-          ...m,
-          content: newContent,
-          versions: updatedVersions
-        };
-        savedMsg = updatedMsg;
-        return updatedMsg;
-      });
-      nextMessages = updated;
-      return updated;
-    });
-
-    if (activeProjectId && nextMessages.length > 0) {
-      safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(nextMessages));
-    }
-
-    if (user && activeProjectId && savedMsg) {
-      try {
-        const docRef = doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, id);
-        await setDoc(docRef, savedMsg, { merge: true });
-      } catch (err) {
-        console.warn("Firestore save message edit failed:", err);
-      }
+    if (user && activeProjectId) {
+      const docRef = doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, id);
+      await setDoc(docRef, { content: newContent }, { merge: true });
     }
   };
 
   const handleDeleteMessage = async (id: string) => {
-    let nextMessages: Message[] = [];
-    setMessages(prev => {
-      const updated = prev.filter(m => m.id !== id);
-      nextMessages = updated;
-      return updated;
-    });
-
-    if (activeProjectId) {
-      safeLocalStorage.setItem(`local_messages_${activeProjectId}`, JSON.stringify(nextMessages));
-    }
+    const updated = messages.filter(m => m.id !== id);
+    setMessages(updated);
 
     if (user && activeProjectId) {
       const docRef = doc(db, `users/${user.uid}/projects/${activeProjectId}/messages`, id);
@@ -2869,11 +2926,32 @@ export default function App() {
     // 1. Optimistically update local React state immediately so UI and tools have instant access
     setCharacters(prev => {
       const cleanName = typeof name === "string" ? name.trim().toLowerCase() : "";
-      const exists = prev.some(c => c && (c.id === localId || (cleanName && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === cleanName && c.type === defaultType)));
+      const normName = normalizeCharacterName(typeof name === "string" ? name : "");
+      const exists = prev.some(c => c && (
+        c.id === localId || 
+        (cleanName && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === cleanName) ||
+        (normName && c.name && typeof c.name === "string" && normalizeCharacterName(c.name) === normName)
+      ));
       if (exists) {
-        return prev.map(c => (c && (c.id === localId || (cleanName && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === cleanName && c.type === defaultType))) ? { ...c, ...newItem } : c);
+        return prev.map(c => {
+          const isMatch = c && (
+            c.id === localId || 
+            (cleanName && c.name && typeof c.name === "string" && c.name.trim().toLowerCase() === cleanName) ||
+            (normName && c.name && typeof c.name === "string" && normalizeCharacterName(c.name) === normName)
+          );
+          if (isMatch) {
+            const preferNew = newItem.name.toLowerCase().includes("companion") && !c.name.toLowerCase().includes("companion");
+            return {
+              ...c,
+              ...newItem,
+              name: preferNew ? newItem.name : c.name,
+              customFields: { ...(c.customFields || {}), ...(newItem.customFields || {}) }
+            };
+          }
+          return c;
+        });
       }
-      return [...prev, newItem];
+      return deduplicateCharacters([...prev, newItem]);
     });
 
     // 2. Persist to Firestore with safety timeout so async callers never freeze
@@ -2975,8 +3053,10 @@ export default function App() {
     }
   }, [activeProject?.name, activeProject?.setting, activeProjectId]);
 
+  const isEffectiveMobile = isMobileScreen || isMobileLite;
+
   return (
-    <div className="h-screen max-h-screen overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans">
+    <div className="h-screen h-[100dvh] max-h-[100dvh] overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans select-none">
       
       {isInitialLoad ? (
         <div className="flex-1 flex flex-col items-center justify-center bg-slate-950 p-6 text-center">
@@ -3329,6 +3409,23 @@ export default function App() {
                 </div>
               )}
 
+              {/* FIRESTORE QUOTA SAFE MODE BANNER */}
+              {isQuotaExhausted && isOnline && (
+                <div className="bg-purple-950/60 border-b border-purple-800/40 px-4 sm:px-6 py-2 text-xs flex items-center justify-between gap-4 text-purple-200">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-2 w-2 relative">
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-purple-400"></span>
+                    </span>
+                    <span>
+                      <strong>Local Safe Mode:</strong> Firestore free daily write limit reached. All campaigns, dialogue, and lore are securely saved on this device and will sync automatically once quota resets.
+                    </span>
+                  </div>
+                  <div className="text-[10px] bg-purple-900/50 border border-purple-700/50 px-2 py-0.5 rounded font-mono uppercase text-purple-300 shrink-0">
+                    Local Safe Mode
+                  </div>
+                </div>
+              )}
+
               {/* LOCAL STORAGE BLOCKED WARNING BANNER */}
               {!safeLocalStorage.isAvailable() && (
                 <div className="bg-red-500/10 border-b border-red-500/20 px-4 sm:px-6 py-2 text-xs flex flex-col md:flex-row items-center justify-between gap-3 text-red-200">
@@ -3353,47 +3450,72 @@ export default function App() {
               )}
 
               {/* SUB HEADER: GLASS NAV TABS */}
-              {isMobileLite ? (
-                <nav className="px-3 py-2 border-b border-slate-800/80 bg-slate-950 flex items-center justify-between gap-1 select-none">
-                  <div className="flex items-center gap-1.5 w-full">
+              {isEffectiveMobile ? (
+                <nav className="px-2 sm:px-3 py-1.5 sm:py-2 border-b border-slate-800/80 bg-slate-950 flex items-center justify-between gap-1 select-none overflow-x-auto no-scrollbar">
+                  <div className="flex items-center gap-1 w-full min-w-0">
                     <button
                       type="button"
                       onClick={() => setMobileLiteTab("chat")}
-                      className={`relative flex-1 py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer min-h-[42px] ${
+                      className={`relative flex-1 py-1.5 sm:py-2 px-1 sm:px-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 sm:gap-1.5 transition-all cursor-pointer min-h-[40px] shrink-0 ${
                         mobileLiteTab === "chat"
                           ? "text-purple-200 bg-purple-950/70 border border-purple-600/60 shadow-sm shadow-purple-950/50"
                           : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
                       }`}
                     >
-                      <Sparkles size={14} className={mobileLiteTab === "chat" ? "text-purple-400 shrink-0" : "text-slate-500 shrink-0"} />
-                      <span className="truncate">Narration</span>
+                      <Sparkles size={13} className={mobileLiteTab === "chat" ? "text-purple-400 shrink-0" : "text-slate-500 shrink-0"} />
+                      <span className="truncate text-[11px] sm:text-xs">Adventure</span>
                     </button>
 
                     <button
                       type="button"
                       onClick={() => setMobileLiteTab("assistant")}
-                      className={`relative flex-1 py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer min-h-[42px] ${
+                      className={`relative flex-1 py-1.5 sm:py-2 px-1 sm:px-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 sm:gap-1.5 transition-all cursor-pointer min-h-[40px] shrink-0 ${
                         mobileLiteTab === "assistant"
                           ? "text-purple-200 bg-purple-950/70 border border-purple-600/60 shadow-sm shadow-purple-950/50"
                           : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
                       }`}
                     >
-                      <Sparkles size={14} className={mobileLiteTab === "assistant" ? "text-purple-400 shrink-0" : "text-slate-500 shrink-0"} />
-                      <span className="truncate">Assistant</span>
+                      <Sparkles size={13} className={mobileLiteTab === "assistant" ? "text-purple-400 shrink-0" : "text-slate-500 shrink-0"} />
+                      <span className="truncate text-[11px] sm:text-xs">Assistant</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setMobileLiteTab("editor")}
+                      className={`relative flex-1 py-1.5 sm:py-2 px-1 sm:px-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 sm:gap-1.5 transition-all cursor-pointer min-h-[40px] shrink-0 ${
+                        mobileLiteTab === "editor"
+                          ? "text-emerald-200 bg-emerald-950/70 border border-emerald-600/60 shadow-sm shadow-emerald-950/50"
+                          : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
+                      }`}
+                    >
+                      <Layers size={13} className={mobileLiteTab === "editor" ? "text-emerald-400 shrink-0" : "text-slate-500 shrink-0"} />
+                      <span className="truncate text-[11px] sm:text-xs">Editor</span>
                     </button>
 
                     <button
                       type="button"
                       onClick={() => setMobileLiteTab("settings")}
-                      className={`relative flex-1 py-2 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer min-h-[42px] ${
+                      className={`relative flex-1 py-1.5 sm:py-2 px-1 sm:px-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 sm:gap-1.5 transition-all cursor-pointer min-h-[40px] shrink-0 ${
                         mobileLiteTab === "settings"
-                          ? "text-purple-200 bg-purple-950/70 border border-purple-600/60 shadow-sm shadow-purple-950/50"
+                          ? "text-indigo-200 bg-indigo-950/70 border border-indigo-600/60 shadow-sm shadow-indigo-950/50"
                           : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
                       }`}
                     >
-                      <Globe size={14} className={mobileLiteTab === "settings" ? "text-purple-400 shrink-0" : "text-slate-500 shrink-0"} />
-                      <span className="truncate sm:hidden">World</span>
-                      <span className="truncate hidden sm:inline">World Settings</span>
+                      <Globe size={13} className={mobileLiteTab === "settings" ? "text-indigo-400 shrink-0" : "text-slate-500 shrink-0"} />
+                      <span className="truncate text-[11px] sm:text-xs">World</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setMobileLiteTab("workspace")}
+                      className={`relative flex-1 py-1.5 sm:py-2 px-1 sm:px-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1 sm:gap-1.5 transition-all cursor-pointer min-h-[40px] shrink-0 ${
+                        mobileLiteTab === "workspace"
+                          ? "text-blue-200 bg-blue-950/70 border border-blue-600/60 shadow-sm shadow-blue-950/50"
+                          : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 border border-transparent"
+                      }`}
+                    >
+                      <FileText size={13} className={mobileLiteTab === "workspace" ? "text-blue-400 shrink-0" : "text-slate-500 shrink-0"} />
+                      <span className="truncate text-[11px] sm:text-xs">Vault</span>
                     </button>
                   </div>
                 </nav>
@@ -3519,7 +3641,7 @@ export default function App() {
               {activeProject ? (
                 <div className="h-full w-full min-h-0 flex-1 flex flex-row relative overflow-hidden">
                   <div className="h-full w-full min-h-0 flex-1 flex flex-col relative overflow-hidden">
-                    {isMobileLite ? (
+                    {isEffectiveMobile ? (
                     <AnimatePresence mode="wait">
                       {mobileLiteTab === "chat" && (
                         <motion.div
@@ -3528,7 +3650,7 @@ export default function App() {
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, y: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className="h-full w-full"
+                          className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
                         >
                           <AdventureChat
                             project={activeProject}
@@ -3556,7 +3678,7 @@ export default function App() {
                             isCinemaMode={isCinemaMode}
                             onToggleCinemaMode={() => setIsCinemaMode(prev => !prev)}
                             onOpenStoryArchives={() => setShowStoryArchiveModal(true)}
-                            isMobileLite={isMobileLite}
+                            isMobileLite={true}
                           />
                         </motion.div>
                       )}
@@ -3568,7 +3690,7 @@ export default function App() {
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, y: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className="h-full w-full rounded-xl border border-slate-850 overflow-hidden bg-slate-950"
+                          className="h-full w-full min-h-0 flex-1 flex flex-col rounded-xl border border-slate-850 overflow-hidden bg-slate-950"
                         >
                           <StudioAssistantSidebar
                             projects={projects}
@@ -3598,6 +3720,34 @@ export default function App() {
                         </motion.div>
                       )}
 
+                      {mobileLiteTab === "editor" && (
+                        <motion.div
+                          key="mobile-lite-editor"
+                          initial={{ opacity: 0, y: 4 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -4 }}
+                          transition={{ duration: 0.15, ease: "easeOut" }}
+                          className="h-full w-full min-h-0 flex-1 flex flex-col overflow-y-auto overflow-x-hidden scrollbar-thin"
+                        >
+                          <NarrativeSuite
+                            chatTranscript={messages.map(m => `[${m.role}] ${m.content}`).join("\n\n")}
+                            onEditNarrative={handleEditNarrative}
+                            ragSummary={activeProject.ragSummary}
+                            onUpdateRagSummary={(summary) => handleSetProjectValue("ragSummary", summary)}
+                            googleToken={googleToken}
+                            onClearGoogleToken={handleClearGoogleToken}
+                            onUpdateWorldSetting={(setting) => handleSetProjectValue("setting", setting)}
+                            onUpdateStyleGuide={(guide) => handleSetProjectValue("styleGuide", guide)}
+                            onImportMessages={handleImportMessages}
+                            projectId={activeProjectId}
+                            projectName={activeProject.name}
+                            onGoogleSignIn={handleGoogleDriveSignIn}
+                            onShowToast={showToast}
+                            onAttachToSources={handleAttachNarrativeToSources}
+                          />
+                        </motion.div>
+                      )}
+
                       {mobileLiteTab === "settings" && (
                         <motion.div
                           key="mobile-lite-settings"
@@ -3605,7 +3755,7 @@ export default function App() {
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, y: -4 }}
                           transition={{ duration: 0.15, ease: "easeOut" }}
-                          className="h-full w-full"
+                          className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
                         >
                           <MobileWorldSettings
                             project={activeProject}
@@ -3614,6 +3764,39 @@ export default function App() {
                             onShowToast={showToast}
                             onSwitchToNarration={() => setMobileLiteTab("chat")}
                             onConsultAssistant={() => setMobileLiteTab("assistant")}
+                          />
+                        </motion.div>
+                      )}
+
+                      {mobileLiteTab === "workspace" && (
+                        <motion.div
+                          key="mobile-lite-workspace"
+                          initial={{ opacity: 0, y: 4 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -4 }}
+                          transition={{ duration: 0.15, ease: "easeOut" }}
+                          className="h-full w-full min-h-0 flex-1 flex flex-col overflow-hidden"
+                        >
+                          <WorkspaceSync
+                            notes={notes}
+                            tasks={tasks}
+                            onAddNote={handleAddNote}
+                            onDeleteNote={handleDeleteNote}
+                            onUpdateNotes={setNotes}
+                            onAddTask={handleAddTask}
+                            onToggleTask={handleToggleTask}
+                            onDeleteTask={handleDeleteTask}
+                            googleToken={googleToken}
+                            onClearGoogleToken={handleClearGoogleToken}
+                            onSyncDocInstructions={(docText) => handleSetProjectValue("customInstructions", docText)}
+                            project={activeProject}
+                            onSetProjectValue={handleSetProjectValue}
+                            onGoogleSignIn={handleGoogleDriveSignIn}
+                            onAddCharacter={handleAddCharacter}
+                            characters={characters}
+                            syncLogs={syncLogs}
+                            onAddLog={handleAddSyncLog}
+                            navigationTarget={navigationTarget}
                           />
                         </motion.div>
                       )}
@@ -3655,6 +3838,7 @@ export default function App() {
                           isCinemaMode={isCinemaMode}
                           onToggleCinemaMode={() => setIsCinemaMode(prev => !prev)}
                           onOpenStoryArchives={() => setShowStoryArchiveModal(true)}
+                          isMobileLite={isEffectiveMobile}
                         />
                       </motion.div>
                     )}
@@ -3669,12 +3853,7 @@ export default function App() {
                         className="h-full w-full min-h-0 flex-1 flex flex-col overflow-y-auto overflow-x-hidden scrollbar-thin"
                       >
                         <NarrativeSuite
-                          chatTranscript={messages.map(m => {
-                            const text = (m.versions && typeof m.activeVersionIndex === "number" && m.versions[m.activeVersionIndex])
-                              ? m.versions[m.activeVersionIndex].content
-                              : (m.content || "");
-                            return `[${m.role}] ${text}`;
-                          }).join("\n\n")}
+                          chatTranscript={messages.map(m => `[${m.role}] ${m.content}`).join("\n\n")}
                           onEditNarrative={handleEditNarrative}
                           ragSummary={activeProject.ragSummary}
                           onUpdateRagSummary={(summary) => handleSetProjectValue("ragSummary", summary)}
@@ -3728,7 +3907,7 @@ export default function App() {
                   )}
                   </div>
 
-                  {!isMobileLite && activeProject && (
+                  {!isEffectiveMobile && activeProject && (
                     <StudioAssistantSidebar
                       isCinemaMode={isCinemaMode}
                       projects={projects}
@@ -3785,8 +3964,8 @@ export default function App() {
 
       {/* NEW PROJECT MODAL */}
       {showNewProjModal && (
-        <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-lg shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+        <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-3 sm:p-4 z-50 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 w-full max-w-lg shadow-2xl animate-in fade-in zoom-in-95 duration-200 max-h-[92dvh] overflow-y-auto">
             <div className="flex items-center justify-between mb-5 border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2.5 text-purple-400">
                 <Sparkles size={20} />

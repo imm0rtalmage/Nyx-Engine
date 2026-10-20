@@ -2,7 +2,7 @@
 <html lang="en" class="bg-slate-950 text-slate-100">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover" />
     <title>Nyx Roleplay Dashboard</title>
     <meta name="description" content="An advanced roleplay companion and DM campaign dashboard featuring real-time sync, narrative editors, grounding lore codex, and AI generation." />
     <meta property="og:title" content="Nyx Roleplay Dashboard" />
@@ -12,10 +12,27 @@
         background-color: #020617 !important;
         color: #f8fafc;
         min-height: 100vh;
+        min-height: 100dvh;
+        height: 100%;
         margin: 0;
         padding: 0;
+        overscroll-behavior-y: none;
+        -webkit-text-size-adjust: 100%;
       }
     </style>
+    <script>
+      // Early protection against React 19 DevTools profiler DataCloneError on structuredClone/measure
+      if (typeof window !== 'undefined' && window.performance && typeof window.performance.measure === 'function') {
+        const _origMeasure = window.performance.measure.bind(window.performance);
+        window.performance.measure = function() {
+          try {
+            return _origMeasure.apply(window.performance, arguments);
+          } catch (_e) {
+            return undefined;
+          }
+        };
+      }
+    </script>
   </head>
   <body class="bg-slate-950 text-slate-100 min-h-screen">
     <div id="root" class="min-h-screen bg-slate-950 text-slate-100"></div>

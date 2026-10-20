@@ -1,5 +1,5 @@
-import React from "react";
-import { Brain, Layers, Sliders, Sparkles, User, X, Zap } from "lucide-react";
+import React, { useState } from "react";
+import { Brain, Layers, Sliders, Sparkles, User, X, Zap, MapPin, Plus } from "lucide-react";
 import { CharacterProfile, Message } from "../types";
 import { computeGranularLoreContext } from "../lib/nyxLoreEngine";
 
@@ -12,6 +12,8 @@ interface ContextHUDModalProps {
   onSetSlidingTurns: (turns: number) => void;
   onUpdateCharacter: (id: string, updates: Partial<CharacterProfile>) => Promise<void> | void;
   onShowToast?: (title: string, message: string, type?: "success" | "error" | "info") => void;
+  persistentContext?: string;
+  onSetPersistentContext?: (ctx: string) => void;
 }
 
 export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
@@ -22,8 +24,11 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
   slidingTurnsLimit,
   onSetSlidingTurns,
   onUpdateCharacter,
-  onShowToast
+  onShowToast,
+  persistentContext = "",
+  onSetPersistentContext
 }) => {
+  const [newContextText, setNewContextText] = useState("");
   if (!isOpen) return null;
 
   const {
@@ -41,8 +46,8 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
   const estTotalContextTokens = estimatedTokens.total;
 
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-purple-500/30 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-2.5 sm:p-4">
+      <div className="bg-slate-900 border border-purple-500/30 rounded-2xl w-full max-w-4xl max-h-[92dvh] flex flex-col overflow-hidden shadow-2xl animate-in fade-in zoom-in-95 duration-150">
         {/* Header */}
         <div className="p-4 border-b border-slate-800 bg-slate-950 flex justify-between items-center">
           <div className="flex items-center gap-2.5">
@@ -155,6 +160,69 @@ export const ContextHUDModal: React.FC<ContextHUDModalProps> = ({
                 {slidingTurnsLimit} turns
               </span>
             </div>
+          </div>
+
+          {/* Persistent Grounding Context & State Deltas */}
+          <div className="bg-slate-950/80 p-4 rounded-xl border border-emerald-900/50 space-y-3">
+            <div className="flex items-center justify-between flex-wrap gap-2 border-b border-slate-850 pb-2">
+              <div className="flex items-center gap-2">
+                <MapPin size={15} className="text-emerald-400 shrink-0" />
+                <span className="text-xs font-bold font-mono text-emerald-300 uppercase tracking-wide">
+                  Active Persistent Grounding Context & Location
+                </span>
+              </div>
+              <span className="text-[9.5px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800/60 font-semibold">
+                Injected in EVERY Prompt
+              </span>
+            </div>
+
+            {persistentContext ? (
+              <div className="bg-slate-900/80 p-2.5 rounded-lg border border-slate-800 text-xs font-mono text-slate-200 whitespace-pre-wrap leading-relaxed max-h-36 overflow-y-auto">
+                {persistentContext}
+              </div>
+            ) : (
+              <div className="text-xs text-slate-500 italic font-mono bg-slate-900/40 p-2.5 rounded-lg border border-slate-850/60">
+                No manual grounding context pinned yet (e.g., location, injuries, weather). Add an entry below or tell Nyx "Add location: Rear Terrace to context".
+              </div>
+            )}
+
+            {onSetPersistentContext && (
+              <div className="flex items-center gap-2 pt-1">
+                <input
+                  type="text"
+                  value={newContextText}
+                  onChange={(e) => setNewContextText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && newContextText.trim()) {
+                      e.preventDefault();
+                      const trimmed = newContextText.trim();
+                      const updated = persistentContext ? `${persistentContext}\n- ${trimmed}` : `- ${trimmed}`;
+                      onSetPersistentContext(updated);
+                      onShowToast?.("📌 Grounding Context Added", `Pinned: "${trimmed}"`, "success");
+                      setNewContextText("");
+                    }
+                  }}
+                  placeholder="Manually add location or fact (e.g. Location: Rear Terrace)..."
+                  className="flex-1 bg-slate-900 border border-slate-750 focus:border-emerald-500 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 outline-none font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!newContextText.trim()) return;
+                    const trimmed = newContextText.trim();
+                    const updated = persistentContext ? `${persistentContext}\n- ${trimmed}` : `- ${trimmed}`;
+                    onSetPersistentContext(updated);
+                    onShowToast?.("📌 Grounding Context Added", `Pinned: "${trimmed}"`, "success");
+                    setNewContextText("");
+                  }}
+                  disabled={!newContextText.trim()}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer shrink-0"
+                >
+                  <Plus size={12} />
+                  <span>Pin to Context</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Granular Memory Allocation Breakdown */}

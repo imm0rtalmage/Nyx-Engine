@@ -28,25 +28,9 @@ type LogLevel = "INFO" | "WARN" | "ERROR";
 function formatErrorForLog(err: any): any {
   if (!err) return err;
   if (err instanceof Error || (typeof err === "object" && ("message" in err || "status" in err || "statusCode" in err))) {
-    let cleanMessage = err.message || String(err);
-    if (typeof cleanMessage === "string" && (cleanMessage.includes('{"error"') || cleanMessage.startsWith("{"))) {
-      try {
-        const parsed = JSON.parse(cleanMessage);
-        if (parsed?.error?.message) {
-          cleanMessage = parsed.error.message;
-        }
-      } catch (_) {}
-    }
-    // Convert raw API quota / demand strings into concise human-readable summaries
-    if (cleanMessage.includes("Quota exceeded") || cleanMessage.includes("RESOURCE_EXHAUSTED")) {
-      cleanMessage = "Upstream model quota boundary reached; resilience pipeline active.";
-    } else if (cleanMessage.includes("high demand") || cleanMessage.includes("UNAVAILABLE")) {
-      cleanMessage = "Upstream model temporarily experiencing high demand (503).";
-    }
-
     return {
       name: err.name || "Error",
-      message: cleanMessage,
+      message: err.message || String(err),
       status: err.status || err.statusCode,
       retrySeconds: err.retrySeconds || extractRetrySeconds(err) || undefined,
       isRateLimit: err.isRateLimit || (err.status === 429) || undefined,
@@ -190,11 +174,11 @@ function extractRetrySeconds(err: any): number {
   return 0;
 }
 
-// Track model availability and cooldowns across sessions so exhausted models don't waste network calls
+// Track model availability and dynamic temporary cooldowns across sessions
 const modelCooldownUntil: Record<string, number> = {};
 
 function markModelCooldown(model: string, seconds = 60) {
-  modelCooldownUntil[model] = Date.now() + Math.max(seconds * 1000, 15000);
+  modelCooldownUntil[model] = Date.now() + Math.max(seconds * 1000, 30000);
 }
 
 function isModelInCooldown(model: string): boolean {
@@ -202,23 +186,16 @@ function isModelInCooldown(model: string): boolean {
   return typeof cd === "number" && Date.now() < cd;
 }
 
-// Canonical model constants
-export const DEFAULT_GEMINI_MODEL = "gemini-flash-latest";
-
 // Helper to perform generateContent calls with multi-stage retry logic, exponential backoff, and model cascading.
-// Primary model: gemini-flash-latest
-// High availability cascades: gemini-3.5-flash, gemini-3.6-flash, gemini-3.1-flash-lite, gemini-flash-lite-latest, gemini-3-flash-preview.
+// Primary model: gemini-3.8-flash (Gemini 3.8 Flash Storyteller Engine).
 async function generateContentWithRetry(
   ai: GoogleGenAI,
   params: { model?: string; contents: any; config?: any },
   retries = 2,
-  initialDelay = 800,
-  timeoutPerAttemptMs = 15000
+  initialDelay = 1000,
+  timeoutPerAttemptMs = 45000
 ) {
-  let requestedModel = params.model || DEFAULT_GEMINI_MODEL;
-  if (requestedModel === "flash-latest") {
-    requestedModel = "gemini-flash-latest";
-  }
+  const requestedModel = params.model || "gemini-3.8-flash";
   let lastError: any = null;
 
   // Clean and normalize incoming config
@@ -230,14 +207,17 @@ async function generateContentWithRetry(
     }
   }
 
-  // Determine optimal model execution order:
-  // 1. gemini-flash-latest (High performance, requested primary model)
-  // 2. gemini-3.5-flash (High availability backup, supports all schema/tools)
-  // 3. gemini-3.6-flash (High availability reasoning backup)
-  // 4. gemini-3.1-flash-lite (high rate boundaries, lightweight reasoning)
-  // 5. gemini-flash-lite-latest (fast standard generation)
-  // 6. gemini-3-flash-preview (fast execution when available)
-  const candidatePool = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-3-flash-preview"];
+  // Determine optimal model execution order based on requested model
+  let candidatePool = [
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+    "gemini-3.1-flash-lite"
+  ];
+  if (requestedModel === "gemini-4-argon") {
+    candidatePool = ["gemini-4-argon", "gemini-3.8-flash", "gemini-flash-latest"];
+  } else if (requestedModel === "gemini-3.8-flash") {
+    candidatePool = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+  }
   const prioritizedModels: string[] = [];
 
   // If the requested model is not in cooldown, place it first
@@ -245,13 +225,14 @@ async function generateContentWithRetry(
     prioritizedModels.push(requestedModel);
   }
 
+  // Add all active candidates that are not in cooldown
   for (const m of candidatePool) {
     if (!prioritizedModels.includes(m) && !isModelInCooldown(m)) {
       prioritizedModels.push(m);
     }
   }
 
-  // If all candidate models appear cooled down, retain fallback candidates to attempt anyway
+  // Fallback candidates if needed
   for (const m of [requestedModel, ...candidatePool]) {
     if (!prioritizedModels.includes(m)) {
       prioritizedModels.push(m);
@@ -265,15 +246,15 @@ async function generateContentWithRetry(
     const model = prioritizedModels[i];
     let stageConfig = { ...baseConfig };
 
-    // Models other than Gemini 3 series or gemini-flash-latest do NOT support thinkingConfig - strip it completely
-    if (!model.startsWith("gemini-3") && model !== "gemini-flash-latest") {
+    // gemini-flash-lite-latest does NOT support thinkingConfig (Gemini 3 only) - strip it completely
+    if (model === "gemini-flash-lite-latest") {
       delete stageConfig.thinkingConfig;
     } else if (stageConfig.thinkingConfig) {
-      // Default to MINIMAL thinking to prevent 503 thinking queue congestion and preserve token latency
-      stageConfig.thinkingConfig = {
-        ...stageConfig.thinkingConfig,
-        thinkingLevel: ThinkingLevel.MINIMAL
-      };
+      delete stageConfig.thinkingConfig.thinkingBudget;
+      // Never send MINIMAL to any model because gemini-3.8-flash, gemini-4-argon, and other current models reject it with 400
+      if (!stageConfig.thinkingConfig.thinkingLevel || stageConfig.thinkingConfig.thinkingLevel === ThinkingLevel.MINIMAL) {
+        stageConfig.thinkingConfig.thinkingLevel = ThinkingLevel.LOW;
+      }
     }
 
     stages.push({
@@ -304,6 +285,7 @@ async function generateContentWithRetry(
           try {
             const result = (await Promise.race([callPromise, timeoutPromise])) as any;
             if (timeoutHandle) clearTimeout(timeoutHandle);
+            if (result) result.modelUsed = currentStage.model;
             return result;
           } catch (raceErr) {
             if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -311,7 +293,9 @@ async function generateContentWithRetry(
           }
         }
 
-        return await callPromise;
+        const directResult = await callPromise as any;
+        if (directResult) directResult.modelUsed = currentStage.model;
+        return directResult;
       } catch (err: any) {
         lastError = err;
         const errMsg = (err.message || "").toLowerCase();
@@ -341,13 +325,18 @@ async function generateContentWithRetry(
 
         // If hard quota limit is exceeded, record cooldown on this model so subsequent turns skip it directly
         if (isQuotaExceeded) {
-          const cooldownSecs = detectedRetrySecs > 0 ? (detectedRetrySecs + 5) : 180;
-          markModelCooldown(currentStage.model, cooldownSecs);
-
+          const cooldownDuration = detectedRetrySecs > 30 ? detectedRetrySecs : 3600;
+          markModelCooldown(currentStage.model, cooldownDuration);
           if (stageIdx < stages.length - 1) {
             console.log(`[Resilience Router] Model ${currentStage.model} reached quota limit. Routing to ${stages[stageIdx + 1].name}...`);
             break;
           }
+        }
+
+        // If 503 high demand, route to next stage immediately
+        if (isHighDemand && stageIdx < stages.length - 1) {
+          console.log(`[Resilience Router] Model ${currentStage.model} experiencing high demand (503). Routing to ${stages[stageIdx + 1].name}...`);
+          break;
         }
 
         // If not found or unsupported model, skip directly to next stage
@@ -356,13 +345,9 @@ async function generateContentWithRetry(
           break;
         }
 
-        // If high demand (503), record temporary cooldown and fast cascade to next stage
-        if (isHighDemand) {
-          markModelCooldown(currentStage.model, 45);
-          if (stageIdx < stages.length - 1) {
-            console.log(`[Resilience Router] High demand on ${currentStage.model}. Fast cascading to ${stages[stageIdx + 1].name}...`);
-            break;
-          }
+        // If high demand (503), remove thinkingConfig to bypass reasoning queue congestion
+        if (isHighDemand && currentStage.config?.thinkingConfig) {
+          delete currentStage.config.thinkingConfig;
         }
 
         // If timed out, advance to next stage with lighter load
@@ -934,6 +919,19 @@ function formatGranularCharacterSpecs(c: any): string {
   return parts.length > 0 ? "\n" + parts.join("\n") : "";
 }
 
+function normalizeCharacterName(name: string): string {
+  if (!name || typeof name !== "string") return "";
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/\bashely\b/gi, "ashley")
+    .replace(/\s*[\(\[]?(?:companion|pc|npc|protagonist|expanded npc)[\)\]]?\s*$/i, "")
+    .replace(/^[\(\[]?(?:companion|pc|npc|protagonist)\s*[:\-–]?\s*/i, "")
+    .replace(/[^\w\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // 5. Nyx Engine v2.0 - Comprehensive Lorebook, Character Relationship Matrix & Sliding Context Engine
 function buildDynamicLoreContext(
   entities: any[] = [],
@@ -998,6 +996,7 @@ function buildDynamicLoreContext(
     // Party companions travel with the PC and stay anchored in active foreground
     if (type === "companion" || ent.isInScene) {
       companions.push(ent);
+      continue;
     }
 
     // Story chronicles and past session logs
@@ -1202,17 +1201,42 @@ function buildDynamicLoreContext(
     ? `\n\n=== DYNAMIC LOREBOOK CONTEXT (Nyx Engine v2.0 Canon Grounding) ===\n${sections.join("\n\n")}\n=== END DYNAMIC LOREBOOK ===`
     : "";
 
-  // Compile exact list of in-context entity names with granular percentage display
-  const inContextEntities: string[] = [
-    ...pcs.map(c => `${c.name} (PC)`),
-    ...companions.map(c => `${c.name} (Companion)`),
-    ...weightedEntities.map(w => `${w.entity.name} (${w.weightPercent}%)`)
-  ];
+  // Compile exact list of in-context entity names with deduplicated normalized identity
+  const inContextEntities: string[] = [];
+  const seenNorms = new Set<string>();
+
+  for (const c of pcs) {
+    if (!c || !c.name) continue;
+    const norm = normalizeCharacterName(c.name);
+    if (!seenNorms.has(norm)) {
+      seenNorms.add(norm);
+      inContextEntities.push(`${c.name} (PC)`);
+    }
+  }
+
+  for (const c of companions) {
+    if (!c || !c.name) continue;
+    const norm = normalizeCharacterName(c.name);
+    if (!seenNorms.has(norm)) {
+      seenNorms.add(norm);
+      const label = c.name.toLowerCase().includes("companion") ? c.name : `${c.name} (Companion)`;
+      inContextEntities.push(label);
+    }
+  }
+
+  for (const w of weightedEntities) {
+    if (!w || !w.entity || !w.entity.name) continue;
+    const norm = normalizeCharacterName(w.entity.name);
+    if (!seenNorms.has(norm)) {
+      seenNorms.add(norm);
+      inContextEntities.push(`${w.entity.name} (${w.weightPercent}%)`);
+    }
+  }
 
   return {
     pcs,
     activeEntities: [...pcs, ...companions, ...weightedEntities.map(w => w.entity)],
-    inContextEntities: Array.from(new Set(inContextEntities)),
+    inContextEntities,
     promptText,
     pcLabel,
     activeEntityCount: inContextEntities.length
@@ -1223,34 +1247,6 @@ function buildDynamicLoreContext(
 // API ROUTES
 // ----------------------------------------------------
 
-async function fetchGoogleWithRedirects(initialUrl: string, accessToken: string): Promise<Response> {
-  let currentUrl = initialUrl;
-  let redirectCount = 0;
-  const maxRedirects = 5;
-
-  while (redirectCount < maxRedirects) {
-    const res = await fetch(currentUrl, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-      redirect: "manual",
-    });
-
-    if ([301, 302, 303, 307, 308].includes(res.status)) {
-      const location = res.headers.get("location");
-      if (location) {
-        currentUrl = new URL(location, currentUrl).toString();
-        redirectCount++;
-        continue;
-      }
-    }
-    return res;
-  }
-  return await fetch(currentUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-}
-
 async function fetchGoogleDocOnServer(accessToken: string, docId: string, mimeType?: string): Promise<string> {
   if (!accessToken || accessToken === "mock" || accessToken.startsWith("mock-")) {
     return `[Mock Doc Content for ${docId}] This is a sandbox simulation document. In a real environment, this would hold your complete custom setting rules, story parameters, and campaign outlines.`;
@@ -1259,13 +1255,21 @@ async function fetchGoogleDocOnServer(accessToken: string, docId: string, mimeTy
   try {
     if (!mimeType || mimeType === "application/vnd.google-apps.document") {
       const exportUrl = `https://www.googleapis.com/drive/v3/files/${cleanId}/export?mimeType=text/plain`;
-      const response = await fetchGoogleWithRedirects(exportUrl, accessToken);
+      const response = await fetch(exportUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
       if (response.ok) {
         return await response.text();
       }
       
       const docUrl = `https://docs.googleapis.com/v1/documents/${cleanId}`;
-      const docResponse = await fetchGoogleWithRedirects(docUrl, accessToken);
+      const docResponse = await fetch(docUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
       if (docResponse.ok) {
         const docData = await docResponse.json();
         let bodyText = "";
@@ -1284,7 +1288,11 @@ async function fetchGoogleDocOnServer(accessToken: string, docId: string, mimeTy
       }
     } else {
       const mediaUrl = `https://www.googleapis.com/drive/v3/files/${cleanId}?alt=media`;
-      const response = await fetchGoogleWithRedirects(mediaUrl, accessToken);
+      const response = await fetch(mediaUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
       if (response.ok) {
         const checkMime = mimeType ? mimeType.toLowerCase() : "";
         if (
@@ -1582,6 +1590,7 @@ app.post("/api/chat", async (req, res) => {
       slidingContextTurns,
       customInstructions = "", 
       thinkingLevel = "Low", 
+      selectedModel = "gemini-3.8-flash",
       creatorNames = "", 
       setting = "", 
       ragSummary = "", 
@@ -1608,8 +1617,14 @@ app.post("/api/chat", async (req, res) => {
     const ai = getGeminiClient();
     const isMock = process.env.GEMINI_API_KEY ? false : true;
 
-    // Primary model: gemini-flash-latest
-    const modelName = DEFAULT_GEMINI_MODEL;
+    // Resolve storyteller model: switch between 3.8 Flash (gemini-3.8-flash) and 4.0 Argon (gemini-4-argon)
+    let modelName = "gemini-3.8-flash";
+    const requestedModelLower = String(selectedModel || "").toLowerCase().trim();
+    if (requestedModelLower.includes("argon") || requestedModelLower.includes("4.0") || requestedModelLower === "gemini-4-argon") {
+      modelName = "gemini-4-argon";
+    } else {
+      modelName = "gemini-3.8-flash";
+    }
 
     // 2.0 Dynamic Lorebook & Scene Grounding Engine (NovelAI-Inspired Tiered Context)
     const dynamicLore = buildDynamicLoreContext(characters, messages, userNickname, activeCharacterId);
@@ -2132,21 +2147,21 @@ YOU MUST IMMEDIATELY CEASE ALL WRITING FOR THE PLAYER CHARACTER (${pcLabel.toUpp
         });
 
         functionDeclarations.push({
-          name: "edit_narrative_log",
-          description: "Edits, rewrites, or modifies an existing previous turn or scene entry in the Adventure / Narrative Log. Always call this whenever the player asks to edit, revise, change, retcon, or rewrite story text in the adventure log.",
+          name: "add_to_grounding_context",
+          description: "Adds or pins a fact, location, weather state, active condition, or environmental detail directly into the persistent grounding context so it is remembered in every scene. ALWAYS call this when the player gives a command or OOC note to add something to context (e.g. 'Add location: Rear Terrace to context').",
           parameters: {
             type: Type.OBJECT,
             properties: {
-              id: {
+              entry: {
                 type: Type.STRING,
-                description: "The ID of the message to edit (e.g. from history), or 'latest' for the last turn."
+                description: "The fact, location, or state delta to add to persistent grounding context (e.g. 'Location: Rear Terrace')."
               },
-              newContent: {
+              category: {
                 type: Type.STRING,
-                description: "The new rewritten narrative prose, story text, or dialogue to replace the entry with."
+                description: "Optional category: 'location', 'scene', 'state', 'inventory', 'rule'."
               }
             },
-            required: ["newContent"]
+            required: ["entry"]
           }
         });
 
@@ -2263,18 +2278,23 @@ YOU MUST IMMEDIATELY CEASE ALL WRITING FOR THE PLAYER CHARACTER (${pcLabel.toUpp
                     id: id
                   }
                 });
-              } else if (name === "edit_narrative_log" || name === "edit_narrative_entry" || name === "edit_message") {
+              } else if (name === "add_to_grounding_context" || name === "add_to_context") {
+                const entryVal = (args as any).entry || (args as any).text || (args as any).value || "";
+                const categoryVal = (args as any).category || "location";
                 loreActions.push({
-                  action: "edit_narrative",
-                  args: args
+                  action: "context_add",
+                  args: {
+                    entry: entryVal,
+                    category: categoryVal
+                  }
                 });
 
-                console.log(`[Narrative Tool] Editing narrative turn in adventure log: ${(args as any).id || "latest"}`);
+                console.log(`[Grounding Tool] Adding to persistent grounding context: ${entryVal}`);
 
                 responseParts.push({
                   functionResponse: {
-                    name: "edit_narrative_log",
-                    response: { status: "success", message: "Adventure log narrative turn revised successfully." },
+                    name: "add_to_grounding_context",
+                    response: { status: "success", message: `Successfully added '${entryVal}' to persistent grounding context.` },
                     id: id
                   }
                 });
@@ -2333,19 +2353,19 @@ YOU MUST IMMEDIATELY CEASE ALL WRITING FOR THE PLAYER CHARACTER (${pcLabel.toUpp
           textResponse = `[Nyx Storyteller Note: The scene narrative paused. Let's keep moving forward!]`;
         }
       } catch (err: any) {
-        safeWarn("[Chat Pipeline] Primary chat call interrupted; transitioning to resilient backup engine.");
+        safeLog("Gemini API Chat primary call interrupted, evaluating resilient recovery options:", err?.message || err);
 
         let emergencySucceeded = false;
         try {
           // Emergency recovery retaining FULL conversation history, FULL lorebook/systemPrompt, with lightweight model and minimal thinking
           const emergencyAi = getGeminiClient();
           const fallbackResp = await generateContentWithRetry(emergencyAi, {
-            model: DEFAULT_GEMINI_MODEL,
+            model: "gemini-3.8-flash",
             contents: contents, // PRESERVE FULL CONVERSATION HISTORY
             config: {
               ...configObj,
               thinkingConfig: {
-                thinkingLevel: ThinkingLevel.MINIMAL
+                thinkingLevel: ThinkingLevel.LOW
               },
               // Omit function tools in emergency fallback if tool schema triggered the error, but retain all lore and instructions
               tools: undefined
@@ -2528,6 +2548,8 @@ YOU MUST IMMEDIATELY CEASE ALL WRITING FOR THE PLAYER CHARACTER (${pcLabel.toUpp
 
     res.json({
       text: textResponse,
+      modelUsed: modelName,
+      thinkingLevel,
       chainOfThought,
       isTimelineAnomaly: isTimelineAnomalyOccurred || textResponse.includes("brief disturbance in the timeline") || textResponse.includes("unexpected anomaly rippled"),
       retrySeconds: anomalyRetrySeconds || 20,
@@ -2565,6 +2587,176 @@ YOU MUST IMMEDIATELY CEASE ALL WRITING FOR THE PLAYER CHARACTER (${pcLabel.toUpp
       recommendedThinkingLevel: "Low",
       queriedDocs: [],
       loreActions: []
+    });
+  }
+});
+
+// 1.5 3D Scene Diorama Parser: Analyzes story prose into structured 3D parameters, atmosphere, and props
+app.post("/api/parse-scene-3d", async (req, res) => {
+  try {
+    const { sceneText = "", currentConfig = {} } = req.body;
+    const ai = getGeminiClient();
+    const isMock = !process.env.GEMINI_API_KEY;
+
+    const trimmedScene = typeof sceneText === "string" ? sceneText.trim().slice(-3500) : "";
+
+    if (isMock || !trimmedScene) {
+      // Intelligent heuristic fallback
+      const lower = trimmedScene.toLowerCase();
+      let preset: any = "tavern";
+      let groundTexture: any = "wood";
+      let ambientColor = "#2a1c12";
+      let keyLightColor = "#ff9944";
+      let fogColor = "#120b08";
+      let particles: any = "embers";
+      let title = "Cozy Hearthside Scene";
+
+      if (lower.includes("cyber") || lower.includes("neon") || lower.includes("terminal") || lower.includes("hack") || lower.includes("street")) {
+        preset = "cyberpunk";
+        groundTexture = "grid";
+        ambientColor = "#1e1b4b";
+        keyLightColor = "#a855f7";
+        fogColor = "#070714";
+        particles = "rain";
+        title = "Neon Rain Alleyway";
+      } else if (lower.includes("dungeon") || lower.includes("crypt") || lower.includes("cave") || lower.includes("catacomb") || lower.includes("stone")) {
+        preset = "dungeon";
+        groundTexture = "stone";
+        ambientColor = "#111827";
+        keyLightColor = "#38bdf8";
+        fogColor = "#05070e";
+        particles = "dust";
+        title = "Dungeon Depths";
+      } else if (lower.includes("forest") || lower.includes("tree") || lower.includes("wood") || lower.includes("glade") || lower.includes("night")) {
+        preset = "forest";
+        groundTexture = "dirt";
+        ambientColor = "#062e1e";
+        keyLightColor = "#6ee7b7";
+        fogColor = "#03120b";
+        particles = "spores";
+        title = "Moonlit Glade";
+      } else if (lower.includes("ruin") || lower.includes("sanctum") || lower.includes("temple") || lower.includes("monolith") || lower.includes("altar")) {
+        preset = "sanctum";
+        groundTexture = "stone";
+        ambientColor = "#2e1065";
+        keyLightColor = "#f43f5e";
+        fogColor = "#10061f";
+        particles = "embers";
+        title = "Ancient Arcane Sanctum";
+      }
+
+      return res.json({
+        preset,
+        groundTexture,
+        ambientColor,
+        ambientIntensity: 0.85,
+        keyLightColor,
+        keyLightIntensity: 2.2,
+        fogColor,
+        fogDensity: 0.025,
+        particles,
+        sceneTitle: title,
+        props: currentConfig.props && currentConfig.props.length > 0 ? currentConfig.props : [
+          { id: `prop-${Date.now()}-1`, type: "stone_arch", name: "Entrance Arch", position: [0, 0, -4.5], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          { id: `prop-${Date.now()}-2`, type: preset === "cyberpunk" ? "cyber_terminal" : "tavern_table", name: "Centerpiece", position: [0, 0, 0], rotation: [0, 0.2, 0], scale: [1.1, 1.1, 1.1] },
+          { id: `prop-${Date.now()}-3`, type: "fire_brazier", name: "Beacon", position: [-3.5, 0, -2.5], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          { id: `prop-${Date.now()}-4`, type: "character_token", name: "Hero Pawn", position: [0, 0, 1.8], rotation: [0, 0, 0], scale: [1, 1, 1], tint: "#a855f7" }
+        ]
+      });
+    }
+
+    const prompt = `You are a 3D environment architect and art director for a roleplay tabletop visualizer.
+Analyze the following story scene narrative and output a JSON specification for a 3D isometric diorama stage.
+
+SCENE PROSE:
+"""
+${trimmedScene}
+"""
+
+AVAILABLE PROP TYPES:
+- "stone_arch" (arches, gates, doorways)
+- "pillar_column" (columns, pillars, ruins)
+- "tavern_table" (tables, dining, desks)
+- "fire_brazier" (braziers, torches, campfires, hearths)
+- "cyber_terminal" (terminals, consoles, screens, servers)
+- "ancient_monolith" (obelisks, runestones, altars)
+- "chest_crate" (chests, crates, loot, cargo)
+- "crystal_spire" (crystals, arcane pillars, magical fonts)
+- "character_token" (pawns for heroes or notable characters)
+
+Output ONLY valid JSON with this exact schema:
+{
+  "preset": "tavern" | "dungeon" | "cyberpunk" | "forest" | "ruins" | "sanctum",
+  "groundTexture": "stone" | "wood" | "grid" | "dirt" | "metal",
+  "ambientColor": "#1e1b4b",
+  "ambientIntensity": 0.85,
+  "keyLightColor": "#ff9944",
+  "keyLightIntensity": 2.2,
+  "fogColor": "#05070e",
+  "fogDensity": 0.025,
+  "particles": "none" | "dust" | "embers" | "rain" | "spores",
+  "sceneTitle": "Short Evocative Title",
+  "props": [
+    {
+      "type": "stone_arch",
+      "name": "Descriptive Name",
+      "position": [0, 0, -4],
+      "rotation": [0, 0, 0],
+      "scale": [1, 1, 1],
+      "tint": "#a855f7"
+    }
+  ]
+}`;
+
+    const response = await generateContentWithRetry(ai, {
+      model: "gemini-3.8-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+      }
+    });
+
+    const parsed = cleanAndParseJson(response.text, {});
+    const props = Array.isArray(parsed.props) && parsed.props.length > 0
+      ? parsed.props.map((p: any, idx: number) => ({
+          id: `prop-ai-${Date.now()}-${idx}`,
+          type: p.type || "stone_arch",
+          name: p.name || `Prop ${idx + 1}`,
+          position: Array.isArray(p.position) ? [p.position[0] || 0, 0, p.position[2] || 0] : [0, 0, 0],
+          rotation: Array.isArray(p.rotation) ? [0, p.rotation[1] || 0, 0] : [0, 0, 0],
+          scale: Array.isArray(p.scale) ? [p.scale[0] || 1, p.scale[1] || 1, p.scale[2] || 1] : [1, 1, 1],
+          tint: p.tint
+        }))
+      : (currentConfig.props || []);
+
+    return res.json({
+      preset: parsed.preset || "tavern",
+      groundTexture: parsed.groundTexture || "stone",
+      ambientColor: parsed.ambientColor || "#1e222d",
+      ambientIntensity: parsed.ambientIntensity || 0.85,
+      keyLightColor: parsed.keyLightColor || "#ff9944",
+      keyLightIntensity: parsed.keyLightIntensity || 2.2,
+      fogColor: parsed.fogColor || "#0f0c18",
+      fogDensity: parsed.fogDensity || 0.025,
+      particles: parsed.particles || "embers",
+      sceneTitle: parsed.sceneTitle || "Narrative Scene",
+      props
+    });
+  } catch (err: any) {
+    safeWarn("Error parsing 3D scene from prose:", err);
+    return res.json({
+      preset: "tavern",
+      groundTexture: "wood",
+      ambientColor: "#2a1c12",
+      ambientIntensity: 0.85,
+      keyLightColor: "#ff9944",
+      keyLightIntensity: 2.2,
+      fogColor: "#120b08",
+      fogDensity: 0.025,
+      particles: "embers",
+      sceneTitle: "Story Scene Stage",
+      props: req.body?.currentConfig?.props || []
     });
   }
 });
@@ -2617,7 +2809,7 @@ Return JSON with keys:
     } else {
       try {
         const response = await generateContentWithRetry(ai, {
-          model: DEFAULT_GEMINI_MODEL,
+          model: "gemini-3.1-flash-lite",
           contents: editPrompt,
           config: {
             responseMimeType: "application/json",
@@ -2642,15 +2834,15 @@ Return JSON with keys:
         resultText = data.editedText || data.edited_text || data.edited || data.polishedText || data.polished_text || data.text || data.result || data.story || safeText;
         ragSummary = data.ragSummary || data.rag_summary || data.summary || "Narrative anchored.";
       } catch (err: any) {
-        safeWarn("[Narrative Edit] Primary call failed, attempting fallback.");
+        safeLog("Narrative edit primary call failed, attempting fallback:", err?.message || err);
         // If primary call fails, attempt simpler prompt without strict schema as quick fallback
         try {
           const fallbackResp = await generateContentWithRetry(ai, {
-            model: DEFAULT_GEMINI_MODEL,
+            model: "gemini-3.8-flash",
             contents: `Rewrite and polish the following tabletop adventure story according to this command: "${userCommand}"\n\nText:\n${safeText.slice(0, 20000)}`,
             config: {
               thinkingConfig: {
-                thinkingLevel: ThinkingLevel.MINIMAL
+                thinkingLevel: ThinkingLevel.LOW
               }
             }
           }, 2);
@@ -2827,6 +3019,24 @@ const assistantTools = [
             }
           },
           required: ["key", "value"]
+        }
+      },
+      {
+        name: "add_to_grounding_context",
+        description: "Adds, appends, or pins a manual fact, location, scene condition, state delta, or rule directly into the persistent grounding context memory (e.g. 'Location: Rear Terrace', 'Weather: Heavy downpour', 'Status: Escaping via elevator'). ALWAYS invoke this tool whenever Sir says 'Add [X] to context', 'Add location: [X] to context', or asks you to manually pin something into active grounding memory without overwriting previous context.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            entry: {
+              type: Type.STRING,
+              description: "The specific fact, location, condition, or state delta to add to persistent grounding context (e.g. 'Location: Rear Terrace')."
+            },
+            category: {
+              type: Type.STRING,
+              description: "Optional categorization: 'location', 'scene', 'state', 'inventory', 'rule', or 'character'."
+            }
+          },
+          required: ["entry"]
         }
       },
       {
@@ -3168,7 +3378,7 @@ Output ONLY the raw valid JSON object. No markdown wrapping (like \`\`\`json), n
 
     try {
       const response = await generateContentWithRetry(ai, {
-        model: DEFAULT_GEMINI_MODEL,
+        model: "gemini-flash-latest",
         contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
         config: {
           responseMimeType: "application/json",
@@ -3255,7 +3465,7 @@ Ensure the "customFields" key-value pairs are highly tailored, extensible, setti
 Output ONLY the raw valid JSON object. No markdown wrapping (like \`\`\`json), no trailing text.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: DEFAULT_GEMINI_MODEL,
+      model: "gemini-3.1-flash-lite",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
         responseMimeType: "application/json"
@@ -3338,7 +3548,7 @@ You MUST return a raw JSON object with this exact structure:
 Output ONLY valid JSON. No markdown code blocks, no other text.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: DEFAULT_GEMINI_MODEL,
+      model: "gemini-3.1-flash-lite",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
         tools: [{ googleSearch: {} }],
@@ -3443,7 +3653,7 @@ ${transcript}
 Output ONLY valid raw JSON. No markdown code blocks.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: DEFAULT_GEMINI_MODEL,
+      model: "gemini-3.1-flash-lite",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
         responseMimeType: "application/json"
@@ -3571,11 +3781,11 @@ You MUST return ONLY a raw JSON object with this exact structure:
 Output ONLY valid JSON. No markdown code blocks, no trailing commentary.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: DEFAULT_GEMINI_MODEL,
+      model: "gemini-flash-latest",
       contents: [{ role: "user", parts: [{ text: systemPrompt }] }],
       config: {
         responseMimeType: "application/json",
-        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL }
+        thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
       }
     }, 1, 400, 30000);
 
@@ -3615,7 +3825,26 @@ app.post("/api/workspace-assistant", async (req, res) => {
       let replyText = "";
       const nickname = appContext?.activeProject?.userNickname || "Adventurer";
       
-      if (textLower.includes("context") || textLower.includes("scene") || textLower.includes("thunderstorm")) {
+      if (
+        (textLower.includes("add") && (textLower.includes("context") || textLower.includes("grounding"))) ||
+        textLower.includes("rear terrace") ||
+        (textLower.startsWith("add ") && (textLower.includes("location") || textLower.includes("scene")))
+      ) {
+        let entry = "Location: Rear Terrace";
+        const match = lastText.match(/add\s+(?:location\s*:\s*|to\s+(?:grounding\s+)?context\s*:\s*|location\s+)?(.+?)(?:\s+to\s+(?:grounding\s+)?context)?$/i);
+        if (match && match[1]?.trim()) {
+          const raw = match[1].trim();
+          entry = (textLower.includes("location") && !raw.toLowerCase().startsWith("location")) ? `Location: ${raw}` : raw;
+        }
+        functionCalls.push({
+          name: "add_to_grounding_context",
+          args: {
+            entry,
+            category: "location"
+          }
+        });
+        replyText = `[Nyx: Locked in, ${nickname}! Added "${entry}" directly to our active grounding context. The storyteller engine will now anchor to it for every scene.]`;
+      } else if (textLower.includes("context") || textLower.includes("scene") || textLower.includes("thunderstorm")) {
         functionCalls.push({
           name: "update_project_value",
           args: {
@@ -3918,9 +4147,7 @@ CANON ARCHITECTURE & LORE DATABASE PRECEDENCE (DELTA OVER BASE TRAINING):
 - Base training serves as foundational vocabulary and world physics; all lore database entries are permanently active knowledge.
 
 TOOL EXECUTION CAPABILITIES:
-- \`edit_narrative_log\`: Edit, rewrite, polish, or fix an entry in the Narrative / Adventure Log.
-  * CRITICAL ABSOLUTE MANDATE: Whenever Sir asks to edit, revise, rewrite, fix, alter, polish, or change narrative story text, scene prose, or dialogue in the Adventure Log, YOU MUST CALL \`edit_narrative_log\` WITH \`newContent\` SET TO THE FULL REVISED NARRATIVE PROSE!
-  * NEVER merely write conversational text or describe what you changed without calling \`edit_narrative_log\`! Sir's Adventure Log ONLY updates when \`edit_narrative_log\` is called. Supplying conversational prose without the tool call results in zero changes and breaks Sir's experience! Supply \`id\` (or omit/'latest' for the last turn) and \`newContent\`.
+- \`edit_narrative_log\`: Edit, rewrite, polish, or fix an entry in the Narrative / Adventure Log. Use when Sir asks to edit, revise, polish, or rewrite a scene turn or dialogue in the story log. Supply \`id\` (or omit/'latest' for the last turn) and \`newContent\` with the full rewritten prose.
 - \`delete_narrative_entry\`: Remove an unwanted turn or message from the adventure log.
 - \`update_adventure_log_title\`: Rename the header title of the Narrative / Adventure Log (or use \`update_project_value\` with key="adventureLogTitle").
 - \`add_character_or_lore\`: Create new PC, companion, NPC, faction, vehicle, equipment, location, or chronicle profiles.
@@ -3929,6 +4156,7 @@ TOOL EXECUTION CAPABILITIES:
 - \`update_character_or_lore\`: Edit existing profile roles, descriptions, custom fields, or stats. If Sir asks to flesh out or fill in missing fields or custom specifications for an existing character, supply the updated \`customFields\` JSON with all category specifications populated!
 - \`delete_character_or_lore\`: Remove outdated or unwanted profiles.
 - \`update_project_value\`: Update or upsert campaign parameters. When Sir asks to update, upsert, or change world settings, lore, adventure log title, or turn header (e.g. 'The Mortician - S01E11' or 'The Household - Fun in the Sun'), invoke \`update_project_value\` with key="turnHeader" (or "setting", "adventureLogTitle", "plotOverview", "persistentContext", "styleGuide", "pacing", "emotionalTone") and value="<updated value>".
+- \`add_to_grounding_context\`: Manually add, pin, or append a location, state delta, sensory detail, character fact, or scene condition into the campaign's persistent grounding context. ALWAYS call this tool when Sir says "Add [X] to context", "Add location: [X] to context", or tells you to record or pin something to context manually. Do not wipe out past context; this cleanly pins the fact or location into persistent memory!
 - \`add_lore_source\`, \`update_lore_source\`, \`delete_lore_source\`: Create, edit, and manage grounding lore documents, world guides, historical codices, and transcripts. Use \`add_lore_source\` when Sir asks to record, log, or establish world lore or notes. (Note: Keep notes and scratchpads are legacy; the structured Lore Database and Grounding Sources are the active canon repositories).
 - \`add_task\`, \`toggle_task\`, \`delete_task\`: Manage campaign goals and objectives.
 - \`feed_context_to_main_chat\`: Post narration or dialogue into the main adventure transcript.
@@ -4004,7 +4232,7 @@ Always answer concisely, directly, and naturally.
 
     try {
       const response = await generateContentWithRetry(ai, {
-        model: DEFAULT_GEMINI_MODEL,
+        model: "gemini-flash-latest",
         contents,
         config: callConfig
       }, 1, 300, 35000);
@@ -4017,7 +4245,7 @@ Always answer concisely, directly, and naturally.
       // Fallback fast text-only generation if tool schemas or complex function calls caused an issue
       try {
         const fallbackResp = await generateContentWithRetry(ai, {
-          model: DEFAULT_GEMINI_MODEL,
+          model: "gemini-flash-latest",
           contents,
           config: {
             systemInstruction: systemPrompt,
@@ -4092,6 +4320,11 @@ Always answer concisely, directly, and naturally.
                   name: "update_adventure_log_title",
                   args: { title: item.title || item.name }
                 });
+              } else if (item?.action === "ADD_TO_GROUNDING_CONTEXT" || item?.action === "add_to_grounding_context" || item?.action === "add_to_context") {
+                functionCalls.push({
+                  name: "add_to_grounding_context",
+                  args: { entry: item.entry || item.text || item.value, category: item.category || "location" }
+                });
               }
             }
           } else if (parsed && typeof parsed === "object") {
@@ -4149,104 +4382,6 @@ Always answer concisely, directly, and naturally.
       }
     }
 
-    // SEMANTIC RECOVERY: If Gemini responded conversationally describing an edit to the narrative/turn,
-    // or if the user requested a narrative edit, but Gemini forgot to trigger the native edit_narrative_log tool call,
-    // extract the rewritten prose and synthesize the call so the Adventure Log is actually revised!
-    if (!functionCalls.some(f => f.name === "edit_narrative_log" || f.name === "edit_narrative_entry" || f.name === "edit_message") && text.trim()) {
-      const lastUserMessage = (messages || []).filter((m: any) => m.role === "user").pop();
-      const userText = (lastUserMessage?.content || "").toLowerCase();
-      
-      const isUserEditRequest = 
-        /(?:edit|rewrite|revise|change|update|fix|modify|alter|replace|retcon|redo|polish|rework|rephrase)\s+(?:the\s+)?(?:narrative|story|turn|scene|log|prose|dialogue|post|entry|message|response|last|previous|adventure)/i.test(userText) ||
-        /(?:can you|please|could you)\s+(?:edit|rewrite|revise|change|update|fix|modify|alter|retcon)\s+(?:the\s+)?(?:narrative|story|turn|scene|log)/i.test(userText) ||
-        /(?:edit|rewrite|revise|fix|retcon)\s+(?:this|that|the)\s+(?:turn|scene|message|dialogue|log|narrative)/i.test(userText) ||
-        /^(?:narrative edit|scene edit|edit narrative|rewrite turn):/i.test(userText);
-
-      const isModelClaimingEdit = 
-        /(?:revised|updated|edited|rewritten|modified|changed)\s+(?:the\s+)?(?:turn|scene|narrative|log|story|entry|message|adventure)/i.test(text) ||
-        /(?:here(?:'s| is) (?:the )?(?:revised|updated|edited|new) (?:turn|scene|narrative|log|prose|version))/i.test(text);
-
-      if (isUserEditRequest || isModelClaimingEdit) {
-        let extractedProse = "";
-
-        // 1. Check for prose inside markdown quote blocks (> ...)
-        const quoteMatch = text.match(/(?:^|\n)>\s*([\s\S]+?)(?=\n\n[^\>]|$)/);
-        if (quoteMatch && quoteMatch[1]?.trim().length > 15) {
-          extractedProse = quoteMatch[1].trim();
-        }
-
-        // 2. Check for prose inside a code block
-        if (!extractedProse) {
-          const codeBlockMatch = text.match(/```(?:markdown|text)?\s*([\s\S]*?)\s*```/);
-          if (codeBlockMatch && codeBlockMatch[1]?.trim().length > 15 && !codeBlockMatch[1].trim().startsWith("{")) {
-            extractedProse = codeBlockMatch[1].trim();
-          }
-        }
-
-        // 3. Check for text outside [Nyx: ...] brackets
-        if (!extractedProse) {
-          const nonBracketText = text.replace(/\[(?:Nyx|Sir)[\s\S]*?\]/gi, "").trim();
-          if (nonBracketText.length > 20) {
-            extractedProse = nonBracketText;
-          }
-        }
-
-        // 4. Check for text after phrases like "Here is the revised turn:" or "I've updated the scene:"
-        if (!extractedProse) {
-          const afterHeaderMatch = text.match(/(?:Here(?:'s| is) (?:the )?(?:revised|updated|edited|new) (?:turn|scene|narrative|log|prose)|I(?:'ve| have) (?:revised|updated|edited|rewritten) (?:the )?(?:turn|scene|narrative|log|prose)[^:\n.!]*)[ :.!]\s*\n*([\s\S]+)/i);
-          if (afterHeaderMatch && afterHeaderMatch[1]?.trim().length > 15) {
-            extractedProse = afterHeaderMatch[1].replace(/\]\s*$/, "").trim();
-          }
-        }
-
-        // 5. If wrapped inside [Nyx: ...], unwrap and strip conversational preamble
-        if (!extractedProse) {
-          const unwrapped = text.replace(/^\[(?:Nyx|Sir)[^:]*:\s*/i, "").replace(/\]\s*$/i, "").trim();
-          const cleanedProse = unwrapped.replace(/^(?:(?:All set|Done|Sure thing|I've updated|I have updated|I've edited|I have edited|I've revised|I have revised|I've rewritten|I have rewritten|Here is the revised|Here's the revised|Got it|You got it)[^.!?\n]*[.!?:\n]\s*)+/i, "").trim();
-          if (cleanedProse.length > 20) {
-            extractedProse = cleanedProse;
-          }
-        }
-
-        // 6. Fallback: If model only said "I've edited the narrative..." without providing the new prose,
-        // take the user's instructions and synthesize the prose so the Adventure Log doesn't remain untouched!
-        if (!extractedProse && isUserEditRequest) {
-          const cleanUserInstruction = lastUserMessage?.content?.replace(/^(?:can you|please|could you)?\s*(?:edit|rewrite|revise|change|update|fix)\s+(?:the\s+)?(?:narrative|story|turn|scene|log)\s*(?:to|so that|and|:)?\s*/i, "").trim();
-          if (cleanUserInstruction && cleanUserInstruction.length > 10) {
-            extractedProse = cleanUserInstruction;
-          }
-        }
-
-        if (extractedProse && extractedProse.length > 10) {
-          console.log(`[Workspace Assistant] Synthesized missing edit_narrative_log tool call (${extractedProse.length} chars) from model response.`);
-          functionCalls.push({
-            name: "edit_narrative_log",
-            args: {
-              id: "latest",
-              newContent: extractedProse
-            }
-          });
-
-          // If the model's text response was just raw prose, replace it with a clean confirmation so prose isn't doubled
-          if (!text.includes("[Nyx:") && !text.includes("[Sir:")) {
-            text = `[Nyx: Revised the latest scene entry in the Adventure Log, ${appContext?.activeProject?.userNickname || "Sir"}!]`;
-          }
-        }
-      }
-    }
-
-    // ANTI-HALLUCINATION GUARD:
-    // If the text response claims to have revised or updated the narrative, but NO narrative edit tool call exists,
-    // NEVER falsely tell the user the narrative was updated!
-    if (!functionCalls.some(f => f.name === "edit_narrative_log" || f.name === "edit_narrative_entry" || f.name === "edit_message")) {
-      if (/(?:revised|updated|edited|rewritten)\s+(?:the\s+)?(?:turn|scene|narrative|log|adventure)/i.test(text)) {
-        text = text.replace(/\[Nyx:[^\]]*(?:revised|updated|edited|rewritten)[^\]]*\]/gi, "").trim();
-        if (!text) {
-          text = `[Nyx: I can revise that narrative turn for you, ${appContext?.activeProject?.userNickname || "Sir"}. What specific dialogue, action, or scene outcome would you like me to rewrite?]`;
-        }
-      }
-    }
-
     // If function calls were returned but no text was output by Gemini, generate in-character confirmation
     if (!text.trim() && functionCalls.length > 0) {
       const actionDescriptions = functionCalls.map(f => {
@@ -4257,6 +4392,7 @@ Always answer concisely, directly, and naturally.
         if (f.name === "add_character_or_lore") return `registered "${f.args?.name || "character"}" into the lore database`;
         if (f.name === "update_character_or_lore") return `updated "${f.args?.name || f.args?.id || "profile"}"`;
         if (f.name === "update_project_value") return `updated workspace setting "${f.args?.key}"`;
+        if (f.name === "add_to_grounding_context") return `pinned "${f.args?.entry || "context"}" to persistent grounding context`;
         if (f.name === "add_lore_source") return `registered lore document "${f.args?.name}"`;
         if (f.name === "update_lore_source") return `updated lore document "${f.args?.name || f.args?.id}"`;
         if (f.name === "delete_lore_source") return `deleted lore document "${f.args?.id || f.args?.name}"`;
@@ -4278,30 +4414,9 @@ Always answer concisely, directly, and naturally.
 
   } catch (err: any) {
     safeError("Assistant API outer issue:", err);
-
-    // If the user requested a narrative edit and the outer call caught an error,
-    // rescue the edit by synthesizing the function call from the user directive!
-    const lastUserMsg = (req.body?.messages || []).filter((m: any) => m.role === "user").pop();
-    const userPromptText = (lastUserMsg?.content || "").trim();
-    const fallbackCalls: any[] = [];
-    let fallbackText = `[Nyx: I caught that, ${req.body?.appContext?.activeProject?.userNickname || "Sir"}! Everything is synced up and standing by.]`;
-
-    const isEditReq = /(?:edit|rewrite|revise|change|update|fix)\s+(?:the\s+)?(?:narrative|story|turn|scene|log)/i.test(userPromptText);
-    if (isEditReq && userPromptText.length > 10) {
-      const cleanInstruction = userPromptText.replace(/^(?:can you|please|could you)?\s*(?:edit|rewrite|revise|change|update|fix)\s+(?:the\s+)?(?:narrative|story|turn|scene|log)\s*(?:to|so that|and|:)?\s*/i, "").trim();
-      fallbackCalls.push({
-        name: "edit_narrative_log",
-        args: {
-          id: "latest",
-          newContent: cleanInstruction || userPromptText
-        }
-      });
-      fallbackText = `[Nyx: Revised the latest scene entry in the Adventure Log, ${req.body?.appContext?.activeProject?.userNickname || "Sir"}!]`;
-    }
-
     res.json({
-      text: fallbackText,
-      functionCalls: fallbackCalls
+      text: `[Nyx: I caught that, ${req.body?.appContext?.activeProject?.userNickname || "Sir"}! Everything is synced up and standing by.]`,
+      functionCalls: []
     });
   }
 });
@@ -4338,7 +4453,7 @@ app.get("/api/workspace-assistant/diagnostics", async (req, res) => {
     const pingStart = Date.now();
     try {
       const pingResp = await generateContentWithRetry(ai, {
-        model: DEFAULT_GEMINI_MODEL,
+        model: "gemini-flash-latest",
         contents: [{ role: "user", parts: [{ text: "ping" }] }],
         config: {
           systemInstruction: "Respond with the single word PONG.",
@@ -4350,7 +4465,7 @@ app.get("/api/workspace-assistant/diagnostics", async (req, res) => {
       checks.modelConnectivity = {
         status: text ? "ok" : "warn",
         latencyMs: pingLatency,
-        details: text ? `Gemini operational (Ping response in ${pingLatency}ms).` : "Model connected but returned empty ping response."
+        details: text ? `Gemini Flash-Latest operational (Ping response in ${pingLatency}ms).` : "Model connected but returned empty ping response."
       };
     } catch (e: any) {
       checks.modelConnectivity = {
@@ -4579,12 +4694,12 @@ Please return JSON conforming to this exact structure:
       ];
 
       response = await generateContentWithRetry(ai, {
-        model: DEFAULT_GEMINI_MODEL,
+        model: "gemini-flash-latest",
         contents,
         config: {
           responseMimeType: "application/json",
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MINIMAL
+            thinkingLevel: ThinkingLevel.HIGH
           }
         }
       });
@@ -4601,12 +4716,12 @@ Please return JSON conforming to this exact structure:
       }
       const prompt = `${corePrompt}\n\nDOCUMENT CONTENT TO SCRAPE:\n\"\"\"\n${textContent}\n\"\"\"`;
       response = await generateContentWithRetry(ai, {
-        model: DEFAULT_GEMINI_MODEL,
+        model: "gemini-flash-latest",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MINIMAL
+            thinkingLevel: ThinkingLevel.HIGH
           }
         }
       });
@@ -5013,12 +5128,12 @@ Provide a clean JSON structure that includes both the extracted entities AND the
         }
       ];
       response = await generateContentWithRetry(ai, {
-        model: DEFAULT_GEMINI_MODEL,
+        model: "gemini-flash-latest",
         contents,
         config: {
           responseMimeType: "application/json",
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MINIMAL
+            thinkingLevel: ThinkingLevel.HIGH
           }
         }
       });
@@ -5034,12 +5149,12 @@ Provide a clean JSON structure that includes both the extracted entities AND the
       }
       const prompt = `${systemPrompt}\n\nDOCUMENT CONTENT TO INGEST:\n\"\"\"\n${textContent}\n\"\"\"`;
       response = await generateContentWithRetry(ai, {
-        model: DEFAULT_GEMINI_MODEL,
+        model: "gemini-flash-latest",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
           thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MINIMAL
+            thinkingLevel: ThinkingLevel.HIGH
           }
         }
       });
@@ -5405,7 +5520,7 @@ Return JSON with:
 `;
 
     const response = await generateContentWithRetry(ai, {
-      model: DEFAULT_GEMINI_MODEL,
+      model: "gemini-flash-latest",
       contents: prompt,
       config: {
         responseMimeType: "application/json"
@@ -5470,16 +5585,21 @@ ${content.length > 120000 ? content.substring(0, 120000) + "\n...[Truncated for 
 """`;
 
     const response = await generateContentWithRetry(ai, {
-      model: DEFAULT_GEMINI_MODEL,
-      contents: prompt
-    }, 1, 500, 15000);
+      model: "gemini-flash-latest",
+      contents: prompt,
+      config: {
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.HIGH
+        }
+      }
+    });
 
     res.json({
       summary: response.text || "Failed to generate study guide."
     });
 
   } catch (err: any) {
-    safeWarn("[Summarizer] Source summarization offline fallback engaged.");
+    safeError("Source summarization issue, falling back gracefully:", err);
     
     // Check if it's a quota or rate-limiting/overload issue
     const isOverloadedOrQuota = err.status === 429 || err.status === 503 ||
@@ -5623,7 +5743,7 @@ app.post("/api/deduplicate-workspace", async (req, res) => {
     });
 
   } catch (err: any) {
-    safeWarn("Workspace deduplication error, falling back:", err);
+    safeError("Workspace deduplication error, falling back:", err);
 
     res.json({
       mergedSources: sources,
@@ -5696,7 +5816,7 @@ Do not require specific wiki URLs or single pages; use the entire web to form a 
 Highlight any major characters, historical events, rules, or factions found in the search results.`;
 
     const response = await generateContentWithRetry(ai, {
-      model: DEFAULT_GEMINI_MODEL,
+      model: "gemini-flash-latest",
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
@@ -5719,7 +5839,7 @@ Highlight any major characters, historical events, rules, or factions found in t
     });
 
   } catch (err: any) {
-    safeWarn("Web search API failed, falling back gracefully:", err);
+    safeError("Web search API failed, falling back gracefully:", err);
     
     // Check if it's a quota or rate-limiting issue
     const isQuotaError = err.status === 429 || 
@@ -6113,7 +6233,7 @@ Return ONLY valid JSON matching this exact structure:
 
     try {
       const aiResponse = await generateContentWithRetry(ai, {
-        model: DEFAULT_GEMINI_MODEL,
+        model: "gemini-3.1-flash-lite",
         contents: distillPrompt,
         config: {
           responseMimeType: "application/json",
@@ -6218,20 +6338,10 @@ app.all("/api/google-proxy", async (req: express.Request, res: express.Response)
     return res.status(400).json({ error: "Missing 'url' query parameter" });
   }
 
-  const isAllowedHost = (hostname: string) => {
-    return (
-      hostname === "www.googleapis.com" ||
-      hostname === "docs.googleapis.com" ||
-      hostname === "drive.googleapis.com" ||
-      hostname === "content.googleapis.com" ||
-      hostname.endsWith(".googleusercontent.com") ||
-      hostname.endsWith(".google.com")
-    );
-  };
-
   try {
     const parsedUrl = new URL(targetUrl);
-    if (!isAllowedHost(parsedUrl.hostname)) {
+    const ALLOWED_HOSTS = ["www.googleapis.com", "docs.googleapis.com", "drive.googleapis.com"];
+    if (!ALLOWED_HOSTS.includes(parsedUrl.hostname)) {
       return res.status(403).json({ error: `Forbidden host: ${parsedUrl.hostname}` });
     }
   } catch {
@@ -6244,49 +6354,12 @@ app.all("/api/google-proxy", async (req: express.Request, res: express.Response)
       headers["Content-Type"] = req.headers["content-type"] as string;
     }
 
-    // Handle redirects manually to preserve Authorization header across Google domains
-    // (Standard fetch drops Authorization header when redirected to docs.googleusercontent.com)
-    let currentUrl = targetUrl;
-    let googleResponse: Response | null = null;
-    let redirectCount = 0;
-    const maxRedirects = 5;
-
-    while (redirectCount < maxRedirects) {
-      const parsed = new URL(currentUrl);
-      if (!isAllowedHost(parsed.hostname)) {
-        return res.status(403).json({ error: `Forbidden host on redirect: ${parsed.hostname}` });
-      }
-
-      const reqHeaders: Record<string, string> = { ...headers, Authorization: authHeader };
-      const fetchOptions: RequestInit = {
-        method: redirectCount === 0 ? req.method : "GET",
-        headers: reqHeaders,
-        redirect: "manual"
-      };
-
-      if (redirectCount === 0 && req.method !== "GET" && req.method !== "HEAD" && req.body) {
-        fetchOptions.body = typeof req.body === "object" ? JSON.stringify(req.body) : String(req.body);
-      }
-
-      googleResponse = await fetch(currentUrl, fetchOptions);
-
-      // Check for redirect status codes (301, 302, 303, 307, 308)
-      if ([301, 302, 303, 307, 308].includes(googleResponse.status)) {
-        const location = googleResponse.headers.get("location");
-        if (location) {
-          currentUrl = new URL(location, currentUrl).toString();
-          redirectCount++;
-          continue;
-        }
-      }
-
-      break;
+    const fetchOptions: RequestInit = { method: req.method, headers };
+    if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
+      fetchOptions.body = typeof req.body === "object" ? JSON.stringify(req.body) : String(req.body);
     }
 
-    if (!googleResponse) {
-      return res.status(500).json({ error: "No response from upstream Google service" });
-    }
-
+    const googleResponse = await fetch(targetUrl, fetchOptions);
     res.status(googleResponse.status);
 
     const contentType = googleResponse.headers.get("content-type");

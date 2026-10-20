@@ -1169,24 +1169,24 @@ export default function WorkspaceSync({
           <button
             id="tab-btn-all"
             onClick={() => setActiveWorkspaceTab("all")}
-            className={`px-3 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-2.5 sm:px-3 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
               activeWorkspaceTab !== "keep"
                 ? "bg-purple-900/60 text-purple-200 border border-purple-500/30 font-semibold"
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            <Layers size={12} /> Lore Base ({loreSources.length})
+            <Layers size={12} /> <span className="truncate">Lore ({loreSources.length})</span>
           </button>
           <button
             id="tab-btn-keep"
             onClick={() => setActiveWorkspaceTab("keep")}
-            className={`px-3 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-2.5 sm:px-3 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
               activeWorkspaceTab === "keep"
                 ? "bg-purple-900/60 text-purple-200 border border-purple-500/30 font-semibold"
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            <CheckSquare size={12} className="text-emerald-400" /> Notes & Tasks ({tasks.filter(t => !t.completed).length + notes.length})
+            <CheckSquare size={12} className="text-emerald-400" /> <span className="truncate">Notes ({tasks.filter(t => !t.completed).length + notes.length})</span>
           </button>
         </div>
       </div>

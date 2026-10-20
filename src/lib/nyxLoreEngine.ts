@@ -152,8 +152,21 @@ export interface ParsedContextBadge {
   weightPct: number;
 }
 
+export function normalizeCharacterName(name: string): string {
+  if (!name || typeof name !== "string") return "";
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/\bashely\b/gi, "ashley")
+    .replace(/\s*[\(\[]?(?:companion|pc|npc|protagonist|expanded npc)[\)\]]?\s*$/i, "")
+    .replace(/^[\(\[]?(?:companion|pc|npc|protagonist)\s*[:\-–]?\s*/i, "")
+    .replace(/[^\w\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /**
- * Parses context entity string (e.g. "Shima Aliph (PC)", "The Guild (100%)") into a structured badge.
+ * Parses context entity string (e.g. "Shima Aliph (PC)", "The Guild (100%)", "Ashley (Companion)") into a structured badge.
  */
 export function parseContextEntityEntry(
   entry: any,
@@ -170,22 +183,51 @@ export function parseContextEntityEntry(
   if (matchPc) {
     return { name: matchPc[1].trim(), badge: "PC", isPc: true, weightPct: 100 };
   }
+  const matchCompanion = clean.match(/^(.*?)\s*\((Companion|companion|Ally|ally)\)$/i);
+  if (matchCompanion) {
+    return { name: matchCompanion[1].trim(), badge: "Companion", isPc: false, weightPct: 100 };
+  }
   const matchWeight = clean.match(/^(.*?)\s*\((\d+)%\)$/);
   if (matchWeight) {
     const weightPct = parseInt(matchWeight[2], 10);
-    return { name: matchWeight[1].trim(), badge: `${weightPct}%`, isPc: false, weightPct: isNaN(weightPct) ? 100 : weightPct };
+    const parsedName = matchWeight[1].trim();
+    const norm = normalizeCharacterName(parsedName);
+    const char = (characters || []).find((c) => {
+      if (!c || !c.name) return false;
+      return c.name.toLowerCase() === parsedName.toLowerCase() || (norm && normalizeCharacterName(c.name) === norm);
+    });
+    if (char) {
+      if (char.isPlayerCharacter || char.type === "pc") {
+        return { name: char.name, badge: "PC", isPc: true, weightPct: 100 };
+      }
+      if (char.type === "companion" || /companion/i.test(char.role || "")) {
+        return { name: char.name, badge: "Companion", isPc: false, weightPct: 100 };
+      }
+    }
+    return { name: parsedName, badge: `${weightPct}%`, isPc: false, weightPct: isNaN(weightPct) ? 100 : weightPct };
   }
-  // Check if matches known PC in characters
-  const char = (characters || []).find(
-    (c) => c && typeof c.name === "string" && c.name.toLowerCase() === clean.toLowerCase()
-  );
+  // Check if matches known character
+  const norm = normalizeCharacterName(clean);
+  const char = (characters || []).find((c) => {
+    if (!c || !c.name) return false;
+    return c.name.toLowerCase() === clean.toLowerCase() || (norm && normalizeCharacterName(c.name) === norm);
+  });
   const isPc = !!(char?.isPlayerCharacter || char?.type === "pc");
-  return { name: clean || "Entity", badge: isPc ? "PC" : "100%", isPc, weightPct: 100 };
+  const isCompanion = !!(char?.type === "companion" || /companion/i.test(char?.role || "") || /companion/i.test(clean));
+  const preferredName = char?.name || clean || "Entity";
+  return { 
+    name: preferredName, 
+    badge: isPc ? "PC" : isCompanion ? "Companion" : "100%", 
+    isPc, 
+    weightPct: 100 
+  };
 }
 
 /**
  * Returns the exact context entities snapshot for a given message turn,
  * falling back to calculating it if the message is from legacy history.
+ * Automatically deduplicates entities by normalized name so companions/PCs
+ * never appear duplicated (e.g. preventing "Ashley" and "Ashley Companion" together).
  */
 export function getTurnContextSnapshot(
   msg: Message,
@@ -194,20 +236,43 @@ export function getTurnContextSnapshot(
   msgIdx: number = -1
 ): string[] {
   if (!msg) return [];
+  let rawList: string[] = [];
+
   if (msg.contextEntities && Array.isArray(msg.contextEntities) && msg.contextEntities.length > 0) {
-    return (msg.contextEntities as any[])
+    rawList = (msg.contextEntities as any[])
       .map((e: any) => (typeof e === "string" ? e : (e && typeof e.name === "string" ? e.name : String(e || ""))))
       .filter(Boolean);
+  } else {
+    const safeAll = Array.isArray(allMessages) && allMessages.length > 0 ? allMessages.filter(Boolean) : [msg];
+    const effectiveIndex = msgIdx >= 0 && safeAll.length > 1 ? msgIdx : safeAll.findIndex((m) => m && m.id === msg.id);
+    const messagesSlice = effectiveIndex >= 0 ? safeAll.slice(0, effectiveIndex + 1) : safeAll;
+    const result = computeGranularLoreContext(characters || [], messagesSlice);
+    
+    rawList = [
+      ...(result.pcEntities || []).filter((c) => c && typeof c.name === "string").map((c) => `${c.name} (PC)`),
+      ...(result.granularEntities || []).filter((w) => w && w.entity && typeof w.entity.name === "string").map((w) => {
+        const isComp = w.entity.type === "companion" || /companion/i.test(w.entity.role || "") || /companion/i.test(w.entity.name);
+        return isComp ? (w.entity.name.toLowerCase().includes("companion") ? w.entity.name : `${w.entity.name} (Companion)`) : `${w.entity.name} (${w.weightPercent || 100}%)`;
+      }),
+    ];
   }
-  // If not saved on the message, compute what was in context at this turn
-  const safeAll = Array.isArray(allMessages) ? allMessages.filter(Boolean) : [];
-  const effectiveIndex = msgIdx >= 0 ? msgIdx : safeAll.findIndex((m) => m && m.id === msg.id);
-  const messagesSlice = effectiveIndex >= 0 ? safeAll.slice(0, effectiveIndex + 1) : safeAll;
-  const result = computeGranularLoreContext(characters || [], messagesSlice);
-  
-  return [
-    ...(result.pcEntities || []).filter((c) => c && typeof c.name === "string").map((c) => `${c.name} (PC)`),
-    ...(result.granularEntities || []).filter((w) => w && w.entity && typeof w.entity.name === "string").map((w) => `${w.entity.name} (${w.weightPercent || 100}%)`),
-  ];
-}
 
+  // Deduplicate using normalizeCharacterName to ensure no entity is doubled
+  const seenNorms = new Set<string>();
+  const deduplicated: string[] = [];
+
+  for (const item of rawList) {
+    const parsed = parseContextEntityEntry(item, characters);
+    const norm = normalizeCharacterName(parsed.name);
+    if (!norm) {
+      deduplicated.push(item);
+      continue;
+    }
+    if (!seenNorms.has(norm)) {
+      seenNorms.add(norm);
+      deduplicated.push(item);
+    }
+  }
+
+  return deduplicated;
+}

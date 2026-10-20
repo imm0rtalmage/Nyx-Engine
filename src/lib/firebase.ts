@@ -15,6 +15,8 @@ import {
 import { 
   getFirestore, 
   initializeFirestore,
+  persistentLocalCache,
+  persistentSingleTabManager,
   memoryLocalCache,
   setLogLevel,
   collection as firebaseCollection, 
@@ -29,7 +31,6 @@ import {
   where,
   orderBy,
   addDoc as firebaseAddDoc,
-  writeBatch as firebaseWriteBatch,
   DocumentReference,
   WithFieldValue,
   UpdateData,
@@ -77,17 +78,31 @@ if (isFirebaseConfigured) {
     try {
       db = firestoreDatabaseId
         ? initializeFirestore(app, {
-            localCache: memoryLocalCache()
+            localCache: persistentLocalCache({
+              tabManager: persistentSingleTabManager({})
+            })
           }, firestoreDatabaseId)
         : initializeFirestore(app, {
-            localCache: memoryLocalCache()
+            localCache: persistentLocalCache({
+              tabManager: persistentSingleTabManager({})
+            })
           });
     } catch {
       try {
-        db = firestoreDatabaseId ? getFirestore(app, firestoreDatabaseId) : getFirestore(app);
-      } catch (dbErr) {
-        console.warn("Firestore initialization error (falling back to local storage):", dbErr);
-        db = null;
+        db = firestoreDatabaseId
+          ? initializeFirestore(app, {
+              localCache: memoryLocalCache()
+            }, firestoreDatabaseId)
+          : initializeFirestore(app, {
+              localCache: memoryLocalCache()
+            });
+      } catch {
+        try {
+          db = firestoreDatabaseId ? getFirestore(app, firestoreDatabaseId) : getFirestore(app);
+        } catch (dbErr) {
+          console.warn("Firestore initialization error (falling back to local storage):", dbErr);
+          db = null;
+        }
       }
     }
   } catch (appErr) {
@@ -106,36 +121,84 @@ try {
   // ignore
 }
 
+// Quota tracker for Firestore free tier limits (avoids spamming backoff retries when daily writes are exhausted)
+let quotaExhausted = false;
+let quotaExhaustedUntil = 0;
+
+export function isFirestoreQuotaExhausted(): boolean {
+  if (!quotaExhausted) {
+    if (typeof window !== "undefined") {
+      try {
+        const stored = sessionStorage.getItem("nyx_firestore_quota_exhausted");
+        if (stored) {
+          const resetTime = parseInt(stored, 10);
+          if (Date.now() < resetTime) {
+            quotaExhausted = true;
+            quotaExhaustedUntil = resetTime;
+            return true;
+          } else {
+            sessionStorage.removeItem("nyx_firestore_quota_exhausted");
+          }
+        }
+      } catch {}
+    }
+    return false;
+  }
+  if (Date.now() > quotaExhaustedUntil) {
+    quotaExhausted = false;
+    if (typeof window !== "undefined") {
+      try {
+        sessionStorage.removeItem("nyx_firestore_quota_exhausted");
+      } catch {}
+    }
+    return false;
+  }
+  return true;
+}
+
+export function markFirestoreQuotaExhausted(cooldownMs: number = 3600000) {
+  const nextReset = Date.now() + cooldownMs;
+  if (!quotaExhausted || nextReset > quotaExhaustedUntil) {
+    quotaExhausted = true;
+    quotaExhaustedUntil = nextReset;
+    if (typeof window !== "undefined") {
+      try {
+        sessionStorage.setItem("nyx_firestore_quota_exhausted", String(quotaExhaustedUntil));
+        window.dispatchEvent(new CustomEvent("nyx:firestore-quota-exhausted", {
+          detail: {
+            exhaustedUntil: quotaExhaustedUntil,
+            message: "Firestore daily free write quota reached. Seamlessly running in Offline Local Mode."
+          }
+        }));
+      } catch {}
+    }
+  }
+}
+
 // Suppress benign sandbox WebSocket rejections (HMR disabled in container), zombie client ID, and unprovisioned Firestore database warnings
 if (typeof window !== "undefined") {
-  // Clean up any stale IndexedDB database instances to prevent write stream buffer exhaustion across sessions
-  if (window.indexedDB && window.indexedDB.databases) {
-    try {
-      window.indexedDB.databases().then((dbs) => {
-        dbs.forEach((dbInfo) => {
-          if (dbInfo.name && (dbInfo.name.includes("firestore") || dbInfo.name.includes("[DEFAULT]"))) {
-            try {
-              window.indexedDB.deleteDatabase(dbInfo.name);
-            } catch {}
-          }
-        });
-      }).catch(() => {});
-    } catch {}
-  }
+  const isIgnorableFirestoreError = (msg: string) => {
+    return (
+      msg.includes("Failed to set zombie client id") || 
+      msg.includes("zombie client id") || 
+      msg.includes("Database '(default)' not found") || 
+      msg.includes("auth/invalid-api-key") ||
+      msg.includes("invalid-api-key") ||
+      msg.includes("resource-exhausted") ||
+      msg.includes("Quota limit exceeded") ||
+      msg.includes("Free daily write units per project") ||
+      msg.includes("maximum backoff delay") ||
+      msg.includes("to prevent overloading the backend")
+    );
+  };
 
   const originalWarn = console.warn;
   console.warn = (...args: any[]) => {
     const msg = args.map(a => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
-    if (
-      msg.includes("@firebase/firestore") || 
-      msg.includes("Database '(default)' not found") || 
-      msg.includes("zombie client id") || 
-      msg.includes("Failed to set zombie client id") ||
-      msg.includes("auth/invalid-api-key") ||
-      msg.includes("Write stream exhausted maximum allowed queued writes") ||
-      msg.includes("resource-exhausted") ||
-      msg.includes("maximum backoff delay")
-    ) {
+    if (msg.includes("@firebase/firestore") || isIgnorableFirestoreError(msg)) {
+      if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units")) {
+        markFirestoreQuotaExhausted();
+      }
       return;
     }
     originalWarn.apply(console, args);
@@ -144,15 +207,10 @@ if (typeof window !== "undefined") {
   const originalError = console.error;
   console.error = (...args: any[]) => {
     const msg = args.map(a => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
-    if (
-      msg.includes("Failed to set zombie client id") || 
-      msg.includes("zombie client id") || 
-      msg.includes("Database '(default)' not found") ||
-      msg.includes("auth/invalid-api-key") ||
-      msg.includes("Write stream exhausted maximum allowed queued writes") ||
-      msg.includes("resource-exhausted") ||
-      msg.includes("maximum backoff delay")
-    ) {
+    if (msg.includes("@firebase/firestore") || isIgnorableFirestoreError(msg)) {
+      if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units")) {
+        markFirestoreQuotaExhausted();
+      }
       return;
     }
     originalError.apply(console, args);
@@ -163,12 +221,16 @@ if (typeof window !== "undefined") {
     if (
       msg.includes("auth/invalid-api-key") ||
       msg.includes("invalid-api-key") ||
-      msg.includes("Write stream exhausted") ||
+      msg.includes("Firebase: Error (auth/invalid-api-key)") ||
       msg.includes("resource-exhausted") ||
-      msg.includes("Firebase: Error (auth/invalid-api-key)")
+      msg.includes("Quota limit exceeded") ||
+      msg.includes("Free daily write units per project") ||
+      msg.includes("maximum backoff delay")
     ) {
       event.preventDefault();
-      console.warn("Intercepted unhandled Firebase stream backoff - operating smoothly in resilient local mode.");
+      if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units")) {
+        markFirestoreQuotaExhausted();
+      }
     }
   });
 
@@ -181,11 +243,16 @@ if (typeof window !== "undefined") {
       reason.includes("vite") || 
       reason.includes("Database '(default)' not found") ||
       reason.includes("zombie client id") ||
-      reason.includes("Write stream exhausted") ||
+      reason.includes("Firestore") ||
       reason.includes("resource-exhausted") ||
-      reason.includes("Firestore")
+      reason.includes("Quota limit exceeded") ||
+      reason.includes("Free daily write units per project") ||
+      reason.includes("maximum backoff delay")
     ) {
       event.preventDefault();
+      if (reason.includes("resource-exhausted") || reason.includes("Quota limit exceeded") || reason.includes("Free daily write units")) {
+        markFirestoreQuotaExhausted();
+      }
     }
   });
 }
@@ -330,9 +397,35 @@ export function onSnapshot(...args: any[]): any {
     return () => {};
   }
   try {
+    const errorCallbackIdx = typeof args[2] === "function" ? 2 : (typeof args[1] === "function" ? -1 : 1);
+    if (errorCallbackIdx === 2) {
+      const origErr = args[2];
+      args[2] = (err: any) => {
+        const msg = err?.message || String(err || "");
+        if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units") || err?.code === "resource-exhausted") {
+          markFirestoreQuotaExhausted();
+          return;
+        }
+        origErr(err);
+      };
+    } else if (errorCallbackIdx === 1 && args[1] && typeof args[1] === "object" && typeof args[1].error === "function") {
+      const origErr = args[1].error;
+      args[1].error = (err: any) => {
+        const msg = err?.message || String(err || "");
+        if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units") || err?.code === "resource-exhausted") {
+          markFirestoreQuotaExhausted();
+          return;
+        }
+        origErr(err);
+      };
+    }
+
     return (firebaseOnSnapshot as any)(...args);
-  } catch (err) {
-    console.warn("onSnapshot caught gracefully:", err);
+  } catch (err: any) {
+    const msg = err?.message || String(err || "");
+    if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || err?.code === "resource-exhausted") {
+      markFirestoreQuotaExhausted();
+    }
     return () => {};
   }
 }
@@ -343,7 +436,11 @@ export async function getDoc(reference: any): Promise<any> {
   }
   try {
     return await firebaseGetDoc(reference);
-  } catch (err) {
+  } catch (err: any) {
+    const msg = err?.message || String(err || "");
+    if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || err?.code === "resource-exhausted") {
+      markFirestoreQuotaExhausted();
+    }
     return Promise.resolve({ exists: () => false, data: () => null });
   }
 }
@@ -354,140 +451,76 @@ export async function getDocs(reference: any): Promise<any> {
   }
   try {
     return await firebaseGetDocs(reference);
-  } catch (err) {
+  } catch (err: any) {
+    const msg = err?.message || String(err || "");
+    if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || err?.code === "resource-exhausted") {
+      markFirestoreQuotaExhausted();
+    }
     return Promise.resolve({ empty: true, docs: [] });
   }
 }
 
-// In-flight write scheduler with concurrency limiting and backoff smoothing
-const writeQueue: Array<() => Promise<void>> = [];
-let activeWrites = 0;
-const MAX_CONCURRENT_WRITES = 4;
-
-async function processWriteQueue() {
-  if (activeWrites >= MAX_CONCURRENT_WRITES || writeQueue.length === 0) {
-    return;
-  }
-  const nextWrite = writeQueue.shift();
-  if (!nextWrite) return;
-
-  activeWrites++;
-  try {
-    await nextWrite();
-  } catch {
-    // Graceful containment
-  } finally {
-    activeWrites--;
-    setTimeout(processWriteQueue, 20);
-  }
-}
-
-export function queueWrite(fn: () => Promise<void>): Promise<void> {
-  return new Promise((resolve) => {
-    writeQueue.push(async () => {
-      try {
-        await fn();
-      } catch {
-        // Handled internally
-      }
-      resolve();
-    });
-    processWriteQueue();
-  });
-}
-
 export async function deleteDoc(reference: any): Promise<void> {
-  if (!isFirebaseConfigured || !reference || !db) {
+  if (!isFirebaseConfigured || !reference || !db || isFirestoreQuotaExhausted()) {
     return Promise.resolve();
   }
-  return queueWrite(async () => {
-    try {
-      await firebaseDeleteDoc(reference);
-    } catch {
-      // Ignored
+  try {
+    return await firebaseDeleteDoc(reference);
+  } catch (err: any) {
+    const msg = err?.message || String(err || "");
+    if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units") || err?.code === "resource-exhausted") {
+      markFirestoreQuotaExhausted();
     }
-  });
+    return Promise.resolve();
+  }
 }
 
 export async function setDoc<T>(reference: any, data: any, options?: any): Promise<void> {
-  if (!isFirebaseConfigured || !reference || !db) {
+  if (!isFirebaseConfigured || !reference || !db || isFirestoreQuotaExhausted()) {
     return Promise.resolve();
   }
-  return queueWrite(async () => {
-    try {
-      const sanitizedData = sanitizeForFirestore(data);
-      await firebaseSetDoc(reference, sanitizedData, options);
-    } catch (err: any) {
-      if (err?.code === "resource-exhausted" || err?.message?.includes("resource-exhausted")) {
-        // Backoff slightly to allow stream to clear
-        await new Promise(r => setTimeout(r, 800));
-      }
+  try {
+    const sanitizedData = sanitizeForFirestore(data);
+    return await firebaseSetDoc(reference, sanitizedData, options);
+  } catch (err: any) {
+    const msg = err?.message || String(err || "");
+    if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units") || err?.code === "resource-exhausted") {
+      markFirestoreQuotaExhausted();
     }
-  });
+    return Promise.resolve();
+  }
 }
 
 export async function updateDoc(reference: any, data: any): Promise<void> {
-  if (!isFirebaseConfigured || !reference || !db) {
+  if (!isFirebaseConfigured || !reference || !db || isFirestoreQuotaExhausted()) {
     return Promise.resolve();
   }
-  return queueWrite(async () => {
-    try {
-      const sanitizedData = sanitizeForFirestore(data);
-      await firebaseUpdateDoc(reference, sanitizedData);
-    } catch (err: any) {
-      if (err?.code === "resource-exhausted" || err?.message?.includes("resource-exhausted")) {
-        await new Promise(r => setTimeout(r, 800));
-      }
+  try {
+    const sanitizedData = sanitizeForFirestore(data);
+    return await firebaseUpdateDoc(reference, sanitizedData);
+  } catch (err: any) {
+    const msg = err?.message || String(err || "");
+    if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units") || err?.code === "resource-exhausted") {
+      markFirestoreQuotaExhausted();
     }
-  });
+    return Promise.resolve();
+  }
 }
 
 export async function addDoc<T>(reference: any, data: any): Promise<any> {
-  if (!isFirebaseConfigured || !reference || !db) {
+  if (!isFirebaseConfigured || !reference || !db || isFirestoreQuotaExhausted()) {
     return Promise.resolve({ id: `local_${Date.now()}` });
   }
-  return new Promise((resolve) => {
-    queueWrite(async () => {
-      try {
-        const sanitizedData = sanitizeForFirestore(data);
-        const res = await firebaseAddDoc(reference, sanitizedData);
-        resolve(res);
-      } catch {
-        resolve({ id: `local_${Date.now()}` });
-      }
-    });
-  });
-}
-
-/**
- * Batches multiple setDoc operations into single atomic network commits of up to 400 docs,
- * eliminating write stream buffer exhaustion and redundant roundtrips.
- */
-export async function batchSetDocs(
-  items: Array<{ ref: any; data: any; options?: any }>
-): Promise<void> {
-  if (!isFirebaseConfigured || !db || !items || items.length === 0) {
-    return Promise.resolve();
-  }
-  return queueWrite(async () => {
-    const chunkSize = 250;
-    for (let i = 0; i < items.length; i += chunkSize) {
-      const chunk = items.slice(i, i + chunkSize);
-      try {
-        const batch = firebaseWriteBatch(db);
-        for (const item of chunk) {
-          if (item && item.ref && item.data) {
-            batch.set(item.ref, sanitizeForFirestore(item.data), item.options || { merge: true });
-          }
-        }
-        await batch.commit();
-      } catch (err: any) {
-        if (err?.code === "resource-exhausted" || err?.message?.includes("resource-exhausted")) {
-          await new Promise(r => setTimeout(r, 1200));
-        }
-      }
+  try {
+    const sanitizedData = sanitizeForFirestore(data);
+    return await firebaseAddDoc(reference, sanitizedData);
+  } catch (err: any) {
+    const msg = err?.message || String(err || "");
+    if (msg.includes("resource-exhausted") || msg.includes("Quota limit exceeded") || msg.includes("Free daily write units") || err?.code === "resource-exhausted") {
+      markFirestoreQuotaExhausted();
     }
-  });
+    return Promise.resolve({ id: `local_${Date.now()}` });
+  }
 }
 
 export enum OperationType {

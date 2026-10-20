@@ -11,8 +11,11 @@ import {
   User, Ghost, Scroll, MapPin, Rocket, Shield, Flag, Lock, Unlock, XCircle, Heart,
   Maximize2, Minimize2, Copy, ChevronDown, ChevronUp, Sliders, Type, Save,
   Bold, Italic, Code as CodeIcon, Quote, List as ListIcon, BookOpen, Square, Loader2, Plus, Zap, Info, Layers, Database, Coins, Globe,
-  Pin, SlidersHorizontal
+  Pin, SlidersHorizontal, MoreVertical, Cpu, Box
 } from "lucide-react";
+import { Scene3DConfig, DEFAULT_SCENE_3D_CONFIG, Prop3DItem } from "../types";
+import { Scene3DDiorama } from "./Scene3DDiorama";
+import { Scene3DToolbar } from "./Scene3DToolbar";
 import { THEME_PRESETS, CHAT_BG_PRESETS, BUBBLE_STYLE_PRESETS } from "../utils/themes";
 import ThematicDashboardBanner, { getDynamicArchetype } from "./ThematicDashboardBanner";
 import ChatMessageMarkdown from "./ChatMessageMarkdown";
@@ -25,7 +28,7 @@ import { GooglePickerButton } from "./GooglePickerButton";
 import { SaveToDrivePickerModal } from "./SaveToDrivePickerModal";
 import { ContextHUDModal } from "./ContextHUDModal";
 import { AuthorStyleModal } from "./AuthorStyleModal";
-import { computeGranularLoreContext } from "../lib/nyxLoreEngine";
+import { computeGranularLoreContext, normalizeCharacterName } from "../lib/nyxLoreEngine";
 import { useFunnyLoading, triggerNextLoreFact } from "../utils/useFunnyLoading";
 import { LoreCodexModal } from "./LoreCodexModal";
 import { TokenBreakdownModal } from "./TokenBreakdownModal";
@@ -58,8 +61,8 @@ interface AdventureChatProps {
   project: Project;
   messages: Message[];
   characters: CharacterProfile[];
-  onSendMessage: (text: string, thinkingLevel: string, attachments?: any[]) => Promise<void>;
-  onRegenerateResponse: (thinkingLevel: string, targetMessageId?: string) => Promise<void>;
+  onSendMessage: (text: string, thinkingLevel: string, attachments?: any[], selectedModel?: string) => Promise<void>;
+  onRegenerateResponse: (thinkingLevel: string, targetMessageId?: string, selectedModel?: string) => Promise<void>;
   onSelectMessageVersion?: (messageId: string, versionIndex: number) => void;
   onEditMessage: (id: string, newContent: string) => void;
   onDeleteMessage: (id: string) => void;
@@ -498,7 +501,40 @@ export default function AdventureChat({
       return () => clearTimeout(timer);
     }
   }, [inputText, projectId]);
-  const [thinkingLevel, setThinkingLevel] = useState("Low");
+  const [thinkingLevel, setThinkingLevel] = useState<string>(() => {
+    return project.thinkingLevel || "Low";
+  });
+  const [selectedModel, setSelectedModel] = useState<string>(() => {
+    return project.selectedModel || "gemini-3.8-flash";
+  });
+
+  useEffect(() => {
+    if (project.selectedModel) {
+      setSelectedModel(project.selectedModel);
+    }
+  }, [project.selectedModel]);
+
+  useEffect(() => {
+    if (project.thinkingLevel) {
+      setThinkingLevel(project.thinkingLevel);
+    }
+  }, [project.thinkingLevel]);
+
+  const handleModelChange = useCallback((model: "gemini-3.8-flash" | "gemini-4-argon") => {
+    setSelectedModel(model);
+    onSetProjectValue("selectedModel", model);
+    onShowToast?.(
+      "Storyteller Engine Switched", 
+      `Active model set to ${model === "gemini-4-argon" ? "Gemini 4.0 Argon (Complex Narrative Synthesis)" : "Gemini 3.8 Flash (High Speed & Adaptive Prose)"}`,
+      "info"
+    );
+  }, [onSetProjectValue, onShowToast]);
+
+  const handleThinkingChange = useCallback((tier: string) => {
+    setThinkingLevel(tier);
+    onSetProjectValue("thinkingLevel", tier);
+  }, [onSetProjectValue]);
+
   const [generatingElapsedSeconds, setGeneratingElapsedSeconds] = useState(0);
 
   useEffect(() => {
@@ -518,9 +554,130 @@ export default function AdventureChat({
 
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
+  const [showChatToolsDropdown, setShowChatToolsDropdown] = useState(false);
+
+  // 3D Narrative Diorama Stage State
+  const [show3DStage, setShow3DStage] = useState<boolean>(() => project.show3DStage ?? false);
+  const [isExpanded3DFullscreen, setIsExpanded3DFullscreen] = useState<boolean>(false);
+  const [scene3DConfig, setScene3DConfig] = useState<Scene3DConfig>(() => project.scene3DConfig || DEFAULT_SCENE_3D_CONFIG);
+  const [selectedPropId, setSelectedPropId] = useState<string | null>(null);
+  const [selectedPlacingType, setSelectedPlacingType] = useState<string | null>(null);
+  const [isSyncingAI, setIsSyncingAI] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (project.scene3DConfig) {
+      setScene3DConfig(project.scene3DConfig);
+    }
+  }, [project.scene3DConfig]);
+
+  useEffect(() => {
+    if (project.show3DStage !== undefined) {
+      setShow3DStage(project.show3DStage);
+    }
+  }, [project.show3DStage]);
+
+  const handleUpdateScene3DConfig = useCallback((newConfig: Scene3DConfig) => {
+    setScene3DConfig(newConfig);
+    onSetProjectValue("scene3DConfig", newConfig);
+  }, [onSetProjectValue]);
+
+  const handlePlacePropAtPosition = useCallback((position: [number, number, number]) => {
+    if (!selectedPlacingType) return;
+    const newPropId = `prop-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const newProp: Prop3DItem = {
+      id: newPropId,
+      type: selectedPlacingType,
+      name: selectedPlacingType.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase()),
+      position: [position[0], 0, position[2]],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1]
+    };
+    const updatedProps = [...scene3DConfig.props, newProp];
+    const updatedConfig: Scene3DConfig = {
+      ...scene3DConfig,
+      props: updatedProps
+    };
+    handleUpdateScene3DConfig(updatedConfig);
+    setSelectedPropId(newPropId);
+    setSelectedPlacingType(null);
+    onShowToast?.("🎯 Prop Placed", `Added ${newProp.name} to 3D Stage.`, "success");
+  }, [selectedPlacingType, scene3DConfig, handleUpdateScene3DConfig, onShowToast]);
+
+  const handleSyncSceneWithAI = useCallback(async () => {
+    setIsSyncingAI(true);
+    try {
+      const lastStoryMessages = [...messages]
+        .reverse()
+        .filter(m => m.role === "nyx" || m.role === "assistant")
+        .slice(0, 3)
+        .map(m => m.content)
+        .reverse()
+        .join("\n\n");
+
+      const sceneText = lastStoryMessages || project.description || project.customInstructions || "A mysterious atmospheric fantasy scene";
+
+      const res = await safeFetchJson<{
+        preset: Scene3DConfig["preset"];
+        groundTexture: Scene3DConfig["groundTexture"];
+        ambientColor: string;
+        ambientIntensity: number;
+        keyLightColor: string;
+        keyLightIntensity: number;
+        fogColor: string;
+        fogDensity: number;
+        particles: Scene3DConfig["particles"];
+        sceneTitle: string;
+        props: Prop3DItem[];
+      }>("/api/parse-scene-3d", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sceneText,
+          currentConfig: scene3DConfig
+        })
+      });
+
+      if (res) {
+        const newConfig: Scene3DConfig = {
+          ...scene3DConfig,
+          preset: res.preset || scene3DConfig.preset,
+          groundTexture: res.groundTexture || scene3DConfig.groundTexture,
+          ambientColor: res.ambientColor || scene3DConfig.ambientColor,
+          ambientIntensity: res.ambientIntensity ?? scene3DConfig.ambientIntensity,
+          keyLightColor: res.keyLightColor || scene3DConfig.keyLightColor,
+          keyLightIntensity: res.keyLightIntensity ?? scene3DConfig.keyLightIntensity,
+          fogColor: res.fogColor || scene3DConfig.fogColor,
+          fogDensity: res.fogDensity ?? scene3DConfig.fogDensity,
+          particles: res.particles || scene3DConfig.particles,
+          sceneTitle: res.sceneTitle || "Narrative Scene",
+          props: res.props && res.props.length > 0 ? res.props : scene3DConfig.props
+        };
+        handleUpdateScene3DConfig(newConfig);
+        onShowToast?.("✨ 3D Scene Synchronized", `Generated atmospheric diorama: "${newConfig.sceneTitle}"`, "success");
+      }
+    } catch (err: any) {
+      console.warn("Scene 3D parse failed:", err);
+      onShowToast?.("Sync Notice", "Using narrative atmosphere heuristics.", "info");
+    } finally {
+      setIsSyncingAI(false);
+    }
+  }, [messages, project.description, project.customInstructions, scene3DConfig, handleUpdateScene3DConfig, onShowToast]);
+
+  const [isSmallScreen, setIsSmallScreen] = useState<boolean>(() => {
+    return typeof window !== "undefined" ? window.innerWidth < 768 : false;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleResize = () => setIsSmallScreen(window.innerWidth < 768);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  const isEffectiveMobile = Boolean(isMobileLite || isSmallScreen);
 
   const [showLeftPanel, setShowLeftPanel] = useState<boolean>(() => {
-    if (isMobileLite) return false;
+    if (isMobileLite || (typeof window !== "undefined" && window.innerWidth < 768)) return false;
     try {
       const saved = safeLocalStorage.getItem("project_settings_open");
       return saved !== null ? saved === "true" : false;
@@ -537,6 +694,8 @@ export default function AdventureChat({
       return false;
     }
   });
+
+  const isEffectivePinned = isLeftPanelPinned && !isEffectiveMobile;
 
   useEffect(() => {
     try {
@@ -1009,7 +1168,13 @@ export default function AdventureChat({
         setLoreTab(loreType as any);
       }
       if (targetId) {
-        const found = characters.find(c => c.id === targetId || c.name.toLowerCase() === targetId.toLowerCase() || c.name.toLowerCase().includes(targetId.toLowerCase()));
+        const normTarget = normalizeCharacterName(targetId);
+        const found = characters.find(c => 
+          c.id === targetId || 
+          c.name.toLowerCase() === targetId.toLowerCase() || 
+          (normTarget && normalizeCharacterName(c.name) === normTarget) ||
+          c.name.toLowerCase().includes(targetId.toLowerCase())
+        );
         if (found) {
           if (found.type) setLoreTab(found.type as any);
           setExpandedEntityId(found.id);
@@ -1870,10 +2035,66 @@ export default function AdventureChat({
         return;
       }
 
-      if (cmd === "/hud" || cmd === "/context" || cmd === "/memory") {
+      if (cmd === "/hud" || cmd === "/memory") {
         setShowContextHUDModal(true);
         setInputText("");
         return;
+      }
+
+      if (cmd === "/ground" || cmd === "/location" || (cmd === "/context" && arg)) {
+        const rawContent = (cmd === "/ground" || cmd === "/location") ? arg : (arg.startsWith("add ") ? arg.slice(4).trim() : arg);
+        if (rawContent && rawContent !== "hud" && rawContent !== "view") {
+          let formatted = rawContent;
+          if (cmd === "/location" && !formatted.toLowerCase().startsWith("location")) {
+            formatted = `Location: ${formatted}`;
+          }
+          const current = project.persistentContext || "";
+          let updated = current;
+          if (!current.includes(formatted)) {
+            updated = current ? `${current}\n- ${formatted}` : `- ${formatted}`;
+          }
+          await onSetProjectValue("persistentContext", updated);
+          onShowToast?.("📌 Grounding Context Added", `Pinned to persistent grounding context:\n"${formatted}"`, "success");
+          setInputText("");
+          return;
+        } else {
+          setShowContextHUDModal(true);
+          setInputText("");
+          return;
+        }
+      }
+
+      if (cmd === "/context") {
+        setShowContextHUDModal(true);
+        setInputText("");
+        return;
+      }
+    }
+
+    // Natural Language Manual Grounding Directive detection (e.g. "Add location: Rear Terrace to context")
+    const isAddContextDirective = 
+      /add\s+.*to\s+(?:grounding\s+)?context/i.test(txt) ||
+      /^\[?add\s+location\s*:/i.test(txt) ||
+      /^\[?add\s+to\s+(?:grounding\s+)?context\s*:/i.test(txt);
+
+    if (isAddContextDirective) {
+      let extractedEntry = "";
+      const match1 = txt.match(/add\s+(?:location\s*:\s*|to\s+(?:grounding\s+)?context\s*:\s*|location\s+)?(.+?)(?:\s+to\s+(?:grounding\s+)?context)?[\]\.]*$/i);
+      if (match1 && match1[1]?.trim()) {
+        const raw = match1[1].trim().replace(/^\[|\]$/g, "");
+        extractedEntry = (/location/i.test(txt) && !raw.toLowerCase().startsWith("location")) ? `Location: ${raw}` : raw;
+      } else {
+        extractedEntry = txt.replace(/^\[?add\s+/i, "").replace(/\s+to\s+(?:grounding\s+)?context[\]\.]*$/i, "").trim();
+      }
+
+      if (extractedEntry) {
+        const current = project.persistentContext || "";
+        let updated = current;
+        if (!current.includes(extractedEntry)) {
+          updated = current ? `${current}\n- ${extractedEntry}` : `- ${extractedEntry}`;
+        }
+        await onSetProjectValue("persistentContext", updated);
+        onShowToast?.("📌 Grounding Context Added", `Pinned to persistent grounding context:\n"${extractedEntry}"`, "success");
       }
     }
 
@@ -1881,7 +2102,7 @@ export default function AdventureChat({
     try {
       safeLocalStorage.removeItem(`nyx_chat_draft_${project.id}`);
     } catch {}
-    await onSendMessage(txt, thinkingLevel, assistantAttachments);
+    await onSendMessage(txt, thinkingLevel, assistantAttachments, selectedModel);
     setAssistantAttachments([]);
   };
 
@@ -2405,10 +2626,10 @@ export default function AdventureChat({
     <div className={`flex h-full text-slate-100 rounded-2xl overflow-hidden border ${activeTheme.borderColor} ${activeTheme.bgClass} ${activeTheme.fontFamilyClass} relative`}>
       
       {/* FLOATING BACKDROP (WHEN OPEN IN UNPINNED OVERLAY MODE) */}
-      {showLeftPanel && !isLeftPanelPinned && (
+      {showLeftPanel && !isEffectivePinned && (
         <div 
           onClick={() => setShowLeftPanel(false)}
-          className="absolute inset-0 bg-black/40 z-35 backdrop-blur-[1px] transition-opacity duration-200 cursor-pointer"
+          className="absolute inset-0 bg-black/50 z-35 backdrop-blur-[2px] transition-opacity duration-200 cursor-pointer"
           title="Click outside to close Project Settings overlay"
         />
       )}
@@ -2416,11 +2637,11 @@ export default function AdventureChat({
       {/* 1. LEFT PANEL: Dynamic Settings, Themes, and Cast Members */}
       {showLeftPanel && (
         <div 
-          style={{ width: isLeftPanelPinned ? `${leftWidth}%` : undefined }}
+          style={{ width: isEffectivePinned ? `${leftWidth}%` : undefined }}
           className={`h-full flex flex-col overflow-hidden transition-all duration-200 ${activeTheme.cardBgClass} ${
-            isLeftPanelPinned 
+            isEffectivePinned 
               ? `min-w-[320px] max-w-[550px] border-r ${activeTheme.borderColor} shrink-0 relative z-30 shadow-md`
-              : `absolute left-0 top-0 bottom-0 z-40 w-[380px] sm:w-[420px] max-w-[92vw] border-r border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/70 animate-in slide-in-from-left duration-200`
+              : `absolute left-0 top-0 bottom-0 z-40 w-[340px] sm:w-[420px] max-w-[92vw] border-r border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/70 animate-in slide-in-from-left duration-200`
           }`}
         >
           {/* Header */}
@@ -2429,45 +2650,47 @@ export default function AdventureChat({
               <SlidersHorizontal size={14} className="text-purple-400 shrink-0" />
               <span className={`text-xs font-bold uppercase tracking-wider ${activeTheme.accentText} truncate`}>Project Settings</span>
               <span className={`text-[9px] font-mono px-1.5 py-0.2 rounded border shrink-0 ${
-                isLeftPanelPinned 
+                isEffectivePinned 
                   ? "bg-purple-950/90 text-purple-300 border-purple-800/60 font-semibold" 
                   : "bg-slate-900 text-slate-400 border-slate-800"
               }`}>
-                {isLeftPanelPinned ? "PINNED" : "OVERLAY"}
+                {isEffectivePinned ? "PINNED" : "OVERLAY"}
               </span>
             </div>
 
             <div className="flex items-center gap-1 shrink-0">
-              <button
-                type="button"
-                onClick={() => {
-                  const next = !isLeftPanelPinned;
-                  setIsLeftPanelPinned(next);
-                  onShowToast?.(
-                    next ? "Settings Pinned & Docked" : "Settings Floating Overlay",
-                    next 
-                      ? "UI is locked and shifted right to make room for Project Settings." 
-                      : "Settings is now floating over top of the narration UI without shifting it.",
-                    "info"
-                  );
-                }}
-                className={`p-1.5 rounded-lg transition-all cursor-pointer ${
-                  isLeftPanelPinned 
-                    ? "bg-purple-950 text-purple-300 border border-purple-600/50 shadow-sm shadow-purple-950/40" 
-                    : "hover:bg-slate-800 hover:text-slate-200 text-slate-400"
-                }`}
-                title={isLeftPanelPinned ? "Unpin (Float over top of narration UI as overlay)" : "Pin & Dock (Shift narration UI and lock panel)"}
-              >
-                <Pin size={13} className={isLeftPanelPinned ? "rotate-45 text-purple-400 fill-purple-400/40" : ""} />
-              </button>
+              {!isEffectiveMobile && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !isLeftPanelPinned;
+                    setIsLeftPanelPinned(next);
+                    onShowToast?.(
+                      next ? "Settings Pinned & Docked" : "Settings Floating Overlay",
+                      next 
+                        ? "UI is locked and shifted right to make room for Project Settings." 
+                        : "Settings is now floating over top of the narration UI without shifting it.",
+                      "info"
+                    );
+                  }}
+                  className={`p-1.5 rounded-lg transition-all cursor-pointer ${
+                    isLeftPanelPinned 
+                      ? "bg-purple-950 text-purple-300 border border-purple-600/50 shadow-sm shadow-purple-950/40" 
+                      : "hover:bg-slate-800 hover:text-slate-200 text-slate-400"
+                  }`}
+                  title={isLeftPanelPinned ? "Unpin (Float over top of narration UI as overlay)" : "Pin & Dock (Shift narration UI and lock panel)"}
+                >
+                  <Pin size={13} className={isLeftPanelPinned ? "rotate-45 text-purple-400 fill-purple-400/40" : ""} />
+                </button>
+              )}
 
               <button 
                 type="button"
                 onClick={() => setShowLeftPanel(false)}
                 className="text-slate-400 hover:text-white p-1.5 rounded hover:bg-slate-800 transition-colors cursor-pointer"
-                title="Collapse Project Settings"
+                title="Close Project Settings"
               >
-                <ChevronLeft size={14} />
+                <X size={15} />
               </button>
             </div>
           </div>
@@ -5333,241 +5556,489 @@ export default function AdventureChat({
             )}
           </div>
 
-          <div className="flex items-center gap-1 sm:gap-2 shrink-0 max-w-full overflow-x-auto scrollbar-none py-0.5">
-            {/* Thinking / Model tier selector */}
-            <div className="flex items-center gap-1 bg-slate-950/80 p-0.5 rounded-lg border border-slate-800/80 shrink-0">
-              {[
-                { id: "Low", label: "Low", full: "Flash-Latest (Low Thinking / Fast & Token-Efficient)" },
-                { id: "Medium", label: "Medium", full: "Flash-Latest (Medium Thinking / Balanced Detail)" },
-                { id: "High", label: "High", full: "Flash-Latest (High Thinking / Multi-Narrative Synthesis)" }
-              ].map(tier => (
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0 py-0.5">
+            {/* Model & Thinking Tier Selector */}
+            <div className="flex items-center gap-1 bg-slate-950/90 p-0.5 rounded-lg border border-slate-800/80 shrink-0">
+              {/* Model Choice: 3.8 Flash vs 4.0 Argon */}
+              <div className="flex items-center bg-slate-900/90 p-0.5 rounded-md border border-slate-800/60">
                 <button
-                  key={tier.id}
-                  onClick={() => setThinkingLevel(tier.id)}
-                  className={`px-1.5 sm:px-2 py-0.5 rounded text-[9.5px] font-semibold font-mono transition-all cursor-pointer ${
-                    thinkingLevel === tier.id 
-                      ? "bg-purple-600 text-white shadow shadow-purple-900" 
+                  type="button"
+                  onClick={() => handleModelChange("gemini-3.8-flash")}
+                  className={`px-1.5 sm:px-2 py-0.5 rounded text-[9.5px] font-bold font-mono transition-all cursor-pointer flex items-center gap-1 ${
+                    selectedModel === "gemini-3.8-flash"
+                      ? "bg-purple-600 text-white shadow shadow-purple-900"
                       : "text-slate-400 hover:text-slate-200"
                   }`}
-                  title={tier.full}
+                  title="3.8 Flash (Fast & Adaptive Storytelling)"
                 >
-                  {tier.label}
+                  <Zap size={10} className={selectedModel === "gemini-3.8-flash" ? "text-purple-200" : "text-slate-500"} />
+                  <span>3.8 Flash</span>
                 </button>
-              ))}
+                <button
+                  type="button"
+                  onClick={() => handleModelChange("gemini-4-argon")}
+                  className={`px-1.5 sm:px-2 py-0.5 rounded text-[9.5px] font-bold font-mono transition-all cursor-pointer flex items-center gap-1 ${
+                    selectedModel === "gemini-4-argon"
+                      ? "bg-indigo-600 text-white shadow shadow-indigo-900"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                  title="4.0 Argon (Deep Reasoning & Narrative Synthesis)"
+                >
+                  <Cpu size={10} className={selectedModel === "gemini-4-argon" ? "text-indigo-200" : "text-slate-500"} />
+                  <span>4.0 Argon</span>
+                </button>
+              </div>
+
+              {/* Reasoning Tiers: Low | Med | High */}
+              <div className="flex items-center gap-0.5 pl-0.5">
+                {[
+                  { id: "Low", label: "Low", full: `${selectedModel === "gemini-4-argon" ? "4.0 Argon" : "3.8 Flash"} • Low Thinking (Fast, direct prose)` },
+                  { id: "Medium", label: "Med", full: `${selectedModel === "gemini-4-argon" ? "4.0 Argon" : "3.8 Flash"} • Med Thinking (Balanced character depth)` },
+                  { id: "High", label: "High", full: `${selectedModel === "gemini-4-argon" ? "4.0 Argon" : "3.8 Flash"} • High Thinking (Complex narrative synthesis)` }
+                ].map(tier => (
+                  <button
+                    key={tier.id}
+                    type="button"
+                    onClick={() => handleThinkingChange(tier.id)}
+                    className={`px-1.5 sm:px-2 py-0.5 rounded text-[9.5px] font-semibold font-mono transition-all cursor-pointer ${
+                      thinkingLevel === tier.id 
+                        ? (selectedModel === "gemini-4-argon" ? "bg-indigo-600 text-white shadow shadow-indigo-950" : "bg-purple-600 text-white shadow shadow-purple-900") 
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                    title={tier.full}
+                  >
+                    {tier.label}
+                  </button>
+                ))}
+              </div>
             </div>
 
-            {/* Quick Turn Token Inspector Button */}
-            {messages.length > 0 && (
+            {/* MOBILE COMPACT TOOLS MENU (< sm) */}
+            <div className="relative sm:hidden">
+              <button
+                type="button"
+                onClick={() => setShowChatToolsDropdown(prev => !prev)}
+                className={`p-1.5 rounded-lg border transition-all flex items-center justify-center cursor-pointer ${
+                  showChatToolsDropdown
+                    ? "bg-purple-950 text-purple-200 border-purple-500 shadow-sm"
+                    : "bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200"
+                }`}
+                title="Story Tools & Actions"
+              >
+                <MoreVertical size={14} />
+              </button>
+
+              {showChatToolsDropdown && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    onClick={() => setShowChatToolsDropdown(false)}
+                  />
+                  <div className="absolute right-0 top-full mt-1.5 w-56 bg-slate-950 border border-purple-900/60 rounded-xl shadow-2xl p-1.5 z-50 flex flex-col gap-1 text-xs animate-in fade-in zoom-in-95 duration-150">
+                    {/* Font Size Adjuster in Mobile Menu */}
+                    <div className="flex items-center justify-between px-2 py-1.5 bg-slate-900/80 rounded-lg border border-slate-800">
+                      <span className="text-[10px] font-mono text-slate-400">Font Size:</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => handleStepFontSize(-1)}
+                          disabled={currentFontSizeKey === FONT_SIZE_KEYS[0]}
+                          className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold text-slate-400 hover:text-purple-300 disabled:opacity-30 cursor-pointer"
+                        >
+                          A-
+                        </button>
+                        <span className="text-[10px] font-mono font-semibold text-purple-300 px-1 min-w-[28px] text-center select-none">
+                          {currentFontSizeObj.px}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleStepFontSize(1)}
+                          disabled={currentFontSizeKey === FONT_SIZE_KEYS[FONT_SIZE_KEYS.length - 1]}
+                          className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold text-slate-400 hover:text-purple-300 disabled:opacity-30 cursor-pointer"
+                        >
+                          A+
+                        </button>
+                      </div>
+                    </div>
+                    {/* Model & Reasoning Selector in Mobile Menu */}
+                    <div className="flex flex-col gap-1 p-1.5 bg-slate-900/80 rounded-lg border border-slate-800">
+                      <div className="text-[10px] font-mono font-semibold text-slate-400">Storyteller Model:</div>
+                      <div className="grid grid-cols-2 gap-1">
+                        <button
+                          type="button"
+                          onClick={() => handleModelChange("gemini-3.8-flash")}
+                          className={`px-2 py-1 rounded text-[10px] font-mono font-bold flex items-center justify-center gap-1 cursor-pointer transition-all ${
+                            selectedModel === "gemini-3.8-flash" ? "bg-purple-600 text-white shadow shadow-purple-900" : "bg-slate-950 text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          <Zap size={10} /> 3.8 Flash
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleModelChange("gemini-4-argon")}
+                          className={`px-2 py-1 rounded text-[10px] font-mono font-bold flex items-center justify-center gap-1 cursor-pointer transition-all ${
+                            selectedModel === "gemini-4-argon" ? "bg-indigo-600 text-white shadow shadow-indigo-900" : "bg-slate-950 text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          <Cpu size={10} /> 4.0 Argon
+                        </button>
+                      </div>
+                      <div className="text-[10px] font-mono font-semibold text-slate-400 mt-0.5">Reasoning Budget:</div>
+                      <div className="grid grid-cols-3 gap-1">
+                        {["Low", "Medium", "High"].map(tier => (
+                          <button
+                            key={tier}
+                            type="button"
+                            onClick={() => handleThinkingChange(tier)}
+                            className={`px-1.5 py-1 rounded text-[10px] font-mono font-semibold text-center cursor-pointer transition-all ${
+                              thinkingLevel === tier
+                                ? (selectedModel === "gemini-4-argon" ? "bg-indigo-600 text-white" : "bg-purple-600 text-white")
+                                : "bg-slate-950 text-slate-400 hover:text-white"
+                            }`}
+                          >
+                            {tier === "Medium" ? "Med" : tier}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* 3D Stage Diorama */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowChatToolsDropdown(false);
+                        const next = !show3DStage;
+                        setShow3DStage(next);
+                        onSetProjectValue("show3DStage", next);
+                      }}
+                      className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-purple-300 hover:text-purple-100 hover:bg-purple-950/50 transition-colors text-left cursor-pointer"
+                    >
+                      <Box size={13} className="text-purple-400 shrink-0" />
+                      <span>{show3DStage ? "Hide 3D Stage" : "3D Stage Diorama"}</span>
+                    </button>
+
+                    {/* Cinema Mode */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowChatToolsDropdown(false);
+                        handleToggleCinemaMode();
+                      }}
+                      className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-slate-300 hover:text-purple-200 hover:bg-slate-900 transition-colors text-left cursor-pointer"
+                    >
+                      <Sparkle size={13} className="text-purple-400 shrink-0" />
+                      <span>{cinemaMode ? "Exit Cinema Mode" : "Cinema Mode"}</span>
+                    </button>
+
+                    {/* Story Archives */}
+                    {onOpenStoryArchives && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowChatToolsDropdown(false);
+                          onOpenStoryArchives();
+                        }}
+                        className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-purple-300 hover:text-purple-100 hover:bg-purple-950/50 transition-colors text-left cursor-pointer"
+                      >
+                        <BookOpen size={13} className="text-purple-400 shrink-0" />
+                        <span>Story Archives</span>
+                      </button>
+                    )}
+
+                    {/* Lore Codex */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowChatToolsDropdown(false);
+                        setIsLoreCodexOpen(true);
+                      }}
+                      className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-amber-300 hover:text-amber-100 hover:bg-amber-950/40 transition-colors text-left cursor-pointer"
+                    >
+                      <Sparkles size={13} className="text-amber-400 shrink-0" />
+                      <span>Lore Codex</span>
+                    </button>
+
+                    {/* Import Narrative */}
+                    <label className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-900 transition-colors cursor-pointer text-left">
+                      <Download size={13} className="rotate-180 text-purple-400 shrink-0" />
+                      <span>Import Transcript</span>
+                      <input
+                        type="file"
+                        accept=".json,.txt"
+                        className="hidden"
+                        onChange={async (e) => {
+                          setShowChatToolsDropdown(false);
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          try {
+                            const text = await file.text();
+                            let importedMsgs: any[] = [];
+                            if (file.name.endsWith(".json")) {
+                              const parsed = JSON.parse(text);
+                              importedMsgs = Array.isArray(parsed) ? parsed : (parsed.messages || []);
+                            } else {
+                              importedMsgs = text.split("\n\n").map((chunk, idx) => ({
+                                id: `imported-${Date.now()}-${idx}`,
+                                role: idx % 2 === 0 ? "user" : "nyx",
+                                content: chunk.trim(),
+                                timestamp: Date.now()
+                              }));
+                            }
+                            if (importedMsgs.length > 0) {
+                              onSetProjectValue("messages", [...messages, ...importedMsgs]);
+                              onShowToast?.("📥 Narrative Imported!", `Loaded ${importedMsgs.length} message(s).`, "success");
+                            }
+                          } catch (err: any) {
+                            onShowToast?.("Import Error", "Failed to parse imported narrative file.", "error");
+                          }
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+
+                    {/* Export to Google Doc */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowChatToolsDropdown(false);
+                        setShowSaveDrivePickerModal(true);
+                      }}
+                      className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-emerald-300 hover:text-emerald-100 hover:bg-emerald-950/40 transition-colors text-left cursor-pointer"
+                    >
+                      <FileText size={13} className="text-emerald-400 shrink-0" />
+                      <span>Export to Google Doc</span>
+                    </button>
+
+                    {/* Dump to Spark Archive */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowChatToolsDropdown(false);
+                        setSparkThreadTitle(`${project.name} - Thread Log ${new Date().toLocaleDateString()}`);
+                        setShowSparkExportModal(true);
+                      }}
+                      className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-amber-300 hover:text-amber-100 hover:bg-amber-950/40 transition-colors text-left cursor-pointer"
+                    >
+                      <Sparkles size={13} className="text-amber-400 shrink-0" />
+                      <span>Dump to Spark Archive</span>
+                    </button>
+
+                    {/* Clear Log */}
+                    <div className="border-t border-slate-800 my-0.5" />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowChatToolsDropdown(false);
+                        setShowClearLogModal(true);
+                      }}
+                      className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-red-400 hover:text-red-200 hover:bg-red-950/40 transition-colors text-left cursor-pointer"
+                    >
+                      <Trash2 size={13} className="shrink-0" />
+                      <span>Clear Log</span>
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* DESKTOP TOOLBAR (>= sm) */}
+            <div className="hidden sm:flex items-center gap-1 sm:gap-2 shrink-0">
+              {/* Quick Turn Token Inspector Button */}
+              {messages.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const lastAssistant = [...messages].reverse().find(m => m.role === "nyx" || m.role === "assistant") || messages[messages.length - 1];
+                    const lastIdx = messages.findIndex(m => m.id === lastAssistant.id);
+                    setTokenBreakdownTarget({ msg: lastAssistant, index: lastIdx >= 0 ? lastIdx : messages.length - 1 });
+                  }}
+                  className="hidden lg:flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-950/80 border border-slate-800 hover:border-purple-500/60 text-[10px] font-mono text-slate-300 hover:text-purple-200 transition-all cursor-pointer group shadow-xs"
+                  title="View Turn Token Breakdown (Input, Retrieval, Thinking, Output)"
+                >
+                  <Coins size={11} className="text-amber-400 group-hover:text-purple-400 transition-colors shrink-0" />
+                  <span className="font-semibold text-slate-200 group-hover:text-purple-100 tabular-nums">
+                    Turn {messages.length} Tokens
+                  </span>
+                </button>
+              )}
+
+              {/* Font Size Adjuster Stepper */}
+              <div 
+                className="flex items-center gap-0.5 bg-slate-950/80 p-0.5 rounded-lg border border-slate-800/80" 
+                title={`Story & Assistant Font Size: ${currentFontSizeObj.label} (${currentFontSizeObj.px})`}
+              >
+                <button
+                  type="button"
+                  onClick={() => handleStepFontSize(-1)}
+                  disabled={currentFontSizeKey === FONT_SIZE_KEYS[0]}
+                  className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold text-slate-400 hover:text-purple-300 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                  title="Decrease font size"
+                >
+                  A-
+                </button>
+                <span className="text-[9.5px] font-mono font-semibold text-purple-300 px-1 min-w-[28px] text-center select-none">
+                  {currentFontSizeObj.px}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleStepFontSize(1)}
+                  disabled={currentFontSizeKey === FONT_SIZE_KEYS[FONT_SIZE_KEYS.length - 1]}
+                  className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold text-slate-400 hover:text-purple-300 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                  title="Increase font size"
+                >
+                  A+
+                </button>
+              </div>
+
+              {/* 3D Diorama Stage Toggle */}
               <button
                 type="button"
                 onClick={() => {
-                  const lastAssistant = [...messages].reverse().find(m => m.role === "nyx" || m.role === "assistant") || messages[messages.length - 1];
-                  const lastIdx = messages.findIndex(m => m.id === lastAssistant.id);
-                  setTokenBreakdownTarget({ msg: lastAssistant, index: lastIdx >= 0 ? lastIdx : messages.length - 1 });
+                  const next = !show3DStage;
+                  setShow3DStage(next);
+                  onSetProjectValue("show3DStage", next);
                 }}
-                className="hidden lg:flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-950/80 border border-slate-800 hover:border-purple-500/60 text-[10px] font-mono text-slate-300 hover:text-purple-200 transition-all cursor-pointer group shadow-xs"
-                title="View Turn Token Breakdown (Input, Retrieval, Thinking, Output)"
+                className={`p-1.5 sm:px-2.5 sm:py-1 rounded-lg text-xs font-mono font-semibold transition-all border flex items-center gap-1.5 cursor-pointer shadow-xs ${
+                  show3DStage 
+                    ? "bg-purple-950/90 text-purple-200 border-purple-500/60 shadow-lg shadow-purple-950/40" 
+                    : "bg-slate-950/80 text-slate-400 border-slate-800 hover:text-slate-200 hover:bg-slate-900"
+                }`}
+                title={show3DStage ? "Hide 3D Stage Panel" : "Open 3D Stage Diorama Split View"}
               >
-                <Coins size={11} className="text-amber-400 group-hover:text-purple-400 transition-colors shrink-0" />
-                <span className="font-semibold text-slate-200 group-hover:text-purple-100 tabular-nums">
-                  Turn {messages.length} Tokens
-                </span>
+                <Box size={13} className={show3DStage ? "text-purple-400 shrink-0" : "text-slate-400 shrink-0"} />
+                <span className="text-[10px] hidden sm:inline">{show3DStage ? "3D Active" : "3D Stage"}</span>
               </button>
-            )}
 
-            {/* Font Size Adjuster Stepper */}
-            <div 
-              className="flex items-center gap-0.5 bg-slate-950/80 p-0.5 rounded-lg border border-slate-800/80" 
-              title={`Story & Assistant Font Size: ${currentFontSizeObj.label} (${currentFontSizeObj.px})`}
-            >
+              {/* Cinema mode toggle */}
               <button
-                type="button"
-                onClick={() => handleStepFontSize(-1)}
-                disabled={currentFontSizeKey === FONT_SIZE_KEYS[0]}
-                className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold text-slate-400 hover:text-purple-300 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
-                title="Decrease font size"
+                onClick={handleToggleCinemaMode}
+                className={`p-1.5 rounded-lg text-xs font-mono font-semibold transition-all border flex items-center gap-1 cursor-pointer ${
+                  cinemaMode 
+                    ? "bg-purple-950/80 text-purple-200 border-purple-500/50 shadow-lg shadow-purple-950/40" 
+                    : "bg-slate-950/80 text-slate-400 border-slate-800 hover:text-slate-200 hover:bg-slate-900"
+                }`}
+                title={cinemaMode ? "Exit Fullscreen / Cinema Mode (F11 or Esc)" : "Fullscreen / Cinema Mode (F11)"}
               >
-                A-
+                {cinemaMode ? (
+                  <>
+                    <svg className="w-3.5 h-3.5 text-purple-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M10 14l-7 7" />
+                    </svg>
+                    <span className="text-[10px] hidden sm:inline">Exit Cinema</span>
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-3.5 h-3.5 text-slate-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+                    </svg>
+                    <span className="text-[10px] hidden sm:inline">Cinema Mode</span>
+                  </>
+                )}
               </button>
-              <span className="text-[9.5px] font-mono font-semibold text-purple-300 px-1 min-w-[28px] text-center select-none">
-                {currentFontSizeObj.px}
-              </span>
+
+              {/* Import Narrative Log Button */}
+              <label
+                className="text-[10px] text-purple-300 hover:text-purple-100 font-mono bg-purple-950/40 hover:bg-purple-900/60 px-2 py-1 rounded-lg border border-purple-800/50 transition-all cursor-pointer flex items-center gap-1"
+                title="Import a saved narrative file (.json / .txt)"
+              >
+                <Download size={11} className="rotate-180 shrink-0" />
+                <span className="hidden sm:inline">Import</span>
+                <input
+                  type="file"
+                  accept=".json,.txt"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    try {
+                      const text = await file.text();
+                      let importedMsgs: any[] = [];
+                      if (file.name.endsWith(".json")) {
+                        const parsed = JSON.parse(text);
+                        importedMsgs = Array.isArray(parsed) ? parsed : (parsed.messages || []);
+                      } else {
+                        importedMsgs = text.split("\n\n").map((chunk, idx) => ({
+                          id: `imported-${Date.now()}-${idx}`,
+                          role: idx % 2 === 0 ? "user" : "nyx",
+                          content: chunk.trim(),
+                          timestamp: Date.now()
+                        }));
+                      }
+                      if (importedMsgs.length > 0) {
+                        onSetProjectValue("messages", [...messages, ...importedMsgs]);
+                        onShowToast?.("📥 Narrative Imported!", `Loaded ${importedMsgs.length} message(s).`, "success");
+                      }
+                    } catch (err: any) {
+                      onShowToast?.("Import Error", "Failed to parse imported narrative file.", "error");
+                    }
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+
+              {/* Export to Google Doc */}
+              <button
+                onClick={() => setShowSaveDrivePickerModal(true)}
+                className="text-[10px] text-emerald-300 hover:text-emerald-100 font-mono bg-emerald-950/40 hover:bg-emerald-900/60 px-2 py-1 rounded-lg border border-emerald-800/50 transition-all cursor-pointer flex items-center gap-1"
+                title="Save / Export active narrative transcript directly to Google Drive"
+              >
+                <FileText size={11} className="shrink-0" />
+                <span className="hidden sm:inline">Export</span>
+              </button>
+
+              {/* Dump to Spark Archive */}
+              <button
+                onClick={() => {
+                  setSparkThreadTitle(`${project.name} - Thread Log ${new Date().toLocaleDateString()}`);
+                  setShowSparkExportModal(true);
+                }}
+                className="text-[10px] text-amber-300 hover:text-amber-100 font-mono bg-amber-950/40 hover:bg-amber-900/60 px-2 py-1 rounded-lg border border-amber-800/50 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+                title="Dump transcript to 01_Raw_Threads in Google Drive for background Spark processing"
+              >
+                <Sparkles size={11} className="text-amber-400 shrink-0" />
+                <span className="hidden sm:inline">Dump to Spark Archive</span>
+              </button>
+
+              {onOpenStoryArchives && (
+                <button
+                  type="button"
+                  onClick={onOpenStoryArchives}
+                  className="text-[10px] text-purple-300 hover:text-purple-100 font-mono bg-purple-950/60 hover:bg-purple-900/80 p-1.5 sm:px-2.5 sm:py-1 rounded-lg border border-purple-800/50 hover:border-purple-600/60 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+                  title="Browse and restore saved story transcripts and campaign logs"
+                >
+                  <BookOpen size={11} className="text-purple-400 shrink-0" />
+                  <span className="hidden sm:inline">Story Archives</span>
+                </button>
+              )}
+
               <button
                 type="button"
-                onClick={() => handleStepFontSize(1)}
-                disabled={currentFontSizeKey === FONT_SIZE_KEYS[FONT_SIZE_KEYS.length - 1]}
-                className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold text-slate-400 hover:text-purple-300 disabled:opacity-30 disabled:hover:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed"
-                title="Increase font size"
+                onClick={() => setIsLoreCodexOpen(true)}
+                className="text-[10px] text-amber-300 hover:text-amber-100 font-mono bg-amber-950/40 hover:bg-amber-900/60 p-1.5 sm:px-2.5 sm:py-1 rounded-lg border border-amber-800/50 hover:border-amber-600/60 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+                title="Open Did You Know? Lore Codex archives to explore deep universe trivia"
               >
-                A+
+                <Sparkles size={11} className="text-amber-400 shrink-0" />
+                <span className="hidden sm:inline">Lore Codex</span>
+              </button>
+
+              <button
+                onClick={() => setShowClearLogModal(true)}
+                className="text-[10px] text-slate-400 hover:text-red-300 font-mono bg-slate-950 hover:bg-red-950/40 p-1.5 sm:px-2 sm:py-1 rounded-lg border border-slate-800 hover:border-red-800/50 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
+                title="Clear active story narrative log"
+              >
+                <Trash2 size={11} className="text-slate-500 group-hover:text-red-400 shrink-0" />
+                <span className="hidden sm:inline">Clear</span>
               </button>
             </div>
-
-            {/* Cinema mode toggle */}
-            <button
-              onClick={handleToggleCinemaMode}
-              className={`p-1.5 rounded-lg text-xs font-mono font-semibold transition-all border flex items-center gap-1 ${
-                cinemaMode 
-                  ? "bg-purple-950/80 text-purple-200 border-purple-500/50 shadow-lg shadow-purple-950/40" 
-                  : "bg-slate-950/80 text-slate-400 border-slate-800 hover:text-slate-200 hover:bg-slate-900"
-              }`}
-              title={cinemaMode ? "Exit Fullscreen / Cinema Mode (F11 or Esc)" : "Fullscreen / Cinema Mode (F11)"}
-            >
-              {cinemaMode ? (
-                <>
-                  <svg className="w-3.5 h-3.5 text-purple-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M10 14l-7 7" />
-                  </svg>
-                  <span className="text-[10px] hidden sm:inline">Exit Cinema</span>
-                </>
-              ) : (
-                <>
-                  <svg className="w-3.5 h-3.5 text-slate-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
-                  </svg>
-                  <span className="text-[10px] hidden sm:inline">Cinema Mode</span>
-                </>
-              )}
-            </button>
-
-            {/* Import Narrative Log Button */}
-            <label
-              className="text-[10px] text-purple-300 hover:text-purple-100 font-mono bg-purple-950/40 hover:bg-purple-900/60 px-2 py-1 rounded-lg border border-purple-800/50 transition-all cursor-pointer flex items-center gap-1"
-              title="Import a saved narrative file (.json / .txt)"
-            >
-              <Download size={11} className="rotate-180 shrink-0" />
-              <span className="hidden sm:inline">Import</span>
-              <input
-                type="file"
-                accept=".json,.txt"
-                className="hidden"
-                onChange={async (e) => {
-                  const file = e.target.files?.[0];
-                  if (!file) return;
-                  try {
-                    const text = await file.text();
-                    let importedMsgs: any[] = [];
-                    if (file.name.endsWith(".json")) {
-                      const parsed = JSON.parse(text);
-                      importedMsgs = Array.isArray(parsed) ? parsed : (parsed.messages || []);
-                    } else {
-                      importedMsgs = text.split("\n\n").map((chunk, idx) => ({
-                        id: `imported-${Date.now()}-${idx}`,
-                        role: idx % 2 === 0 ? "user" : "nyx",
-                        content: chunk.trim(),
-                        timestamp: Date.now()
-                      }));
-                    }
-                    if (importedMsgs.length > 0) {
-                      onSetProjectValue("messages", [...messages, ...importedMsgs]);
-                      onShowToast?.("📥 Narrative Imported!", `Loaded ${importedMsgs.length} message(s).`, "success");
-                    }
-                  } catch (err: any) {
-                    onShowToast?.("Import Error", "Failed to parse imported narrative file.", "error");
-                  }
-                  e.target.value = "";
-                }}
-              />
-            </label>
-
-            {/* Export to Google Doc */}
-            <button
-              onClick={() => setShowSaveDrivePickerModal(true)}
-              className="text-[10px] text-emerald-300 hover:text-emerald-100 font-mono bg-emerald-950/40 hover:bg-emerald-900/60 px-2 py-1 rounded-lg border border-emerald-800/50 transition-all cursor-pointer flex items-center gap-1"
-              title="Save / Export active narrative transcript directly to Google Drive"
-            >
-              <FileText size={11} className="shrink-0" />
-              <span className="hidden sm:inline">Export</span>
-            </button>
-
-            {/* Dump to Spark Archive */}
-            <button
-              onClick={() => {
-                setSparkThreadTitle(`${project.name} - Thread Log ${new Date().toLocaleDateString()}`);
-                setShowSparkExportModal(true);
-              }}
-              className="text-[10px] text-amber-300 hover:text-amber-100 font-mono bg-amber-950/40 hover:bg-amber-900/60 px-2 py-1 rounded-lg border border-amber-800/50 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
-              title="Dump transcript to 01_Raw_Threads in Google Drive for background Spark processing"
-            >
-              <Sparkles size={11} className="text-amber-400 shrink-0" />
-              <span className="hidden sm:inline">Dump to Spark Archive</span>
-            </button>
-
-            {/* Save to Google Drive Picker Modal */}
-            {showSaveDrivePickerModal && (
-              <SaveToDrivePickerModal
-                isOpen={true}
-                onClose={() => setShowSaveDrivePickerModal(false)}
-                googleToken={googleToken}
-                onGoogleSignIn={onGoogleSignIn}
-                exportTitle={`${project.name} - Official Narrative Log`}
-                exportContent={messages.map(m => `[${m.role.toUpperCase()} - ${formatMsgTimestamp(m.timestamp)}]:\n${m.content}`).join("\n\n---\n\n")}
-                onExportSuccess={(docId) => {
-                  onSetProjectValue("persistentContextDocId", docId);
-                }}
-                onShowToast={onShowToast}
-              />
-            )}
-
-            {/* Author Style & Literary Anti-Drift Modal */}
-            {showAuthorStyleModal && (
-              <AuthorStyleModal
-                isOpen={true}
-                onClose={() => setShowAuthorStyleModal(false)}
-                currentAuthors={localCreatorNames || project.creatorNames || ""}
-                onSelectAuthor={(authorName) => {
-                  setLocalCreatorNames(authorName);
-                  onSetProjectValue("creatorNames", authorName);
-                }}
-                onAnchorStyle={(authorName) => {
-                  setLocalCreatorNames(authorName);
-                  onSetProjectValue("creatorNames", authorName);
-                }}
-                onPurgeDrift={(authorName) => {
-                  setInputText((prev) => {
-                    const reminder = `[Narrator directive: Strict adherence to ${authorName}'s literary style requested. Avoid generic assistant prose, eliminate repetitious dialogue, and ground narration in concrete sensory textures.]\n\n`;
-                    return reminder + prev;
-                  });
-                }}
-                onShowToast={onShowToast}
-              />
-            )}
-
-            {onOpenStoryArchives && (
-              <button
-                type="button"
-                onClick={onOpenStoryArchives}
-                className="text-[10px] text-purple-300 hover:text-purple-100 font-mono bg-purple-950/60 hover:bg-purple-900/80 p-1.5 sm:px-2.5 sm:py-1 rounded-lg border border-purple-800/50 hover:border-purple-600/60 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
-                title="Browse and restore saved story transcripts and campaign logs"
-              >
-                <BookOpen size={11} className="text-purple-400 shrink-0" />
-                <span className="hidden sm:inline">Story Archives</span>
-              </button>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setIsLoreCodexOpen(true)}
-              className="text-[10px] text-amber-300 hover:text-amber-100 font-mono bg-amber-950/40 hover:bg-amber-900/60 p-1.5 sm:px-2.5 sm:py-1 rounded-lg border border-amber-800/50 hover:border-amber-600/60 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
-              title="Open Did You Know? Lore Codex archives to explore deep universe trivia"
-            >
-              <Sparkles size={11} className="text-amber-400 shrink-0" />
-              <span className="hidden sm:inline">Lore Codex</span>
-            </button>
-
-            <button
-              onClick={() => setShowClearLogModal(true)}
-              className="text-[10px] text-slate-400 hover:text-red-300 font-mono bg-slate-950 hover:bg-red-950/40 p-1.5 sm:px-2 sm:py-1 rounded-lg border border-slate-800 hover:border-red-800/50 transition-all cursor-pointer flex items-center gap-1 shadow-sm"
-              title="Clear active story narrative log"
-            >
-              <Trash2 size={11} className="text-slate-500 group-hover:text-red-400 shrink-0" />
-              <span className="hidden sm:inline">Clear</span>
-            </button>
           </div>
         </div>
 
-        {/* Messages Feed */}
-        <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-3 sm:py-6 space-y-4 sm:space-y-6 z-10 flex flex-col justify-start">
+        {/* Main Content Area: Split View between Narrative Chat Log and 3D Diorama Stage */}
+        <div className="flex-1 flex flex-col lg:flex-row min-h-0 relative overflow-hidden">
+          {/* Left Panel: Narrative Chat Log */}
+          <div className={`flex-1 flex flex-col min-h-0 min-w-0 transition-all ${isExpanded3DFullscreen ? "hidden" : "flex"}`}>
+            {/* Messages Feed */}
+            <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-3 sm:py-6 space-y-4 sm:space-y-6 z-10 flex flex-col justify-start">
           {messages.length === 0 && (
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-lg mx-auto space-y-3">
               <div className="w-12 h-12 rounded-2xl bg-purple-950/40 border border-purple-800/30 flex items-center justify-center text-purple-400 shadow-inner">
@@ -5633,7 +6104,7 @@ export default function AdventureChat({
                   onDeleteMessage={onDeleteMessage}
                   onMessageClick={handleMessageClick}
                   onStoreFact={handleStoreFact}
-                  onRegenerateResponse={onRegenerateResponse}
+                  onRegenerateResponse={(lvl, id) => onRegenerateResponse(lvl, id, selectedModel)}
                   onSelectMessageVersion={onSelectMessageVersion}
                   onOpenTokenBreakdown={(targetMsg, targetIdx) => {
                     setTokenBreakdownTarget({ msg: targetMsg, index: targetIdx });
@@ -5647,7 +6118,6 @@ export default function AdventureChat({
                   currentFontSizeClass={currentFontSizeObj?.class || "text-xs"}
                   userNickname={project?.userNickname}
                   characters={characters || []}
-                  allMessages={messages || []}
                   portraitPosition={project?.portraitPosition}
                   thinkingLevel={thinkingLevel}
                   renderPortrait={renderPortrait}
@@ -5674,20 +6144,24 @@ export default function AdventureChat({
                         <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-purple-500"></span>
                       </span>
                       <span className="font-semibold text-purple-200">
-                        {thinkingLevel === "High" 
-                          ? "Deep Reasoning & Context Synthesis Active" 
-                          : thinkingLevel === "Low" 
-                            ? "Fast Narrative Generation Active" 
-                            : "Narrative Generation Active"}
+                        {selectedModel === "gemini-4-argon" ? "4.0 Argon" : "3.8 Flash"} • {
+                          thinkingLevel === "High" 
+                            ? "Deep Reasoning & Context Synthesis Active" 
+                            : thinkingLevel === "Low" 
+                              ? "Fast Narrative Generation Active" 
+                              : "Narrative Generation Active"
+                        }
                       </span>
                       <span className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-medium ${
-                        thinkingLevel === "High" 
-                          ? "bg-purple-900/60 text-purple-300 border border-purple-500/40" 
-                          : thinkingLevel === "Low" 
-                            ? "bg-blue-900/50 text-blue-300 border border-blue-500/30" 
-                            : "bg-slate-800 text-slate-300 border border-slate-700"
+                        selectedModel === "gemini-4-argon"
+                          ? "bg-indigo-900/60 text-indigo-300 border border-indigo-500/40"
+                          : (thinkingLevel === "High" 
+                              ? "bg-purple-900/60 text-purple-300 border border-purple-500/40" 
+                              : thinkingLevel === "Low" 
+                                ? "bg-blue-900/50 text-blue-300 border border-blue-500/30" 
+                                : "bg-slate-800 text-slate-300 border border-slate-700")
                       }`}>
-                        {thinkingLevel} Thinking
+                        {selectedModel === "gemini-4-argon" ? "4.0 Argon" : "3.8 Flash"} ({thinkingLevel})
                       </span>
                     </div>
 
@@ -5765,6 +6239,42 @@ export default function AdventureChat({
           </AnimatePresence>
 
           <div ref={messagesEndRef} />
+            </div>
+          </div>
+
+          {/* Right Panel: 3D Stage Diorama Split Panel */}
+          {show3DStage && (
+            <div className={`relative transition-all border-t lg:border-t-0 lg:border-l border-slate-800 bg-slate-950 flex flex-col overflow-hidden ${
+              isExpanded3DFullscreen
+                ? "absolute inset-0 z-30 w-full h-full"
+                : "h-[360px] sm:h-[420px] lg:h-full lg:w-[48%] xl:w-[45%] shrink-0"
+            }`}>
+              <Scene3DDiorama
+                config={scene3DConfig}
+                selectedPropId={selectedPropId}
+                onSelectProp={setSelectedPropId}
+                isPlacingActive={!!selectedPlacingType}
+                onPlacePropAtPosition={handlePlacePropAtPosition}
+              />
+              <Scene3DToolbar
+                config={scene3DConfig}
+                onChangeConfig={handleUpdateScene3DConfig}
+                selectedPropId={selectedPropId}
+                onSelectProp={setSelectedPropId}
+                isPlacingActive={!!selectedPlacingType}
+                onTogglePlacingPropType={setSelectedPlacingType}
+                selectedPlacingType={selectedPlacingType}
+                onSyncSceneWithAI={handleSyncSceneWithAI}
+                isSyncingAI={isSyncingAI}
+                onCloseSplitView={() => {
+                  setShow3DStage(false);
+                  onSetProjectValue("show3DStage", false);
+                }}
+                isExpandedFullscreen={isExpanded3DFullscreen}
+                onToggleFullscreen={() => setIsExpanded3DFullscreen(prev => !prev)}
+              />
+            </div>
+          )}
         </div>
 
         {/* Input area */}
@@ -5956,10 +6466,33 @@ export default function AdventureChat({
                 <Lock size={10} className={project.creatorNames ? "text-emerald-400" : "text-slate-500"} />
               </button>
 
-              {/* RAG Grounding Active Anchor Badge */}
-              <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono bg-slate-900 px-2 py-0.5 rounded-lg border border-slate-800">
-                <Brain size={11} className="text-purple-400 shrink-0" />
-                <span>RAG Grounding: Active</span>
+              {/* RAG Grounding Active Anchor Badge & Quick Add Context */}
+              <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono bg-slate-900 px-2 py-0.5 rounded-lg border border-slate-800">
+                  <Brain size={11} className="text-purple-400 shrink-0" />
+                  <span>RAG Grounding: Active</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const raw = window.prompt("Manually pin fact, location, or state to Grounding Context:", "Location: Rear Terrace");
+                    if (raw && raw.trim()) {
+                      const trimmed = raw.trim();
+                      const current = project.persistentContext || "";
+                      let updated = current;
+                      if (!current.includes(trimmed)) {
+                        updated = current ? `${current}\n- ${trimmed}` : `- ${trimmed}`;
+                      }
+                      onSetProjectValue("persistentContext", updated);
+                      onShowToast?.("📌 Added to Grounding Context", `Pinned to persistent grounding context:\n"${trimmed}"`, "success");
+                    }
+                  }}
+                  className="flex items-center gap-1 text-[10px] text-emerald-300 hover:text-emerald-100 font-mono bg-emerald-950/70 hover:bg-emerald-900/80 px-2 py-0.5 rounded-lg border border-emerald-800/60 hover:border-emerald-600 transition-colors cursor-pointer shadow-xs"
+                  title="Manually pin location, state delta, or fact to persistent grounding context"
+                >
+                  <MapPin size={10} className="text-emerald-400 shrink-0" />
+                  <span>+ Context</span>
+                </button>
               </div>
             </div>
           )}
@@ -5987,185 +6520,186 @@ export default function AdventureChat({
             </div>
           )}
 
-          <div className="flex items-center gap-1.5 sm:gap-2 relative">
-            {/* Action Toggles & Attachment Buttons */}
-            <div className="relative shrink-0 flex items-center gap-1">
-              {/* Pacing & Config Toggle Button */}
-              <button
-                type="button"
-                onClick={() => setShowPacingControls(prev => !prev)}
-                className={`flex items-center justify-center p-1.5 sm:p-2 rounded-xl border transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5 ${
-                  showPacingControls
-                    ? "bg-purple-950/80 border-purple-500/80 text-purple-200 shadow-sm shadow-purple-950/50"
-                    : "bg-slate-950 border-slate-800 hover:bg-slate-900"
-                }`}
-                title={showPacingControls ? "Hide Narrative Pacing & Token Controls" : "Show Narrative Pacing & Token Controls"}
-              >
-                <Sliders size={14} className={showPacingControls ? "text-purple-400" : "text-slate-400"} />
-              </button>
+          <div className="flex flex-col gap-1.5 w-full">
+            {/* Action Toggles, Attachment Buttons & Formatting Bar */}
+            <div className="flex items-center justify-between gap-1.5 overflow-x-auto no-scrollbar py-0.5">
+              <div className="flex items-center gap-1 shrink-0">
+                {/* Pacing & Config Toggle Button */}
+                <button
+                  type="button"
+                  onClick={() => setShowPacingControls(prev => !prev)}
+                  className={`flex items-center justify-center p-1.5 sm:p-2 rounded-xl border transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5 cursor-pointer ${
+                    showPacingControls
+                      ? "bg-purple-950/80 border-purple-500/80 text-purple-200 shadow-sm shadow-purple-950/50"
+                      : "bg-slate-950 border-slate-800 hover:bg-slate-900"
+                  }`}
+                  title={showPacingControls ? "Hide Narrative Pacing & Token Controls" : "Show Narrative Pacing & Token Controls"}
+                >
+                  <Sliders size={14} className={showPacingControls ? "text-purple-400" : "text-slate-400"} />
+                </button>
 
-              {/* Author Style & Literary Anti-Drift Engine Quick Button */}
-              <button
-                type="button"
-                onClick={() => setShowAuthorStyleModal(true)}
-                className={`flex items-center justify-center p-1.5 sm:p-2 rounded-xl border transition-all h-8.5 w-8.5 sm:h-9.5 sm:w-9.5 cursor-pointer ${
-                  project.creatorNames
-                    ? "bg-purple-950/80 border-purple-500/60 text-purple-200 hover:bg-purple-900/80 shadow-sm"
-                    : "bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-                }`}
-                title={`Author Style & Anti-Drift Engine: ${project.creatorNames || "Master Literary Fiction"}`}
-              >
-                <Palette size={14} className={project.creatorNames ? "text-purple-300" : "text-slate-400"} />
-              </button>
+                {/* Author Style & Literary Anti-Drift Engine Quick Button */}
+                <button
+                  type="button"
+                  onClick={() => setShowAuthorStyleModal(true)}
+                  className={`flex items-center justify-center p-1.5 sm:p-2 rounded-xl border transition-all h-8.5 w-8.5 sm:h-9.5 sm:w-9.5 cursor-pointer ${
+                    project.creatorNames
+                      ? "bg-purple-950/80 border-purple-500/60 text-purple-200 hover:bg-purple-900/80 shadow-sm"
+                      : "bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-900"
+                  }`}
+                  title={`Author Style & Anti-Drift Engine: ${project.creatorNames || "Master Literary Fiction"}`}
+                >
+                  <Palette size={14} className={project.creatorNames ? "text-purple-300" : "text-slate-400"} />
+                </button>
 
-              {/* File Attachment Button */}
-              <label className="flex items-center justify-center p-1.5 sm:p-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl cursor-pointer transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5" title="Attach local files (Up to 10)">
-                <Paperclip size={14} className="text-purple-400 hover:text-purple-300" />
-                <input 
-                  type="file" 
-                  multiple
-                  onChange={handleAssistantFileChange} 
-                  className="hidden" 
-                />
-              </label>
+                {/* File Attachment Button */}
+                <label className="flex items-center justify-center p-1.5 sm:p-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl cursor-pointer transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5" title="Attach local files (Up to 10)">
+                  <Paperclip size={14} className="text-purple-400 hover:text-purple-300" />
+                  <input 
+                    type="file" 
+                    multiple
+                    onChange={handleAssistantFileChange} 
+                    className="hidden" 
+                  />
+                </label>
 
-              {/* Google Drive Picker Button (collapses on very small screens) */}
-              <button
-                type="button"
-                onClick={() => {
-                  if (!googleToken) {
-                    onShowToast?.("Google Drive Required", "Please click 'Connect Drive' in the top header to select files directly from Google Drive.", "info");
-                    return;
-                  }
-                  setShowWorkspaceBrowser("drive");
-                }}
-                className="hidden xs:flex items-center justify-center p-1.5 sm:p-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5"
-                title="Select documents from Google Drive"
-              >
-                <FolderOpen size={14} className="text-blue-400 hover:text-blue-300" />
-              </button>
-            </div>
+                {/* Google Drive Picker Button */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!googleToken) {
+                      onShowToast?.("Google Drive Required", "Please click 'Connect Drive' in the top header to select files directly from Google Drive.", "info");
+                      return;
+                    }
+                    setShowWorkspaceBrowser("drive");
+                  }}
+                  className="flex items-center justify-center p-1.5 sm:p-2 bg-slate-950 hover:bg-slate-900 border border-slate-800 rounded-xl transition-all text-slate-400 hover:text-slate-200 h-8.5 w-8.5 sm:h-9.5 sm:w-9.5 cursor-pointer"
+                  title="Select documents from Google Drive"
+                >
+                  <FolderOpen size={14} className="text-blue-400 hover:text-blue-300" />
+                </button>
+              </div>
 
-            {/* Chat Form Input */}
-            <form onSubmit={handleSend} className="flex-1 flex gap-2 items-end relative">
-              <div className="flex-1 flex flex-col gap-1 relative">
-                <div className="flex items-center justify-between px-1 gap-2 flex-wrap">
-                  <div className="flex items-center gap-1 flex-wrap">
-                    {inputText.trim().length > 0 && (
-                      <div className="flex items-center gap-1.5 px-2 py-0.5 text-[9px] font-mono text-purple-300 bg-purple-950/80 border border-purple-800/50 rounded-md w-fit animate-in fade-in duration-150">
-                        <Save size={9} className="text-purple-400 shrink-0" />
-                        <span>Draft ({inputText.trim().split(/\s+/).filter(Boolean).length}w | {inputText.length}c)</span>
-                      </div>
-                    )}
-
-                    {/* Markdown Quick Formatting Toolbar */}
-                    <div className="flex items-center gap-0.5 bg-slate-950/90 px-1 py-0.5 rounded-lg border border-slate-800 shadow-xs">
-                      <button
-                        type="button"
-                        onClick={() => handleInsertMarkdown("bold", chatInputRef)}
-                        className="px-1.5 py-0.5 rounded text-[10px] font-bold text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer"
-                        title="Bold (**text**)"
-                      >
-                        <Bold size={11} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleInsertMarkdown("italic", chatInputRef)}
-                        className="px-1.5 py-0.5 rounded text-[10px] italic text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer"
-                        title="Italic (*text*)"
-                      >
-                        <Italic size={11} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleInsertMarkdown("code", chatInputRef)}
-                        className="px-1.5 py-0.5 rounded text-[10px] font-mono text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer"
-                        title="Inline Code (`code`)"
-                      >
-                        <CodeIcon size={11} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleInsertMarkdown("codeblock", chatInputRef)}
-                        className="px-1.5 py-0.5 rounded text-[9.5px] font-mono text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer hidden sm:inline-flex items-center"
-                        title="Code Block (```\ncode\n```)"
-                      >
-                        {`{ }`}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleInsertMarkdown("quote", chatInputRef)}
-                        className="px-1.5 py-0.5 rounded text-[10px] text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer hidden sm:inline-flex items-center"
-                        title="Blockquote (> quote)"
-                      >
-                        <Quote size={11} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleInsertMarkdown("list", chatInputRef)}
-                        className="px-1.5 py-0.5 rounded text-[10px] text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer hidden sm:inline-flex items-center"
-                        title="List Item (- item)"
-                      >
-                        <ListIcon size={11} />
-                      </button>
-                    </div>
+              {/* Center / Right: Draft status, Markdown toolbar, and Expand */}
+              <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+                {inputText.trim().length > 0 && (
+                  <div className="flex items-center gap-1 px-1.5 py-0.5 text-[9px] font-mono text-purple-300 bg-purple-950/80 border border-purple-800/50 rounded-md">
+                    <Save size={9} className="text-purple-400 shrink-0" />
+                    <span>{inputText.trim().split(/\s+/).filter(Boolean).length}w</span>
                   </div>
+                )}
 
+                {/* Markdown Quick Formatting Toolbar */}
+                <div className="flex items-center gap-0.5 bg-slate-950/90 px-1 py-0.5 rounded-lg border border-slate-800 shadow-xs">
                   <button
                     type="button"
-                    onClick={() => setIsExpandedInput(true)}
-                    className="text-[10px] font-mono text-purple-300 hover:text-purple-100 bg-purple-950/60 hover:bg-purple-900/80 px-2 py-0.5 rounded-md border border-purple-800/50 transition-all flex items-center gap-1 cursor-pointer shadow-xs ml-auto"
-                    title="Expand into Large High-Capacity Narrative Editor"
+                    onClick={() => handleInsertMarkdown("bold", chatInputRef)}
+                    className="px-1.5 py-0.5 rounded text-[10px] font-bold text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer"
+                    title="Bold (**text**)"
                   >
-                    <Maximize2 size={10} className="text-purple-400 shrink-0" />
-                    <span>Expand Editor</span>
+                    <Bold size={11} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInsertMarkdown("italic", chatInputRef)}
+                    className="px-1.5 py-0.5 rounded text-[10px] italic text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer"
+                    title="Italic (*text*)"
+                  >
+                    <Italic size={11} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInsertMarkdown("code", chatInputRef)}
+                    className="px-1.5 py-0.5 rounded text-[10px] font-mono text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer"
+                    title="Inline Code (`code`)"
+                  >
+                    <CodeIcon size={11} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInsertMarkdown("codeblock", chatInputRef)}
+                    className="px-1.5 py-0.5 rounded text-[9.5px] font-mono text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer hidden sm:inline-flex items-center"
+                    title="Code Block (```\ncode\n```)"
+                  >
+                    {`{ }`}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInsertMarkdown("quote", chatInputRef)}
+                    className="px-1.5 py-0.5 rounded text-[10px] text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer hidden sm:inline-flex items-center"
+                    title="Blockquote (> quote)"
+                  >
+                    <Quote size={11} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInsertMarkdown("list", chatInputRef)}
+                    className="px-1.5 py-0.5 rounded text-[10px] text-slate-400 hover:text-purple-300 hover:bg-purple-950/50 transition-colors cursor-pointer hidden sm:inline-flex items-center"
+                    title="List Item (- item)"
+                  >
+                    <ListIcon size={11} />
                   </button>
                 </div>
 
-                <textarea
-                  ref={chatInputRef}
-                  value={inputText}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setInputText(val);
-                    const el = e.currentTarget;
-                    requestAnimationFrame(() => {
-                      if (el) {
-                        el.style.height = "auto";
-                        el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
-                      }
-                    });
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      if (e.ctrlKey || e.metaKey) {
-                        e.preventDefault();
-                        handleSend(e);
-                      }
-                    }
-                  }}
-                  rows={1}
-                  placeholder="Enter actions, dialogue, or commands... (Ctrl+Enter to send, drag bottom edge to expand)"
-                  className={`w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 ${currentFontSizeObj.class} text-slate-100 outline-none focus:ring-1 focus:ring-purple-600 transition-all font-serif resize-y scrollbar-thin min-h-[44px] max-h-[320px]`}
-                />
+                <button
+                  type="button"
+                  onClick={() => setIsExpandedInput(true)}
+                  className="text-[10px] font-mono text-purple-300 hover:text-purple-100 bg-purple-950/60 hover:bg-purple-900/80 px-2 py-0.5 rounded-md border border-purple-800/50 transition-all flex items-center gap-1 cursor-pointer shadow-xs"
+                  title="Expand into Large High-Capacity Narrative Editor"
+                >
+                  <Maximize2 size={10} className="text-purple-400 shrink-0" />
+                  <span className="hidden xs:inline">Expand</span>
+                </button>
               </div>
+            </div>
+
+            {/* Chat Form Input Row */}
+            <form onSubmit={handleSend} className="flex gap-1.5 items-end relative w-full">
+              <textarea
+                ref={chatInputRef}
+                value={inputText}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setInputText(val);
+                  const el = e.currentTarget;
+                  requestAnimationFrame(() => {
+                    if (el) {
+                      el.style.height = "auto";
+                      el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
+                    }
+                  });
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    if (e.ctrlKey || e.metaKey) {
+                      e.preventDefault();
+                      handleSend(e);
+                    }
+                  }
+                }}
+                rows={1}
+                placeholder="Enter actions, dialogue, or commands... (Ctrl+Enter to send)"
+                className={`flex-1 min-w-0 bg-slate-950 border border-slate-800 rounded-xl px-3 sm:px-3.5 py-2.5 ${currentFontSizeObj.class} text-slate-100 outline-none focus:ring-1 focus:ring-purple-600 transition-all font-serif resize-y scrollbar-thin min-h-[44px] max-h-[320px]`}
+              />
+
               {messages.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => onRegenerateResponse(thinkingLevel)}
+                  onClick={() => onRegenerateResponse(thinkingLevel, undefined, selectedModel)}
                   disabled={isGenerating}
-                  className="px-3 py-2 rounded-xl text-xs font-semibold bg-slate-950 hover:bg-slate-900 text-slate-300 hover:text-white border border-slate-800 transition-all flex items-center justify-center gap-1 shrink-0 disabled:opacity-50 h-9.5 cursor-pointer"
+                  className="px-2.5 sm:px-3 py-2 rounded-xl text-xs font-semibold bg-slate-950 hover:bg-slate-900 text-slate-300 hover:text-white border border-slate-800 transition-all flex items-center justify-center gap-1 shrink-0 disabled:opacity-50 h-[44px] min-w-[40px] cursor-pointer"
                   title="Regenerate last storyteller response"
                 >
                   <RefreshCw size={12} className={isGenerating ? "animate-spin" : ""} />
                   <span className="hidden sm:inline">Regen</span>
                 </button>
               )}
+
               {isGenerating && onStopGeneration ? (
                 <button
                   type="button"
                   onClick={onStopGeneration}
-                  className="bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all shrink-0 h-9.5 cursor-pointer shadow-lg shadow-red-950/50 hover:scale-105 active:scale-95 animate-pulse"
+                  className="bg-red-600 hover:bg-red-500 text-white px-3 sm:px-4 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all shrink-0 h-[44px] min-w-[44px] cursor-pointer shadow-lg shadow-red-950/50 hover:scale-105 active:scale-95 animate-pulse"
                   title="Halt storyteller generation"
                 >
                   <Square size={12} className="fill-white" /> <span className="hidden sm:inline">Stop</span>
@@ -6174,7 +6708,7 @@ export default function AdventureChat({
                 <button
                   type="submit"
                   disabled={isGenerating || !inputText.trim()}
-                  className={`text-white px-4 py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors shrink-0 h-9.5 cursor-pointer ${activeTheme.buttonClass}`}
+                  className={`text-white px-3.5 sm:px-4 py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors shrink-0 h-[44px] min-w-[44px] cursor-pointer ${activeTheme.buttonClass}`}
                   title="Send message (Ctrl+Enter)"
                 >
                   <Send size={12} /> <span className="hidden sm:inline">Send</span>
@@ -6196,6 +6730,8 @@ export default function AdventureChat({
           onSetSlidingTurns={(turns) => onSetProjectValue("slidingContextTurns", turns)}
           onUpdateCharacter={onUpdateCharacter}
           onShowToast={onShowToast}
+          persistentContext={project.persistentContext || ""}
+          onSetPersistentContext={(val) => onSetProjectValue("persistentContext", val)}
         />
       )}
 

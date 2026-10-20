@@ -104,13 +104,13 @@ export const AuthorStyleModal: React.FC<AuthorStyleModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-in fade-in duration-200">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/85 backdrop-blur-md p-2.5 sm:p-4 animate-in fade-in duration-200">
       <div 
-        className="relative w-full max-w-4xl max-h-[92vh] flex flex-col bg-slate-950 border border-purple-500/40 rounded-2xl shadow-2xl shadow-purple-950/50 overflow-hidden"
+        className="relative w-full max-w-4xl max-h-[92dvh] flex flex-col bg-slate-950 border border-purple-500/40 rounded-2xl shadow-2xl shadow-purple-950/50 overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-850 bg-slate-900/60 shrink-0">
+        <div className="flex items-center justify-between px-4 py-3 sm:px-6 sm:py-4 border-b border-slate-850 bg-slate-900/60 shrink-0">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-purple-950/90 border border-purple-500/50 flex items-center justify-center text-purple-300 shadow-inner">
               <Feather size={20} />

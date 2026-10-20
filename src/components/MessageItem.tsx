@@ -19,7 +19,6 @@ import { resolveTokenBreakdown, formatTokens } from "../utils/tokenCounter";
 export interface MessageItemProps {
   msg: Message;
   idx: number;
-  allMessages?: Message[];
   isUser: boolean;
   isEditing: boolean;
   editText: string;
@@ -120,7 +119,6 @@ export const MessageItem = memo(function MessageItem({
   currentFontSizeClass,
   userNickname,
   characters,
-  allMessages,
   thinkingLevel,
   renderPortrait,
   turnHeader,
@@ -163,8 +161,8 @@ export const MessageItem = memo(function MessageItem({
   // Derive turn-specific in-context lore log snapshot
   const rawContextList = useMemo(() => {
     if (!msg || msg.role !== "nyx") return [];
-    return getTurnContextSnapshot(msg, allMessages || [], characters || [], idx);
-  }, [msg, allMessages, characters, idx]);
+    return getTurnContextSnapshot(msg, undefined, characters || [], idx);
+  }, [msg, characters, idx]);
 
   const parsedContextBadges = useMemo(() => {
     return (rawContextList || []).map((entry) => parseContextEntityEntry(entry, characters || []));
@@ -247,14 +245,14 @@ export const MessageItem = memo(function MessageItem({
     >
       {/* Visual Game Dialog Box Panel */}
       <div
-        className={`w-full border p-5 rounded-2xl flex flex-col gap-5 transition-all duration-300 relative ${
+        className={`w-full border p-3.5 sm:p-5 rounded-xl sm:rounded-2xl flex flex-col gap-3.5 sm:gap-5 transition-all duration-300 relative ${
           isUser
             ? `${activeThemeUserBubbleClass} ${activeBubbleStyleClass} ${activeBoxBorder}`
             : `${activeThemeNyxBubbleClass} ${activeBubbleStyleClass} ${activeBoxBorder}`
         }`}
       >
         {/* Floating Action corner menu */}
-        <div className="absolute top-2.5 right-2.5 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1.5 bg-slate-950/90 px-2 py-1 rounded-lg backdrop-blur border border-slate-800 z-30">
+        <div className="absolute top-2 right-2 sm:top-2.5 sm:right-2.5 opacity-80 sm:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity flex gap-1 sm:gap-1.5 bg-slate-950/90 px-1.5 sm:px-2 py-1 rounded-lg backdrop-blur border border-slate-800 z-30 shadow-md">
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -336,6 +334,21 @@ export const MessageItem = memo(function MessageItem({
                     tok
                   </span>
                 </button>
+
+                {/* Model & Thinking indicator badge for turn */}
+                {(currentMsgForTurn.modelUsed || currentMsgForTurn.thinkingLevel) && (
+                  <span className="hidden md:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-slate-900/80 border border-slate-800 text-[9px] font-mono text-slate-400">
+                    <span className={currentMsgForTurn.modelUsed?.includes("argon") ? "text-indigo-300 font-semibold" : "text-purple-300 font-semibold"}>
+                      {currentMsgForTurn.modelUsed?.includes("argon") ? "4.0 Argon" : "3.8 Flash"}
+                    </span>
+                    {currentMsgForTurn.thinkingLevel && (
+                      <>
+                        <span className="text-slate-600">•</span>
+                        <span className="text-slate-300">{currentMsgForTurn.thinkingLevel}</span>
+                      </>
+                    )}
+                  </span>
+                )}
 
                 {msgSpeakers.length > 0 && (
                   <span className="text-[9px] text-purple-300/90 font-mono bg-purple-950/60 px-1.5 py-0.5 rounded border border-purple-800/40">

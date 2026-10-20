@@ -15,6 +15,8 @@ export interface MessageVersion {
   tokenBreakdown?: TokenBreakdown;
   speakerIds?: string[];
   contextEntities?: string[];
+  modelUsed?: string;
+  thinkingLevel?: string;
 }
 
 export interface Message {
@@ -34,6 +36,8 @@ export interface Message {
   turnHeader?: string;
   isTimelineAnomaly?: boolean;
   retrySeconds?: number;
+  modelUsed?: string;
+  thinkingLevel?: string;
 }
 
 export interface RelationshipTrack {
@@ -171,8 +175,86 @@ export interface Project {
   sparkCodexFolderId?: string;
   lastSparkSyncTimestamp?: string;
   strictPlayerAgency?: boolean; // When true (default), prevents AI from speaking for or controlling the player character
+  selectedModel?: "gemini-3.8-flash" | "gemini-4-argon" | string; // Active storyteller model (3.8 Flash vs 4.0 Argon)
+  thinkingLevel?: "Low" | "Medium" | "High" | string; // Active reasoning budget (Low, Med, High)
+  scene3DConfig?: Scene3DConfig; // 3D Narrative Diorama and Stage configuration
+  show3DStage?: boolean; // When true, renders side-by-side split 3D diorama canvas
   updatedAt?: number; // Millisecond timestamp of latest message or update for cross-device sync
 }
+
+export interface Prop3DItem {
+  id: string;
+  type: string; // "stone_arch" | "pillar_column" | "tavern_table" | "fire_brazier" | "cyber_terminal" | "ancient_monolith" | "chest_crate" | "character_token" | "banner_sigil" | "crystal_spire"
+  name?: string;
+  position: [number, number, number];
+  rotation: [number, number, number];
+  scale: [number, number, number];
+  tint?: string;
+}
+
+export interface Scene3DConfig {
+  preset: "tavern" | "dungeon" | "cyberpunk" | "forest" | "ruins" | "sanctum" | "custom";
+  groundTexture: "stone" | "wood" | "grid" | "dirt" | "metal";
+  ambientColor: string;
+  ambientIntensity: number;
+  keyLightColor: string;
+  keyLightIntensity: number;
+  fogColor: string;
+  fogDensity: number;
+  particles: "none" | "dust" | "embers" | "rain" | "spores";
+  props: Prop3DItem[];
+  cameraPreset?: "isometric" | "cinematic" | "topdown" | "orbit";
+  sceneTitle?: string;
+}
+
+export const DEFAULT_SCENE_3D_CONFIG: Scene3DConfig = {
+  preset: "tavern",
+  groundTexture: "wood",
+  ambientColor: "#2a2238",
+  ambientIntensity: 0.9,
+  keyLightColor: "#ff9944",
+  keyLightIntensity: 2.2,
+  fogColor: "#0f0c18",
+  fogDensity: 0.025,
+  particles: "embers",
+  props: [
+    {
+      id: "prop-arch-1",
+      type: "stone_arch",
+      name: "Tavern Entrance Arch",
+      position: [0, 0, -4.5],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1]
+    },
+    {
+      id: "prop-table-1",
+      type: "tavern_table",
+      name: "Adventurer's Table",
+      position: [0, 0, 0],
+      rotation: [0, 0.2, 0],
+      scale: [1.1, 1.1, 1.1]
+    },
+    {
+      id: "prop-brazier-1",
+      type: "fire_brazier",
+      name: "Hearth Brazier",
+      position: [-3.5, 0, -2.5],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1]
+    },
+    {
+      id: "prop-token-1",
+      type: "character_token",
+      name: "Protagonist Pawn",
+      position: [0, 0, 1.8],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      tint: "#a855f7"
+    }
+  ],
+  cameraPreset: "isometric",
+  sceneTitle: "Cozy Hearthside Sanctuary"
+};
 
 export const DEFAULT_INITIAL_PROJECT: Project = {
   id: "proj-default-nyx",
@@ -198,7 +280,11 @@ export const DEFAULT_INITIAL_PROJECT: Project = {
   sources: [],
   persistentContext: "",
   plotOverview: "",
-  turnHeader: ""
+  turnHeader: "",
+  selectedModel: "gemini-3.8-flash",
+  thinkingLevel: "Low",
+  scene3DConfig: DEFAULT_SCENE_3D_CONFIG,
+  show3DStage: false
 };
 
 /**

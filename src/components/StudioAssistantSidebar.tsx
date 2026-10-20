@@ -43,6 +43,7 @@ import { safeLocalStorage } from "../App";
 import ChatMessageMarkdown from "./ChatMessageMarkdown";
 import { safeFetchJson } from "../utils/apiClient";
 import { RelationshipTrack, LoreSource, CharacterProfile } from "../types";
+import { normalizeCharacterName } from "../lib/nyxLoreEngine";
 
 export interface AssistantAttachment {
   id?: string;
@@ -150,12 +151,25 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
   onClose,
   isCinemaMode = false
 }) => {
+  const [isSmallScreen, setIsSmallScreen] = useState<boolean>(() => {
+    return typeof window !== "undefined" ? window.innerWidth < 768 : false;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleResize = () => setIsSmallScreen(window.innerWidth < 768);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
   const [isOpen, setIsOpen] = useState<boolean>(() => {
     try {
+      const isMobileInit = typeof window !== "undefined" && window.innerWidth < 768;
       const saved = safeLocalStorage.getItem("studio_assistant_sidebar_open");
-      return saved !== null ? saved === "true" : true;
+      if (saved !== null) return saved === "true";
+      return isMobileInit ? false : true;
     } catch {
-      return true;
+      return false;
     }
   });
 
@@ -167,6 +181,8 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
       return false;
     }
   });
+
+  const isEffectiveDocked = isDocked && !isSmallScreen;
 
   const wasOpenBeforeCinemaRef = useRef<boolean | null>(null);
 
@@ -572,44 +588,13 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
               targetKey = "narrativePerspective";
             } else if (
               kNorm === "adventurelogtitle" ||
+              kNorm === "adventurelog" ||
               kNorm === "logtitle" ||
               kNorm === "narrativetitle" ||
               kNorm === "narrativelogtitle" ||
               kNorm === "adventuretitle"
             ) {
               targetKey = "adventureLogTitle";
-            } else if (kNorm === "narrative" || kNorm === "narrativelog" || kNorm === "adventurelog" || kNorm === "storylog" || kNorm === "story") {
-              // Direct narrative prose update routed via update_project_value
-              if (targetVal) {
-                const proseText = String(targetVal);
-                if (proseText.length > 30 || proseText.includes(" ") || proseText.includes("\n")) {
-                  let msg = narrativeMessages.length > 0 ? narrativeMessages[narrativeMessages.length - 1] : null;
-                  const modelMsgs = narrativeMessages.filter(m => m.role === "model" || m.role === "nyx");
-                  if (modelMsgs.length > 0) msg = modelMsgs[modelMsgs.length - 1];
-                  if (msg && onEditMessage) {
-                    await onEditMessage(msg.id, proseText);
-                    executed.push({
-                      name: `Edited Narrative Log Turn`,
-                      description: proseText.slice(0, 140) + "...",
-                      targetTab: "chat",
-                      subType: "main_chat",
-                      targetId: msg.id
-                    });
-                    onShowToast("✨ Narrative Turn Revised", "Successfully edited the active scene turn in the Adventure Log.", "success");
-                  } else if (onInjectMessageToMainChat) {
-                    await onInjectMessageToMainChat(proseText, "model");
-                    executed.push({
-                      name: `Created Narrative Scene Turn`,
-                      description: proseText.slice(0, 140) + "...",
-                      targetTab: "chat",
-                      subType: "main_chat"
-                    });
-                  }
-                  targetKey = ""; // Handled
-                } else {
-                  targetKey = "adventureLogTitle";
-                }
-              }
             } else if (
               kNorm === "turnheader" ||
               kNorm === "turnheadertemplate" ||
@@ -626,8 +611,18 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
           }
 
           if (targetKey && targetVal !== undefined) {
-            const normalizedValue = typeof targetVal === "object" ? JSON.stringify(targetVal, null, 2) : String(targetVal);
+            let normalizedValue = typeof targetVal === "object" ? JSON.stringify(targetVal, null, 2) : String(targetVal);
             
+            // If updating persistentContext with append flag or incremental phrase, preserve existing context
+            if (targetKey === "persistentContext" && activeProject) {
+              const current = activeProject.persistentContext || "";
+              if (args.append || args.mode === "append" || (!normalizedValue.includes("\n") && current && !normalizedValue.startsWith(current.slice(0, 15)))) {
+                if (!current.includes(normalizedValue.trim())) {
+                  normalizedValue = current ? `${current}\n- ${normalizedValue.trim()}` : `- ${normalizedValue.trim()}`;
+                }
+              }
+            }
+
             // Execute with safety timeout to prevent any freeze
             await Promise.race([
               onSetProjectValue(targetKey, normalizedValue),
@@ -774,16 +769,22 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
             const signatureItems = args.signatureItems || "";
             const backstory = args.backstory || "";
 
+            const charNorm = normalizeCharacterName(charName);
             const existing = currentCharacters.find(c => 
+              c.id === args.id ||
               c.name.toLowerCase().trim() === charName.toLowerCase().trim() ||
-              (isPC && (c.isPlayerCharacter || c.type === "pc")) ||
-              c.id === args.id
+              (charNorm && normalizeCharacterName(c.name) === charNorm) ||
+              (isPC && (c.isPlayerCharacter || c.type === "pc"))
             );
 
             if (existing) {
+              const existingHasComp = existing.name.toLowerCase().includes("companion");
+              const newHasComp = charName.toLowerCase().includes("companion");
+              const resolvedName = (existingHasComp && !newHasComp) ? existing.name : charName;
+
               const updatedProfile: CharacterProfile = {
                 ...existing,
-                name: charName,
+                name: resolvedName,
                 role: role !== "NPC" ? role : (existing.role || role),
                 description: description || existing.description,
                 type: entityType as any,
@@ -873,6 +874,12 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
           let match = currentCharacters.find(c => c.id.toLowerCase() === query);
           if (!match && query) {
             match = currentCharacters.find(c => c.name.toLowerCase().trim() === query);
+          }
+          if (!match && query) {
+            const queryNorm = normalizeCharacterName(query);
+            if (queryNorm) {
+              match = currentCharacters.find(c => normalizeCharacterName(c.name) === queryNorm);
+            }
           }
           if (!match && query && query.length >= 2) {
             match = currentCharacters.find(c => {
@@ -1145,6 +1152,33 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
           }
         }
 
+        // 6d. ADD TO GROUNDING CONTEXT
+        else if (name === "add_to_grounding_context" || name === "add_to_context" || name === "append_grounding_context") {
+          const entry = args.entry || args.text || args.content || args.value || "";
+          const category = args.category || args.type || "";
+          let formattedEntry = typeof entry === "string" ? entry.trim() : JSON.stringify(entry);
+          if (category && !formattedEntry.toLowerCase().startsWith(category.toLowerCase())) {
+            formattedEntry = `${category.charAt(0).toUpperCase() + category.slice(1)}: ${formattedEntry}`;
+          }
+
+          if (formattedEntry && activeProject) {
+            const current = activeProject.persistentContext || "";
+            let updated = current;
+            if (!current.includes(formattedEntry)) {
+              updated = current ? `${current}\n- ${formattedEntry}` : `- ${formattedEntry}`;
+            }
+            await onSetProjectValue("persistentContext", updated);
+            onShowToast?.("📌 Added to Grounding Context", `Pinned to persistent scene context:\n"${formattedEntry}"`, "success");
+            executed.push({
+              name: `Pinned Grounding Context: ${formattedEntry.slice(0, 45)}`,
+              description: formattedEntry,
+              targetTab: "workspace",
+              subType: "world_setting",
+              targetKey: "persistentContext"
+            });
+          }
+        }
+
         // 7. ADD TASK / OBJECTIVE
         else if (name === "add_task") {
           const text = args.text;
@@ -1225,85 +1259,40 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
         else if (
           name === "edit_narrative_log" ||
           name === "edit_narrative_entry" ||
-          name === "edit_narrative" ||
-          name === "update_narrative_log" ||
-          name === "update_narrative" ||
-          name === "rewrite_narrative_turn" ||
-          name === "rewrite_narrative" ||
-          name === "rewrite_message" ||
           name === "edit_message" ||
           name === "update_message" ||
-          name === "modify_narrative_log" ||
-          name === "modify_narrative" ||
-          name === "revise_narrative_log" ||
-          name === "revise_narrative" ||
-          name === "revise_turn" ||
-          name === "edit_turn" ||
-          name === "retcon_narrative"
+          name === "rewrite_narrative_turn" ||
+          name === "rewrite_message"
         ) {
-          const targetId = args.id || args.messageId || args.turnId || args.turn;
-          const newContent = args.newContent !== undefined ? args.newContent
-            : args.content !== undefined ? args.content
-            : args.text !== undefined ? args.text
-            : args.prose !== undefined ? args.prose
-            : args.storyText !== undefined ? args.storyText
-            : args.revisedText !== undefined ? args.revisedText
-            : args.editedText !== undefined ? args.editedText
-            : args.narrative !== undefined ? args.narrative
-            : args.updatedContent !== undefined ? args.updatedContent
-            : args.turnText !== undefined ? args.turnText
-            : args.message !== undefined ? args.message
-            : args.revisedProse !== undefined ? args.revisedProse
-            : args.replacement !== undefined ? args.replacement
-            : args.newText;
-          const searchSnippet = args.searchSnippet || args.snippet || args.match || args.query;
+          const targetId = args.id || args.messageId;
+          const newContent = args.newContent !== undefined ? args.newContent : args.content !== undefined ? args.content : args.text;
+          const searchSnippet = args.searchSnippet || args.snippet || args.match;
 
-          if (newContent !== undefined) {
+          if (newContent !== undefined && onEditMessage && narrativeMessages.length > 0) {
             let matchedMessage: any = null;
 
-            if (narrativeMessages.length > 0) {
-              if (targetId && targetId !== "latest" && targetId !== "last") {
-                matchedMessage = narrativeMessages.find(m => m.id === targetId);
-                if (!matchedMessage) {
-                  const numMatch = String(targetId).match(/\b(\d+)\b/);
-                  if (numMatch) {
-                    const rawNum = parseInt(numMatch[1], 10);
-                    // Check if it matches 0-based index
-                    if (rawNum >= 0 && rawNum < narrativeMessages.length && String(targetId).includes("0")) {
-                      matchedMessage = narrativeMessages[rawNum];
-                    } else {
-                      // Check 1-based relative to recent snippet (last 25)
-                      const offset = Math.max(0, narrativeMessages.length - 25);
-                      const snippetRelIdx = offset + rawNum - 1;
-                      if (snippetRelIdx >= 0 && snippetRelIdx < narrativeMessages.length) {
-                        matchedMessage = narrativeMessages[snippetRelIdx];
-                      } else if (rawNum - 1 >= 0 && rawNum - 1 < narrativeMessages.length) {
-                        matchedMessage = narrativeMessages[rawNum - 1];
-                      }
-                    }
-                  }
-                }
-              }
-
-              if (!matchedMessage && searchSnippet) {
-                const snippetLower = String(searchSnippet).toLowerCase().trim();
-                matchedMessage = [...narrativeMessages].reverse().find(m => {
-                  const text = (m.versions && typeof m.activeVersionIndex === "number" && m.versions[m.activeVersionIndex])
-                    ? m.versions[m.activeVersionIndex].content
-                    : (m.content || "");
-                  return text.toLowerCase().includes(snippetLower);
-                });
-              }
-
-              if (!matchedMessage) {
-                // Target the latest assistant/model/nyx turn or the very last message in narrative
-                const modelMsgs = narrativeMessages.filter(m => m.role === "model" || m.role === "nyx");
-                matchedMessage = modelMsgs.length > 0 ? modelMsgs[modelMsgs.length - 1] : narrativeMessages[narrativeMessages.length - 1];
-              }
+            if (targetId && targetId !== "latest" && targetId !== "last") {
+              matchedMessage = narrativeMessages.find(m => m.id === targetId);
             }
 
-            if (matchedMessage && onEditMessage) {
-              await onEditMessage(matchedMessage.id, String(newContent));
+            if (!matchedMessage && searchSnippet) {
+              const snippetLower = String(searchSnippet).toLowerCase().trim();
+              matchedMessage = [...narrativeMessages].reverse().find(m => 
+                (m.content || "").toLowerCase().includes(snippetLower)
+              );
+            }
+
+            if (!matchedMessage) {
+              // Target the latest assistant/model turn or the very last message in narrative
+              const modelMsgs = narrativeMessages.filter(m => m.role === "model" || m.role === "nyx");
+              matchedMessage = modelMsgs.length > 0 ? modelMsgs[modelMsgs.length - 1] : narrativeMessages[narrativeMessages.length - 1];
+            }
+
+            if (matchedMessage) {
+              await Promise.race([
+                onEditMessage(matchedMessage.id, String(newContent)),
+                new Promise(res => setTimeout(res, 2500))
+              ]);
               executed.push({
                 name: `Edited Narrative Log Turn`,
                 description: String(newContent).slice(0, 140) + (String(newContent).length > 140 ? "..." : ""),
@@ -1311,20 +1300,6 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
                 subType: "main_chat",
                 targetId: matchedMessage.id
               });
-              onShowToast("✨ Narrative Turn Revised", "Successfully edited the active scene turn in the Adventure Log.", "success");
-            } else if (onInjectMessageToMainChat) {
-              // If no message exists yet to edit (e.g. empty log), inject the new turn into the adventure log!
-              await Promise.race([
-                onInjectMessageToMainChat(String(newContent), "model"),
-                new Promise(res => setTimeout(res, 2500))
-              ]);
-              executed.push({
-                name: `Created Narrative Scene Turn`,
-                description: String(newContent).slice(0, 140) + (String(newContent).length > 140 ? "..." : ""),
-                targetTab: "chat",
-                subType: "main_chat"
-              });
-              onShowToast("✨ Narrative Scene Established", "Added new narrative turn directly into the Adventure Log.", "success");
             }
           }
         }
@@ -1431,12 +1406,7 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
     try {
       const recentNarrativeSnippet = (narrativeMessages || [])
         .slice(-25)
-        .map((m: any, idx: number) => {
-          const contentText = (m.versions && typeof m.activeVersionIndex === "number" && m.versions[m.activeVersionIndex])
-            ? m.versions[m.activeVersionIndex].content
-            : (m.content || "");
-          return `[Turn ${idx + 1} | ID: ${m.id}] [${m.role === "model" || m.role === "nyx" ? "DM (Nyx)" : "Player"}]: ${contentText}`;
-        })
+        .map((m: any) => `[Turn ID: ${m.id}] [${m.role === "model" || m.role === "nyx" ? "DM (Nyx)" : "Player"}]: ${m.content}`)
         .join("\n\n");
 
       // Sanitize sources to avoid sending megabytes of background base64 data over fetch, while providing rich document text
@@ -1780,6 +1750,11 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
       label: "📜 Add Grounding Lore",
       prompt: "Create a new grounding lore source in our campaign codex detailing secret world lore, hidden factions, or ancient artifacts.",
       icon: FileText
+    },
+    {
+      label: "📍 Add Location Context",
+      prompt: "Add location: Rear Terrace to context",
+      icon: Compass
     }
   ];
 
@@ -1800,11 +1775,11 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
               <span className={`text-[9px] font-mono px-1.5 py-0.2 rounded border ${
                 embedded
                   ? "bg-purple-950/90 text-purple-300 border-purple-800/60 font-semibold"
-                  : isDocked 
+                  : isEffectiveDocked 
                     ? "bg-purple-950/90 text-purple-300 border-purple-800/60 font-semibold" 
                     : "bg-slate-900 text-slate-400 border-slate-800"
               }`}>
-                {embedded ? "CO-PILOT" : isDocked ? "PINNED" : "OVERLAY"}
+                {embedded ? "CO-PILOT" : isEffectiveDocked ? "PINNED" : "OVERLAY"}
               </span>
             </div>
             <span className="text-[10.5px] text-slate-400 truncate max-w-[170px]">
@@ -1854,8 +1829,8 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
                   <SlidersHorizontal size={14} />
                 </button>
 
-                {/* PIN / DOCK TOGGLE BUTTON (HIDDEN IN EMBEDDED MODE) */}
-                {!embedded && (
+                {/* PIN / DOCK TOGGLE BUTTON (HIDDEN IN EMBEDDED MODE OR ON MOBILE) */}
+                {!embedded && !isSmallScreen && (
                   <button
                     type="button"
                     onClick={() => {
@@ -2306,6 +2281,20 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
                       buttonSize="sm"
                       label="Drive"
                     />
+
+                    {/* Quick Manual Grounding Context Button */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInputText(prev => prev ? `${prev}\nAdd location: Rear Terrace to context` : "Add location: Rear Terrace to context");
+                        textareaRef.current?.focus();
+                      }}
+                      className="flex items-center gap-1 px-1.5 py-1 rounded-lg hover:bg-purple-950/60 text-purple-300 hover:text-purple-100 border border-purple-900/50 hover:border-purple-600/60 transition-colors cursor-pointer text-[11px] font-mono shadow-xs"
+                      title="Quick prompt to add manual location/fact to persistent grounding context"
+                    >
+                      <Compass size={12} className="text-purple-400 shrink-0" />
+                      <span className="hidden sm:inline">+ Context</span>
+                    </button>
                   </div>
 
                   {isGenerating ? (
@@ -2705,10 +2694,10 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
   return (
     <>
       {/* FLOATING BACKDROP (IN UNPINNED OVERLAY MODE WHEN OPEN) */}
-      {isOpen && !isDocked && (
+      {isOpen && !isEffectiveDocked && (
         <div 
           onClick={() => setIsOpen(false)}
-          className="absolute inset-0 bg-black/40 z-35 backdrop-blur-[1px] transition-opacity duration-200 cursor-pointer"
+          className="absolute inset-0 bg-black/50 z-35 backdrop-blur-[2px] transition-opacity duration-200 cursor-pointer"
           title="Click to close floating assistant"
         />
       )}
@@ -2733,9 +2722,9 @@ export const StudioAssistantSidebar: React.FC<StudioAssistantSidebarProps> = ({
       {isOpen && (
         <aside 
           className={`transition-all duration-300 ease-in-out flex flex-col h-full ${
-            isDocked 
+            isEffectiveDocked 
               ? "relative z-30 w-[380px] sm:w-[420px] lg:w-[450px] shrink-0 rounded-2xl border border-slate-800/80 bg-slate-950/95 backdrop-blur-md shadow-lg overflow-hidden ml-3" 
-              : "absolute right-0 top-0 bottom-0 z-40 w-[380px] sm:w-[420px] max-w-[92vw] rounded-l-2xl border-y border-l border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/60 animate-in slide-in-from-right duration-200"
+              : "absolute right-0 top-0 bottom-0 z-40 w-[340px] sm:w-[420px] max-w-[92vw] rounded-l-2xl border-y border-l border-purple-900/60 bg-slate-950/95 backdrop-blur-xl shadow-2xl shadow-purple-950/60 animate-in slide-in-from-right duration-200"
           }`}
         >
           {assistantContent}

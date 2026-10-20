@@ -113,11 +113,11 @@ export const TokenBreakdownModal: React.FC<TokenBreakdownModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200"
+      className="fixed inset-0 z-50 flex items-center justify-center p-2.5 sm:p-5 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl bg-slate-900 border border-purple-500/30 rounded-2xl shadow-2xl shadow-purple-950/40 flex flex-col max-h-[90vh] overflow-hidden text-slate-200"
+        className="w-full max-w-2xl bg-slate-900 border border-purple-500/30 rounded-2xl shadow-2xl shadow-purple-950/40 flex flex-col max-h-[92dvh] overflow-hidden text-slate-200"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

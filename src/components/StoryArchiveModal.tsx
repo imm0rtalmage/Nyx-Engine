@@ -297,11 +297,11 @@ export function StoryArchiveModal({
   const shimaTranscript = transcripts.find(t => t.title.toLowerCase().includes("shima") || t.key.toLowerCase().includes("shima") || t.messages.some(m => m.content.toLowerCase().includes("shima")));
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-in fade-in duration-200">
-      <div className="bg-slate-900 border border-purple-500/30 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-2.5 sm:p-4 bg-slate-950/80 backdrop-blur-md animate-in fade-in duration-200">
+      <div className="bg-slate-900 border border-purple-500/30 rounded-2xl w-full max-w-4xl max-h-[92dvh] flex flex-col shadow-2xl overflow-hidden">
         
         {/* Header */}
-        <div className="px-6 py-5 border-b border-slate-800 bg-slate-900/90 flex items-center justify-between">
+        <div className="px-4 py-3 sm:px-6 sm:py-5 border-b border-slate-800 bg-slate-900/90 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-purple-950/60 border border-purple-600/40 flex items-center justify-center text-purple-400">
               <BookOpen size={20} />
